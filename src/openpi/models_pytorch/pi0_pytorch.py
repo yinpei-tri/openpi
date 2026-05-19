@@ -111,10 +111,6 @@ class PI0Pytorch(nn.Module):
         torch.set_float32_matmul_precision("high")
         if config.pytorch_compile_mode is not None:
             self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
-            if getattr(config, "pytorch_compile_train", False):
-                # Compile the training forward as well. We compile `forward` rather than only the
-                # joint-attention block so that the embedding + projection paths are folded in too.
-                self.forward = torch.compile(self.forward, mode=config.pytorch_compile_mode)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False

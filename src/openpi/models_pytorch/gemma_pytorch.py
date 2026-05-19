@@ -1,4 +1,3 @@
-from contextlib import contextmanager
 from typing import Literal
 
 import torch
@@ -7,39 +6,6 @@ from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
-
-
-def _is_fsdp_module(module: nn.Module) -> bool:
-    """Return True iff `module` is wrapped by FSDP2 (`fully_shard`)."""
-    try:
-        from torch.distributed.fsdp import FSDPModule
-
-        return isinstance(module, FSDPModule)
-    except ImportError:
-        return False
-
-
-@contextmanager
-def _unshard_layers(layers: list[nn.Module]):
-    """Temporarily unshard FSDP2-wrapped layers so the joint forward can read their weights.
-
-    pi0's joint forward bypasses `GemmaDecoderLayer.forward` (it pulls `self_attn.q_proj`
-    out and applies it directly), so FSDP2's pre-forward unshard hook never fires. We
-    explicitly call `unshard()` here and `reshard()` on exit.
-
-    For non-FSDP layers (DDP, single-GPU) this is a no-op.
-    """
-    fsdp_layers = [m for m in layers if _is_fsdp_module(m)]
-    handles = [m.unshard(async_op=False) for m in fsdp_layers]
-    # `unshard` may return a UnshardHandle (newer torch) or None (older). For UnshardHandles
-    # we need to wait() before using params; async_op=False already waits, so handles are
-    # only retained for symmetry.
-    del handles
-    try:
-        yield
-    finally:
-        for m in fsdp_layers:
-            m.reshard()
 
 
 class PaliGemmaWithExpertModel(nn.Module):
@@ -187,20 +153,10 @@ class PaliGemmaWithExpertModel(nn.Module):
                     )
                 self._debug_gc_printed = True
 
-            # Define the complete layer computation function for gradient checkpointing.
-            # The body runs under `_unshard_layers` so FSDP2-sharded params are gathered
-            # both during the forward pass and during gradient-checkpoint recomputation
-            # (which fires this function again from inside the backward pass).
+            # Define the complete layer computation function for gradient checkpointing
             def compute_layer_complete(layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
                 models = [self.paligemma.language_model, self.gemma_expert.model]
-                layer_pair = [models[0].layers[layer_idx], models[1].layers[layer_idx]]
 
-                with _unshard_layers(layer_pair):
-                    return _compute_layer_inner(
-                        models, layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
-                    )
-
-            def _compute_layer_inner(models, layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond):
                 query_states = []
                 key_states = []
                 value_states = []
@@ -280,9 +236,7 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                 return outputs_embeds
 
-            # Process all layers with gradient checkpointing if enabled. The unshard for
-            # FSDP2 happens inside `compute_layer_complete` so it also covers the
-            # gradient-checkpoint recomputation triggered during backward.
+            # Process all layers with gradient checkpointing if enabled
             for layer_idx in range(num_layers):
                 if use_gradient_checkpointing:
                     inputs_embeds = torch.utils.checkpoint.checkpoint(
@@ -300,11 +254,10 @@ class PaliGemmaWithExpertModel(nn.Module):
                         layer_idx, inputs_embeds, attention_mask, position_ids, adarms_cond
                     )
 
+                # Old code removed - now using compute_layer_complete function above
+
             # final norm
-            # Define final norm computation function for gradient checkpointing. The norm
-            # modules belong to the root FSDP unit (sharded by `fully_shard(model)`),
-            # but their forward is invoked directly here, so the root unshard hook fires
-            # at the top-level model forward. Nothing else to do.
+            # Define final norm computation function for gradient checkpointing
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
                 for i, hidden_states in enumerate(inputs_embeds):
