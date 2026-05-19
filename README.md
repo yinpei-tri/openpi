@@ -53,6 +53,8 @@ NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
 
 **Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
 
+**Containerized fine-tuning**: A separate, training-focused image (`scripts/docker/train.Dockerfile` + `scripts/docker/train.compose.yml`) bakes the locked uv environment, applies the PyTorch transformers patch, and runs as your host UID so bind-mounted checkpoints aren't owned by root. The same image runs both `scripts/train.py` (JAX) and `scripts/train_pytorch.py` (PyTorch — including the FSDP2/EMA/`torch.compile` features described below). See [scripts/docker/TRAINING.md](scripts/docker/TRAINING.md) for the host setup, smoke-run recipes, and a single-node 8x A100 example.
+
 
 
 
@@ -146,7 +148,7 @@ To fine-tune a base model on your own data, you need to define configs for data 
 - [`LeRobotLiberoDataConfig`](src/openpi/training/config.py): Defines how to process raw LIBERO data from LeRobot dataset for training.
 - [`TrainConfig`](src/openpi/training/config.py): Defines fine-tuning hyperparameters, data config, and weight loader.
 
-We provide example fine-tuning configs for [π₀](src/openpi/training/config.py), [π₀-FAST](src/openpi/training/config.py), and [π₀.₅](src/openpi/training/config.py) on LIBERO data.
+We provide example fine-tuning configs for [π₀](src/openpi/training/config.py), [π₀-FAST](src/openpi/training/config.py), and [π₀.₅](src/openpi/training/config.py) on LIBERO data. There is also a `pi05_libero_debug` config — the same data + model as `pi05_libero` but with `batch_size=4`, `fsdp_devices=2`, `num_train_steps=200`, and EMA off — designed to fit on two 48 GB GPUs (e.g. A6000) for a quick forward+backward smoke run. It reuses `pi05_libero`'s norm stats via `AssetsConfig`, so you only need to run `compute_norm_stats` once.
 
 Before we can run training, we need to compute the normalization statistics for the training data. Run the script below with the name of your training config:
 
@@ -161,6 +163,15 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-nam
 ```
 
 The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
+
+**Containerized run** (no host venv needed beyond uv): build once and launch the smoke run with the bundled compose file, which mounts your host caches and runs as your UID:
+
+```bash
+cp scripts/docker/.env.example scripts/docker/.env  # then edit absolute cache paths + HOST_UID/GID
+docker compose -f scripts/docker/train.compose.yml up --build
+```
+
+Defaults to `TRAIN_CONFIG=pi05_libero_debug`. Override `TRAIN_CONFIG`, `EXP_NAME`, `TRAIN_ARGS`, or replace the entrypoint via `TRAIN_CMD` for the PyTorch trainer. See [scripts/docker/TRAINING.md](scripts/docker/TRAINING.md) for the full workflow including the DGX A100 recipe.
 
 **Note:** We provide functionality for *reloading* normalization statistics for state / action normalization from pre-training. This can be beneficial if you are fine-tuning to a new task on a robot that was part of our pre-training mixture. For more details on how to reload normalization statistics, see the [norm_stats.md](docs/norm_stats.md) file.
 
@@ -193,9 +204,14 @@ openpi now provides PyTorch implementations of π₀ and π₀.₅ models alongs
 
 - The π₀-FAST model
 - Mixed precision training
-- FSDP (fully-sharded data parallelism) training
 - LoRA (low-rank adaptation) training
-- EMA (exponential moving average) weights during training
+
+Recently added to the PyTorch trainer (parity with the JAX trainer):
+
+- **EMA** (exponential moving average) — **enabled by default** (`config.ema_decay = 0.99` in `TrainConfig`); set `--ema_decay None` to disable. The shadow is kept in float32 and saved alongside each checkpoint as `ema.safetensors`.
+- **FSDP2** (fully-sharded data parallelism) — **default for multi-GPU runs**. With `torchrun --nproc_per_node=N` we automatically shard params across all N ranks. To use a hybrid FSDP x DP layout, set `--fsdp_devices K` (with `K | world_size`); FSDP2 then shards across K ranks and replicates across the remaining `world_size // K` ranks, matching the JAX trainer's mesh layout. Mixed precision is handled by FSDP's `MixedPrecisionPolicy` (bf16 params, fp32 reduce).
+- **`torch.compile` on the training forward** — opt-in via `--model.pytorch_compile_train` (the inference forward `sample_actions` is already compiled when `pytorch_compile_mode` is set).
+- **Gradient checkpointing toggle** — opt-out via `--model.pytorch_gradient_checkpointing False` (defaults to on, as before).
 
 ### Setup
 1. Make sure that you have the latest version of all dependencies installed: `uv sync`
@@ -290,7 +306,55 @@ uv run torchrun \
     --master_addr=<master_ip> \
     --master_port=<port> \
     scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
+
+# FSDP2 (parameter sharding) across all 4 GPUs — default behavior, no extra flags:
+uv run torchrun --standalone --nnodes=1 --nproc_per_node=4 \
+    scripts/train_pytorch.py pi05_libero --exp_name fsdp_run
+
+# Hybrid FSDP x DP (8-GPU run, shard across 4 ranks, replicate across 2 — mirrors the JAX mesh):
+uv run torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+    scripts/train_pytorch.py pi05_libero --exp_name fsdp_dp_run --fsdp_devices 4
+
+# Compile the training forward (combine with any of the above):
+uv run torchrun ... scripts/train_pytorch.py <config_name> --exp_name=<run_name> --model.pytorch_compile_train
 ```
+
+### EMA, FSDP2, and torch.compile
+
+- The trainer auto-selects the distributed mode from `world_size`: `world_size == 1` → single GPU; `world_size > 1` → FSDP2 (full sharding across all ranks). Override with `--fsdp_devices K` (with `K | world_size`, `K > 1`) to shard across K ranks and replicate across the remaining `world_size // K` groups (hybrid FSDP x DP).
+- EMA is enabled by default (`config.ema_decay = 0.99`) and disabled by setting `--ema_decay None`. The shadow is updated after every optimizer step and the full (unsharded) state is written to `<step>/ema.safetensors`. On resume, EMA is restored from disk; if no shadow file is present (e.g. resuming from a JAX-converted checkpoint) the shadow is re-initialized from the current weights.
+- `model.pytorch_compile_train=True` wraps the joint forward with `torch.compile` using `model.pytorch_compile_mode` (default `"max-autotune"`). The inference path is compiled regardless.
+- For FSDP2 we manually unshard each `GemmaDecoderLayer` pair before its weights are read, because the joint forward in `gemma_pytorch.py` accesses `q_proj`/`k_proj`/`mlp` directly rather than calling the wrapped layer's `forward`. This is handled in `_unshard_layers`; user code does not need to do anything.
+
+### Resuming a PyTorch run
+
+Pass `--resume` and the trainer will load the latest checkpoint under `config.checkpoint_dir`:
+
+```bash
+# Single GPU
+uv run scripts/train_pytorch.py <config_name> --exp_name <run_name> --resume
+
+# FSDP2 (default for multi-GPU; FSDP2 reshards from the full state on disk, so
+# resuming on a different number of GPUs / a different fsdp_devices value is supported)
+uv run torchrun --standalone --nnodes=1 --nproc_per_node=4 \
+    scripts/train_pytorch.py <config_name> --exp_name <run_name> --resume
+```
+
+Each checkpoint directory `<exp>/<step>/` contains:
+
+| File                | Contents                                                                                          |
+| ------------------- | ------------------------------------------------------------------------------------------------- |
+| `model.safetensors` | Full (unsharded) model weights. For FSDP runs, gathered to CPU via `torch.distributed.checkpoint.state_dict.get_state_dict`, so the layout matches a single-GPU save. |
+| `optimizer.pt`      | Full optimizer state (AdamW `exp_avg` / `exp_avg_sq`). For FSDP, gathered the same way as the model — resume reshards via `set_state_dict`. |
+| `ema.safetensors`   | EMA shadow (fp32, full unsharded). Only present when `ema_decay is not None`.                     |
+| `metadata.pt`       | `{global_step, config, timestamp}` — used to restore the step counter and LR schedule position.   |
+| `assets/<asset_id>/`| Norm stats copied from the dataset config so inference can run from the checkpoint alone.         |
+
+Notes:
+
+- The trainer always *creates a new commit* at the next save interval; it does not amend a previous one. If a save is interrupted, the partially-written `tmp_<step>/` directory is removed on the next save.
+- Resuming an FSDP2 run on a different number of GPUs is supported (every rank reads the full `model.safetensors` from disk and `set_state_dict` reshards locally). On a shared filesystem this is the common case; on networked storage you may want to switch the load path to `broadcast_from_rank0=True` to avoid N copies of the same read.
+- If you converted a JAX checkpoint via `examples/convert_jax_model_to_pytorch.py` and want to resume training from it, use `pytorch_weight_path` (not `--resume`) — `--resume` requires a full `<step>/` directory layout, while `pytorch_weight_path` just loads `model.safetensors` and starts the optimizer / LR schedule fresh.
 
 ### Precision Settings
 

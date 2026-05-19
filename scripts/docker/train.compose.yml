@@ -1,0 +1,57 @@
+# Run training in a containerized environment.
+#
+# Local 2x A6000 smoke run (JAX, debug config):
+#   docker compose -f scripts/docker/train.compose.yml up --build
+#
+# Local PyTorch smoke run (uses converted base checkpoint):
+#   TRAIN_CMD="uv run scripts/train_pytorch.py pi05_libero_debug --exp_name=debug" \
+#       docker compose -f scripts/docker/train.compose.yml up --build
+#
+# Single-A100 (DGX) full pi05_libero run, JAX, all 8 GPUs sharded:
+#   GPU_COUNT=8 TRAIN_CONFIG=pi05_libero EXP_NAME=libero_a100 \
+#   TRAIN_ARGS="--fsdp-devices=8" \
+#       docker compose -f scripts/docker/train.compose.yml up --build
+#
+# Notes:
+#   - This compose file uses `runtime: nvidia` instead of the Compose `deploy.resources` block
+#     because snap-installed Docker rejects CDI-mode `--gpus`. If you migrate to the official
+#     apt Docker package you can switch to the `deploy` block (see scripts/docker/compose.yml).
+#   - Host caches are bind-mounted so checkpoints + LeRobot datasets survive between runs.
+
+services:
+  trainer:
+    image: openpi_train
+    build:
+      context: ../..
+      dockerfile: scripts/docker/train.Dockerfile
+    init: true
+    tty: true
+    network_mode: host
+    shm_size: 16g
+    runtime: nvidia
+    # Run as the host user so checkpoints written under ./checkpoints aren't owned by root.
+    # Override at the call site if your host UID differs from the default.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    volumes:
+      # Code is bind-mounted so edits don't require rebuilds.
+      - ../..:/app
+      # Persistent caches. We use ${HOME}/... rather than ~/... because some
+      # Docker installs (e.g. snap-confined) resolve `~` inside the daemon's
+      # private home, not the user's real home.
+      - ${OPENPI_DATA_HOME:-${HOME}/.cache/openpi}:/openpi_assets
+      - ${HF_HOME:-${HOME}/.cache/huggingface}:/cache/huggingface
+      # Where wandb writes its local run dirs (handy if WANDB_MODE=offline).
+      - ${WANDB_DIR:-./wandb}:/app/wandb
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - OPENPI_DATA_HOME=/openpi_assets
+      - HF_HOME=/cache/huggingface
+      - XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.9}
+      - WANDB_API_KEY
+      - WANDB_MODE=${WANDB_MODE:-offline}
+      # Pass-through for the default CMD.
+      - TRAIN_CMD
+      - TRAIN_CONFIG=${TRAIN_CONFIG:-pi05_libero_debug}
+      - EXP_NAME=${EXP_NAME:-debug}
+      - TRAIN_ARGS

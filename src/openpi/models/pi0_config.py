@@ -33,6 +33,11 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
 
     pytorch_compile_mode: str | None = "max-autotune"
+    # If true, the PyTorch trainer compiles the joint training forward (not only sample_actions).
+    pytorch_compile_train: bool = False
+    # If true, the PyTorch trainer enables gradient checkpointing on the joint forward.
+    # Trades ~20-25% throughput for a large reduction in activation memory.
+    pytorch_gradient_checkpointing: bool = True
 
     def __post_init__(self):
         if self.max_token_len is None:

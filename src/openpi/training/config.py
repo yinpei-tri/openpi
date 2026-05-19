@@ -761,6 +761,36 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    # Debug variant of pi05_libero for local 2x A6000 (or any small multi-GPU box).
+    # Same data + model as pi05_libero, but tiny batch + few steps so a smoke run finishes quickly.
+    # Reuses pi05_libero's norm stats via AssetsConfig so you only run compute_norm_stats once.
+    TrainConfig(
+        name="pi05_libero_debug",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            assets=AssetsConfig(assets_dir="./assets/pi05_libero", asset_id="physical-intelligence/libero"),
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        batch_size=4,
+        fsdp_devices=2,
+        num_workers=0,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10,
+            peak_lr=5e-5,
+            decay_steps=200,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="./checkpoints/pi05_base_pytorch/model.safetensors",
+        num_train_steps=200,
+        save_interval=100,
+        log_interval=10,
+        keep_period=None,
+    ),
     #
     # Fine-tuning Aloha configs.
     #

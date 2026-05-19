@@ -1,26 +1,33 @@
 """
-PyTorch training entrypoint for PI0/PI05 with multi-GPU and multi-node (DDP) support.
-This script mirrors the behavior of the JAX trainer (`scripts/train.py`) but runs
-entirely in PyTorch using the `PI0Pytorch` model and your existing config/data
-pipeline from `src/openpi/training/config.py` and `src/openpi/training/data_loader.py`.
+PyTorch training entrypoint for PI0/PI05 with multi-GPU and multi-node support.
+Mirrors the JAX trainer (`scripts/train.py`) using `PI0Pytorch` and the shared
+config/data pipeline.
+
+Distributed modes (selected automatically from TrainConfig):
+- single GPU:                    world_size == 1
+- FSDP2 (default for multi-GPU): world_size > 1. By default we shard params across
+                                 *all* ranks (no DP replication). To use a hybrid
+                                 FSDP x DP layout, set `--fsdp_devices N` so params
+                                 shard across N ranks and replicate across the
+                                 remaining `world_size // N` groups (matches the
+                                 JAX trainer's mesh layout).
+
+Other features:
+- EMA: enabled by default (`config.ema_decay = 0.99`); set to `None` to disable.
+  Shadow is kept in fp32 (matches JAX) and saved to `<step>/ema.safetensors`.
+- torch.compile on training forward: set `model.pytorch_compile_train=True`.
+- Gradient checkpointing: toggled via `model.pytorch_gradient_checkpointing`.
 
 Usage
 Single GPU:
-  python scripts/train_pytorch.py <config_name> --exp_name <run_name> --save_interval <interval>
-  Example:
-  python scripts/train_pytorch.py debug --exp_name pytorch_ddp_test
-  python scripts/train_pytorch.py debug --exp_name pytorch_ddp_test --resume  # Resume from latest checkpoint
+  python scripts/train_pytorch.py <config_name> --exp_name <run_name>
 Multi-GPU (single node):
-  torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train_pytorch.py <config_name> --exp_name <run_name>
-  Example:
-  torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
-  torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
-Multi-Node Training:
-	torchrun \
-    --nnodes=<num_nodes> --nproc_per_node=<gpus_per_node> --node_rank=<rank_of_node> \
-    --master_addr=<master_ip> --master_port=<port> \
-    scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
-
+  torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> \
+      scripts/train_pytorch.py <config_name> --exp_name <run_name>
+Multi-Node:
+  torchrun --nnodes=<num_nodes> --nproc_per_node=<gpus_per_node> \
+      --node_rank=<rank> --master_addr=<ip> --master_port=<port> \
+      scripts/train_pytorch.py <config_name> --exp_name <run_name>
 """
 
 import dataclasses
@@ -45,6 +52,7 @@ import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+import openpi.training.pytorch_training_utils as _pt_utils
 
 
 def init_logging():
@@ -94,18 +102,32 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
+
+    # Pin the per-rank CUDA device *before* init_process_group. NCCL eager-binds the
+    # communicator to the current device at init time; if every rank still sees cuda:0
+    # they all bind to the same GPU and the first all_gather fails with
+    # "Duplicate GPU detected : rank 0 and rank 1 both on CUDA device <uuid>".
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
+
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
+        # Pass `device_id` so NCCL binds the communicator to this rank's GPU explicitly.
+        # Without it NCCL infers the device from the current CUDA context, and if any
+        # earlier import (e.g. JAX's xla_bridge) created a context on cuda:0, every
+        # rank ends up registered against cuda:0 and the first all_gather fails with
+        # "Duplicate GPU detected : rank N and rank M both on CUDA device <busid>".
+        init_kwargs = {"backend": backend, "init_method": "env://"}
+        if torch.cuda.is_available():
+            init_kwargs["device_id"] = device
+        torch.distributed.init_process_group(**init_kwargs)
 
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
     return use_ddp, local_rank, device
 
 
@@ -128,74 +150,95 @@ def build_datasets(config: _config.TrainConfig):
     return data_loader, data_loader.data_config()
 
 
-def get_model_state_dict(model):
-    """Get state dict from model, handling DDP wrapper."""
-    return (
-        model.module.state_dict()
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel)
-        else model.state_dict()
-    )
+def _unwrap(model):
+    """Strip DDP wrappers to get the underlying nn.Module."""
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return model.module
+    return model
 
 
-def get_model_parameters(model):
-    """Get parameters from model, handling DDP wrapper."""
-    return (
-        model.module.parameters()
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel)
-        else model.parameters()
-    )
+def _full_state_dicts(model, optimizer, *, is_fsdp: bool):
+    """Return (model_state, optim_state) with full unsharded tensors on CPU.
+
+    For FSDP2 we use the distributed checkpoint API, which all-gathers DTensors and offloads
+    to CPU. For DDP/single-GPU we use the standard state_dict() path.
+    """
+    if is_fsdp:
+        from torch.distributed.checkpoint.state_dict import StateDictOptions
+        from torch.distributed.checkpoint.state_dict import get_state_dict
+
+        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        model_sd, optim_sd = get_state_dict(model, optimizer, options=opts)
+        return model_sd, optim_sd
+
+    inner = _unwrap(model)
+    return inner.state_dict(), optimizer.state_dict()
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
-    """Save a checkpoint with model state, optimizer state, and metadata."""
+def save_checkpoint(
+    model, optimizer, global_step, config, is_main, data_config, ema=None, *, is_fsdp: bool = False
+):
+    """Save a checkpoint with model state, optimizer state, EMA state, and metadata."""
+    # Only save if it's time to save or if it's the final step
+    if not ((global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1):
+        return
+
+    # Gather full state dict on every rank (collective). Only rank 0 writes to disk.
+    model_state, optim_state = _full_state_dicts(model, optimizer, is_fsdp=is_fsdp)
+    ema_state = ema.full_state_dict() if ema is not None else None
     if not is_main:
         return
 
-    # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
-        # Create temporary directory for atomic checkpoint saving
-        final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
-        tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+    # Create temporary directory for atomic checkpoint saving
+    final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
+    tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
 
-        # Remove any existing temp directory and create new one
-        if tmp_ckpt_dir.exists():
-            shutil.rmtree(tmp_ckpt_dir)
-        tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # Remove any existing temp directory and create new one
+    if tmp_ckpt_dir.exists():
+        shutil.rmtree(tmp_ckpt_dir)
+    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save model state using safetensors (handle shared tensors)
-        model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+    # Save model state using safetensors. Pass a flat state dict because save_model
+    # walks the module tree to dedupe shared tensors — that doesn't work on a gathered
+    # FSDP dict. pi0/pi05 has no tied weights, so save_file is safe here.
+    safetensors.torch.save_file(model_state, str(tmp_ckpt_dir / "model.safetensors"))
+    if ema_state is not None:
+        safetensors.torch.save_file(ema_state, str(tmp_ckpt_dir / "ema.safetensors"))
 
-        # Save optimizer state using PyTorch format
-        torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+    # Save optimizer state using PyTorch format
+    torch.save(optim_state, tmp_ckpt_dir / "optimizer.pt")
 
-        # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
-        metadata = {
-            "global_step": global_step,
-            "config": dataclasses.asdict(config),
-            "timestamp": time.time(),
-        }
-        torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+    # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
+    metadata = {
+        "global_step": global_step,
+        "config": dataclasses.asdict(config),
+        "timestamp": time.time(),
+    }
+    torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
 
-        # save norm stats
-        norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+    # save norm stats
+    norm_stats = data_config.norm_stats
+    if norm_stats is not None and data_config.asset_id is not None:
+        _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
 
-        # Atomically move temp directory to final location
-        if final_ckpt_dir.exists():
-            shutil.rmtree(final_ckpt_dir)
-        tmp_ckpt_dir.rename(final_ckpt_dir)
+    # Atomically move temp directory to final location
+    if final_ckpt_dir.exists():
+        shutil.rmtree(final_ckpt_dir)
+    tmp_ckpt_dir.rename(final_ckpt_dir)
 
-        logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
+    logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
-        # Log checkpoint to wandb
-        if config.wandb_enabled:
-            wandb.log({"checkpoint_step": global_step}, step=global_step)
+    # Log checkpoint to wandb
+    if config.wandb_enabled:
+        wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
-    """Load the latest checkpoint and return the global step."""
+def load_checkpoint(model, optimizer, checkpoint_dir, device, ema=None, *, is_fsdp: bool = False):
+    """Load the latest checkpoint and return the global step.
+
+    Returns (global_step, ema_loaded). ema_loaded is True if an EMA shadow file was
+    found and successfully loaded.
+    """
     checkpoint_steps = [
         int(d.name)
         for d in checkpoint_dir.iterdir()
@@ -214,37 +257,60 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         gc.collect()
         log_memory_usage(device, latest_step, "before_loading_checkpoint")
 
+    ema_loaded = False
     try:
         # Load model state with error handling
         logging.info("Loading model state...")
         safetensors_path = ckpt_dir / "model.safetensors"
 
-        if safetensors_path.exists():
+        if not safetensors_path.exists():
+            raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
+
+        if is_fsdp:
+            # Load full state dict on every rank, then let set_state_dict reshard.
+            from torch.distributed.checkpoint.state_dict import StateDictOptions
+            from torch.distributed.checkpoint.state_dict import set_state_dict
+
+            full_model_sd = safetensors.torch.load_file(str(safetensors_path), device="cpu")
+            full_optim_sd = torch.load(ckpt_dir / "optimizer.pt", map_location="cpu", weights_only=False)
+            opts = StateDictOptions(full_state_dict=True, broadcast_from_rank0=False)
+            set_state_dict(
+                model,
+                optimizer,
+                model_state_dict=full_model_sd,
+                optim_state_dict=full_optim_sd,
+                options=opts,
+            )
+            del full_model_sd, full_optim_sd
+            logging.info("Loaded model + optimizer state into FSDP-sharded model")
+        else:
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
             safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
             logging.info("Loaded model state from safetensors format")
-        else:
-            raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
 
-        torch.cuda.empty_cache()
-        gc.collect()
-        log_memory_usage(device, latest_step, "after_loading_model")
-
-        # Load optimizer state with error handling
-        logging.info("Loading optimizer state...")
-        optimizer_path = ckpt_dir / "optimizer.pt"
-
-        if optimizer_path.exists():
+            optimizer_path = ckpt_dir / "optimizer.pt"
+            if not optimizer_path.exists():
+                raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
             optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=False)
+            optimizer.load_state_dict(optimizer_state_dict)
+            del optimizer_state_dict
             logging.info("Loaded optimizer state from pt format")
-        else:
-            raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
 
-        optimizer.load_state_dict(optimizer_state_dict)
-        del optimizer_state_dict
         torch.cuda.empty_cache()
         gc.collect()
         log_memory_usage(device, latest_step, "after_loading_optimizer")
+
+        # Load EMA shadow if present and an EMA is configured.
+        if ema is not None:
+            ema_path = ckpt_dir / "ema.safetensors"
+            if ema_path.exists():
+                ema_state = safetensors.torch.load_file(str(ema_path), device="cpu")
+                ema.load_state_dict(ema_state)
+                ema_loaded = True
+                del ema_state
+                logging.info("Loaded EMA shadow from %s", ema_path)
+            else:
+                logging.warning("No EMA shadow found at %s; resetting EMA from current weights", ema_path)
 
         # Load metadata
         logging.info("Loading metadata...")
@@ -256,7 +322,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         log_memory_usage(device, latest_step, "after_loading_metadata")
 
         logging.info(f"Successfully loaded all checkpoint components from step {latest_step}")
-        return global_step
+        return global_step, ema_loaded
 
     except RuntimeError as e:
         if "out of memory" in str(e):
@@ -406,15 +472,59 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    # FSDP2 is the default distributed mode for multi-GPU PyTorch training. When the
+    # user leaves `fsdp_devices` at the default (1), we auto-promote to full sharding
+    # across all ranks (no DP replication). To get a hybrid FSDP/DP layout, set
+    # `--fsdp_devices N` explicitly with N dividing world_size. Single-GPU is unchanged.
+    if use_ddp:
+        if config.fsdp_devices > 1:
+            effective_fsdp_devices = config.fsdp_devices
+        else:
+            effective_fsdp_devices = world_size
+            logging.info(
+                "FSDP2 is the default for multi-GPU; sharding params across all %d ranks. "
+                "Set --fsdp_devices=N (N>1, N|world_size) to opt into a hybrid FSDP x DP layout.",
+                world_size,
+            )
+        use_fsdp = True
+    else:
+        effective_fsdp_devices = 1
+        use_fsdp = False
 
-    if hasattr(model, "gradient_checkpointing_enable"):
-        enable_gradient_checkpointing = True
+    # Build the model. With FSDP we keep it on CPU until fully_shard moves the right
+    # shard onto each device — this avoids OOM when constructing the full bf16 model.
+    init_device = torch.device("cpu") if use_fsdp else device
+    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(init_device)
+
+    # FSDP2 requires every parameter inside a wrapped unit to share the same original
+    # dtype (`_init_mp_dtypes`). PaliGemmaWithExpertModel's default behavior is to cast
+    # matmul params to bf16 while keeping norms/embeddings in fp32 — that mixed storage
+    # trips the assertion. Force uniform bf16 storage here; FSDP `MixedPrecisionPolicy`
+    # (in `apply_fsdp`) keeps reductions in fp32 for stability. Norms run in bf16 under
+    # FSDP, a minor divergence from the single-GPU path; gradients still reduce in fp32.
+    if use_fsdp and config.pytorch_training_precision == "bfloat16":
+        for p in model.parameters():
+            p.data = p.data.to(dtype=torch.bfloat16)
+        for b in model.buffers():
+            if b.dtype == torch.float32:
+                b.data = b.data.to(dtype=torch.bfloat16)
+        logging.info("FSDP2 path: forced uniform bf16 storage so MixedPrecisionPolicy can wrap the model")
+
+    enable_gradient_checkpointing = bool(getattr(model_cfg, "pytorch_gradient_checkpointing", True))
+    if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
         logging.info("Enabled gradient checkpointing for memory optimization")
     else:
         enable_gradient_checkpointing = False
-        logging.info("Gradient checkpointing is not supported for this model")
+        logging.info("Gradient checkpointing is disabled")
+
+    # Load weights *before* wrapping with FSDP/DDP so the safetensors layout matches the
+    # unwrapped state dict.
+    if config.pytorch_weight_path is not None:
+        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
+        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
+        safetensors.torch.load_model(model, model_path)
+        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():
@@ -429,24 +539,23 @@ def train_loop(config: _config.TrainConfig):
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
-    if use_ddp:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model,
-            device_ids=[device.index] if device.type == "cuda" else None,
-            find_unused_parameters=True,  # Disable for memory efficiency
-            gradient_as_bucket_view=True,  # Enable for memory efficiency
-            static_graph=world_size >= 8,  # Enable for 8+ GPUs
+    if use_fsdp:
+        param_dtype = (
+            torch.bfloat16 if config.pytorch_training_precision == "bfloat16" else torch.float32
         )
-
-    # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
-
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
+        # Re-pin the per-rank device immediately before mesh + fully_shard. Some
+        # earlier import/util (e.g. JAX's xla_bridge, wandb image logging) can reset
+        # the current CUDA device; FSDP2 infers placement from `torch.cuda.current_device()`,
+        # so we make sure rank N is sitting on cuda:N here.
+        if torch.cuda.is_available():
+            torch.cuda.set_device(device)
+        logging.info(
+            "Pre-FSDP device check: local_rank=%d device=%s current_device=%d",
+            local_rank, device, torch.cuda.current_device(),
         )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        mesh = _pt_utils.build_device_mesh(world_size, effective_fsdp_devices)
+        model = _pt_utils.apply_fsdp(model, mesh, param_dtype=param_dtype)
+        # FSDP2 places shards on each rank's GPU automatically.
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -454,19 +563,32 @@ def train_loop(config: _config.TrainConfig):
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
 
-    # Create optimizer with config parameters
+    # Create optimizer with config parameters. Fused AdamW is ~10% faster and is supported
+    # for DTensor params (FSDP2) since torch 2.4.
     optim = torch.optim.AdamW(
         model.parameters(),
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
+        fused=torch.cuda.is_available(),
     )
+
+    # EMA shadow (after wrapping so DTensor placements line up with FSDP).
+    ema = None
+    if config.ema_decay is not None:
+        ema = _pt_utils.EmaModel(model, decay=config.ema_decay, device=device)
+        logging.info("EMA enabled with decay=%s", config.ema_decay)
 
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step, _ema_loaded = load_checkpoint(
+            model, optim, config.checkpoint_dir, device, ema=ema, is_fsdp=use_fsdp
+        )
+        if ema is not None and not _ema_loaded:
+            # Re-init shadow from the just-loaded model weights.
+            ema = _pt_utils.EmaModel(model, decay=config.ema_decay, device=device)
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -496,8 +618,18 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
         )
-        logging.info("EMA is not supported for PyTorch training")
+        if ema is not None:
+            logging.info(f"EMA enabled (decay={config.ema_decay})")
+        else:
+            logging.info("EMA disabled (config.ema_decay is None)")
+        logging.info(
+            "Distributed mode: %s",
+            f"FSDP2 (fsdp_devices={effective_fsdp_devices}, dp={world_size // effective_fsdp_devices})"
+            if use_fsdp
+            else "single-GPU",
+        )
         logging.info(f"Training precision: {model_cfg.dtype}")
+        logging.info(f"Compile training forward: {getattr(model_cfg, 'pytorch_compile_train', False)}")
 
     # Training loop - iterate until we reach num_train_steps
     pbar = (
@@ -549,11 +681,9 @@ def train_loop(config: _config.TrainConfig):
             optim.step()
             optim.zero_grad(set_to_none=True)
 
-            # Clear gradients more aggressively
-            for param in model.parameters():
-                if param.grad is not None:
-                    param.grad.detach_()
-                    param.grad = None
+            # EMA shadow update (after the optimizer step, before grads are reset).
+            if ema is not None:
+                ema.update(model)
 
             # Collect stats
             if is_main:
@@ -602,7 +732,9 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(
+                model, optim, global_step, config, is_main, data_config, ema=ema, is_fsdp=use_fsdp
+            )
 
             # Update progress bar
             if pbar is not None:
