@@ -517,6 +517,9 @@ class TrainConfig:
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
+    # If true, save optimizer state in checkpoints (needed for resuming training).
+    save_optimizer: bool = False
+
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
     # If true, will resume training from the last checkpoint.
@@ -760,6 +763,9 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="./checkpoints/pi05_base_pytorch",
         num_train_steps=30_000,
+        save_interval=30_000,
+        keep_period=30_000
+
     ),
     # Debug variant of pi05_libero for a 2x A6000 (or similar small multi-GPU) box. Same data + model
     # as pi05_libero, but tiny batch + few steps so a smoke run finishes quickly. Reuses

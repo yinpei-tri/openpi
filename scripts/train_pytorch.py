@@ -172,7 +172,8 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
             safetensors.torch.save_file(ema.full_state_dict(), str(tmp_ckpt_dir / "ema.safetensors"))
 
         # Save optimizer state using PyTorch format
-        torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+        if config.save_optimizer:
+            torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
 
         # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
         metadata = {
@@ -236,20 +237,19 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device, ema=None):
         log_memory_usage(device, latest_step, "after_loading_model")
 
         # Load optimizer state with error handling
-        logging.info("Loading optimizer state...")
         optimizer_path = ckpt_dir / "optimizer.pt"
 
         if optimizer_path.exists():
+            logging.info("Loading optimizer state...")
             optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=False)
+            optimizer.load_state_dict(optimizer_state_dict)
+            del optimizer_state_dict
+            torch.cuda.empty_cache()
+            gc.collect()
             logging.info("Loaded optimizer state from pt format")
+            log_memory_usage(device, latest_step, "after_loading_optimizer")
         else:
-            raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
-
-        optimizer.load_state_dict(optimizer_state_dict)
-        del optimizer_state_dict
-        torch.cuda.empty_cache()
-        gc.collect()
-        log_memory_usage(device, latest_step, "after_loading_optimizer")
+            logging.info("No optimizer state found, starting optimizer from scratch")
 
         # Load EMA shadow if present and an EMA is configured.
         ema_loaded = False

@@ -67,6 +67,8 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    *,
+    save_optimizer: bool = False,
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -78,6 +80,8 @@ def save_state(
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
         train_state, params = _split_params(state)
+    if not save_optimizer:
+        train_state = dataclasses.replace(train_state, opt_state={})
     items = {
         "assets": save_assets,
         "train_state": train_state,
@@ -97,13 +101,27 @@ def restore_state(
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
-        restored = checkpoint_manager.restore(
-            step,
-            items={
-                "train_state": train_state,
-                "params": {"params": params},
-            },
-        )
+        # Try restoring with full train_state (including optimizer). If the checkpoint
+        # was saved without optimizer state, fall back to restoring only params.
+        try:
+            restored = checkpoint_manager.restore(
+                step,
+                items={
+                    "train_state": train_state,
+                    "params": {"params": params},
+                },
+            )
+        except Exception:
+            logging.warning("Could not restore optimizer state from checkpoint, restoring params only")
+            train_state_no_opt = dataclasses.replace(train_state, opt_state={})
+            restored = checkpoint_manager.restore(
+                step,
+                items={
+                    "train_state": train_state_no_opt,
+                    "params": {"params": params},
+                },
+            )
+            restored["train_state"] = dataclasses.replace(restored["train_state"], opt_state=state.opt_state)
     return _merge_params(restored["train_state"], restored["params"])
 
 
