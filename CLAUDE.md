@@ -59,7 +59,7 @@ Training, inference, and the policy server are all driven by a single registry o
   ```bash
   cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
   ```
-  This mutates the uv cache (hardlinks); use `uv cache clean transformers` to undo. PyTorch path **does not yet support** π₀-FAST, mixed precision, FSDP, LoRA, or EMA.
+  This mutates the uv cache (hardlinks); use `uv cache clean transformers` to undo. PyTorch path **does not yet support** π₀-FAST or LoRA. It does support FSDP2 (multi-GPU/multi-node via `torchrun`), EMA (`config.ema_decay`), `torch.compile` (`model.pytorch_compile_train`), and gradient checkpointing.
 
 `policy_config.create_trained_policy` auto-detects PyTorch checkpoints by the presence of `model.safetensors` in the checkpoint dir; otherwise it loads JAX `params/` via Orbax. The two backends share the same `TrainConfig`, transforms, normalization, and `Policy` wrapper — only weight loading and the forward pass differ.
 
@@ -77,7 +77,7 @@ Outputs run in reverse. `compute_norm_stats.py` produces the `norm_stats.json` t
 ### Training scripts
 
 - `scripts/train.py` — JAX trainer. Uses `nnx.split`/`nnx.merge`, `optax`, FSDP via `openpi.training.sharding`, Orbax checkpoints in `openpi.training.checkpoints`, wandb logging.
-- `scripts/train_pytorch.py` — PyTorch trainer (single-GPU and `torchrun` multi-GPU/multi-node). Loads from `pytorch_weight_path` set in the config.
+- `scripts/train_pytorch.py` — PyTorch trainer (single-GPU and `torchrun` multi-GPU/multi-node with FSDP2). Supports EMA, `torch.compile`, gradient checkpointing. Loads from `pytorch_weight_path` set in the config.
 - `examples/convert_jax_model_to_pytorch.py` — required to use PyTorch finetuning starting from a JAX checkpoint.
 
 ### Policy serving
