@@ -1,5 +1,9 @@
+from __future__ import annotations
+
 import collections
 import dataclasses
+import datetime
+import json
 import logging
 import math
 import pathlib
@@ -24,7 +28,7 @@ class Args:
     # Model server parameters
     #################################################################################################################
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 8010
     resize_size: int = 224
     replan_steps: int = 5
 
@@ -40,7 +44,11 @@ class Args:
     #################################################################################################################
     # Utils
     #################################################################################################################
-    video_out_path: str = "data/libero/videos"  # Path to save videos
+    # Name of this run. Outputs (videos + results.json) go under <results_root>/<run_name>/.
+    # If empty, falls back to a timestamped name.
+    run_name: str = ""
+    # Root directory for all eval runs.
+    results_root: str = "data/libero/results"
 
     seed: int = 7  # Random Seed (for reproducibility)
 
@@ -55,7 +63,16 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    run_name = args.run_name or datetime.datetime.now(tz=datetime.timezone.utc).strftime("run_%Y%m%d_%H%M%S")  # noqa: UP017
+    run_dir = pathlib.Path(args.results_root) / run_name
+    suite_dir = run_dir / args.task_suite_name
+    video_dir = suite_dir / "videos"
+    video_dir.mkdir(parents=True, exist_ok=True)
+    results_path = suite_dir / "results.json"
+    logging.info(f"Saving results to {results_path}")
+
+    per_episode: list[dict] = []
+    per_task: list[dict] = []
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -164,13 +181,25 @@ def eval_libero(args: Args) -> None:
             task_episodes += 1
             total_episodes += 1
 
-            # Save a replay video of the episode
+            # Save a replay video of the episode (filename includes task + episode index so we keep all rollouts).
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")
+            video_path = video_dir / f"task{task_id:02d}_ep{episode_idx:03d}_{task_segment}_{suffix}.mp4"
             imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
+                video_path,
                 [np.asarray(x) for x in replay_images],
                 fps=10,
+            )
+
+            per_episode.append(
+                {
+                    "task_id": task_id,
+                    "task_description": task_description,
+                    "episode_idx": episode_idx,
+                    "success": bool(done),
+                    "steps": t,
+                    "video": str(video_path.relative_to(run_dir)),
+                }
             )
 
             # Log current results
@@ -178,12 +207,79 @@ def eval_libero(args: Args) -> None:
             logging.info(f"# episodes completed so far: {total_episodes}")
             logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
+            # Persist incrementally so a crash mid-suite still leaves usable results on disk.
+            _write_results(
+                results_path,
+                args=args,
+                run_name=run_name,
+                per_episode=per_episode,
+                per_task=per_task,
+                total_episodes=total_episodes,
+                total_successes=total_successes,
+                completed=False,
+            )
+
+        per_task.append(
+            {
+                "task_id": task_id,
+                "task_description": task_description,
+                "episodes": task_episodes,
+                "successes": task_successes,
+                "success_rate": float(task_successes) / float(task_episodes) if task_episodes else 0.0,
+            }
+        )
+
         # Log final results
         logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
         logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
+
+    _write_results(
+        results_path,
+        args=args,
+        run_name=run_name,
+        per_episode=per_episode,
+        per_task=per_task,
+        total_episodes=total_episodes,
+        total_successes=total_successes,
+        completed=True,
+    )
+
+
+def _write_results(
+    results_path: pathlib.Path,
+    *,
+    args: "Args",
+    run_name: str,
+    per_episode: list[dict],
+    per_task: list[dict],
+    total_episodes: int,
+    total_successes: int,
+    completed: bool,
+) -> None:
+    payload = {
+        "run_name": run_name,
+        "task_suite": args.task_suite_name,
+        "num_trials_per_task": args.num_trials_per_task,
+        "seed": args.seed,
+        "host": args.host,
+        "port": args.port,
+        "replan_steps": args.replan_steps,
+        "resize_size": args.resize_size,
+        "completed": completed,
+        "total_episodes": total_episodes,
+        "total_successes": total_successes,
+        "total_success_rate": (total_successes / total_episodes) if total_episodes else 0.0,
+        "per_task": per_task,
+        "per_episode": per_episode,
+        "updated_at": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(timespec="seconds"),  # noqa: UP017
+    }
+    tmp_path = results_path.with_suffix(".json.tmp")
+    with tmp_path.open("w") as f:
+        json.dump(payload, f, indent=2)
+    tmp_path.replace(results_path)
 
 
 def _get_libero_env(task, resolution, seed):
