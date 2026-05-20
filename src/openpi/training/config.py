@@ -763,8 +763,8 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="./checkpoints/pi05_base_pytorch",
         num_train_steps=30_000,
-        save_interval=30_000,
-        keep_period=30_000
+        save_interval=10_000,
+        keep_period=10_000
 
     ),
     # Debug variant of pi05_libero for a 2x A6000 (or similar small multi-GPU) box. Same data + model
