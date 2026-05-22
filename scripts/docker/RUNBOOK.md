@@ -227,18 +227,18 @@ Terminal 1 — JAX on GPUs 0–3:
 ```bash
 NVIDIA_VISIBLE_DEVICES=0,1,2,3 \
 TRAIN_CONFIG=pi05_libero \
-EXP_NAME=libero_a100_jax \
+EXP_NAME=libero_a100_jax_statsfix_bs64 \
 TRAIN_ARGS="--fsdp-devices=4 --overwrite" \
-    docker compose -p openpi_jax -f scripts/docker/train.compose.yml up
-```
+    docker compose -p openpi_jax -f scripts/docker/train.compose.yml up 2>&1 | tee train_libero_a100_jax_statsfix_bs64.log 
+``` 
 
 Terminal 2 — PyTorch on GPUs 4–7:
 
 ```bash
 NVIDIA_VISIBLE_DEVICES=4,5,6,7 \
 TRAIN_CMD="torchrun --standalone --nnodes=1 --nproc_per_node=4 \
-    scripts/train_pytorch.py pi05_libero --exp_name=libero_a100_pt" \
-    docker compose -p openpi_pt -f scripts/docker/train.compose.yml up
+    scripts/train_pytorch.py pi05_libero --exp_name=libero_a100_pt_statsfix_bs64" \
+    docker compose -p openpi_pt -f scripts/docker/train.compose.yml up 2>&1 | tee train_libero_a100_pt_statsfix_bs64.log
 ```
 
 Notes:

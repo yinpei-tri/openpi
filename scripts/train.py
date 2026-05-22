@@ -2,6 +2,7 @@ import dataclasses
 import functools
 import logging
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -191,7 +192,7 @@ def train_step(
     return new_state, info
 
 
-def main(config: _config.TrainConfig):
+def main(config: _config.TrainConfig, tentative_run: bool = False):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
 
@@ -248,6 +249,8 @@ def main(config: _config.TrainConfig):
     )
 
     start_step = int(train_state.step)
+    tentative_run_step = start_step + 10
+
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -269,6 +272,10 @@ def main(config: _config.TrainConfig):
             infos = []
         batch = next(data_iter)
 
+        if tentative_run and step > tentative_run_step:
+            logging.info("==========Tentative run completed==========")
+            break
+
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step, save_optimizer=config.save_optimizer)
 
@@ -277,4 +284,7 @@ def main(config: _config.TrainConfig):
 
 
 if __name__ == "__main__":
-    main(_config.cli())
+    config = _config.cli()
+    main(config, tentative_run=True)
+    time.sleep(20)
+    main(dataclasses.replace(config, resume=True))
