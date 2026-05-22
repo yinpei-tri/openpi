@@ -40,8 +40,6 @@ services:
       # private home, not the user's real home.
       - ${OPENPI_DATA_HOME:-${HOME}/.cache/openpi}:/openpi_assets
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/cache/huggingface
-      # Where wandb writes its local run dirs (handy if WANDB_MODE=offline).
-      - ${WANDB_DIR:-./wandb}:/app/wandb
     environment:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility

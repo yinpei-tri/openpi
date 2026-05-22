@@ -751,7 +751,8 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
-        batch_size=128,
+        batch_size=64,
+        num_workers=4,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=10_000,
             peak_lr=5e-5,
@@ -792,7 +793,7 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="./checkpoints/pi05_base_pytorch",
         num_train_steps=200,
-        save_interval=100,
+        save_interval=10,
         log_interval=10,
         keep_period=None,
     ),

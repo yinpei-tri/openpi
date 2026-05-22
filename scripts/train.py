@@ -210,13 +210,16 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
-    checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
-        config.checkpoint_dir,
-        keep_period=config.keep_period,
-        overwrite=config.overwrite,
-        resume=config.resume,
-    )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    if tentative_run:
+        checkpoint_manager, resuming = None, False
+    else:
+        checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
+            config.checkpoint_dir,
+            keep_period=config.keep_period,
+            overwrite=config.overwrite,
+            resume=config.resume,
+        )
+    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled and not tentative_run)
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -276,15 +279,16 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             logging.info("==========Tentative run completed==========")
             break
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        if checkpoint_manager and ((step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1):
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step, save_optimizer=config.save_optimizer)
 
-    logging.info("Waiting for checkpoint manager to finish")
-    checkpoint_manager.wait_until_finished()
+    if checkpoint_manager:
+        logging.info("Waiting for checkpoint manager to finish")
+        checkpoint_manager.wait_until_finished()
 
 
 if __name__ == "__main__":
     config = _config.cli()
     main(config, tentative_run=True)
     time.sleep(20)
-    main(dataclasses.replace(config, resume=True))
+    main(config)

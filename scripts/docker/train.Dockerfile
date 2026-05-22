@@ -74,7 +74,7 @@ ENV HF_HOME=/cache/huggingface
 ENV HOME=/cache
 ENV UV_CACHE_DIR=/cache/uv
 ENV TRITON_CACHE_DIR=/cache/triton
-ENV WANDB_DIR=/app/wandb
+ENV WANDB_DIR=/app
 RUN mkdir -p /cache/huggingface /cache/uv /cache/triton && chmod -R 0777 /cache
 # Give JAX more device memory by default; override at runtime if needed.
 ENV XLA_PYTHON_CLIENT_MEM_FRACTION=0.9
