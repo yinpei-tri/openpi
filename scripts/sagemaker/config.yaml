@@ -1,0 +1,86 @@
+# SageMaker launch config for openpi pi05_libero PyTorch training.
+# Override any field on the CLI:
+#   python scripts/sagemaker/launch.py --instance.type=p5 --training.exp_name=run2
+
+aws:
+  region: us-west-2
+  profile: sagemaker
+  # Either fill in here or set $SAGEMAKER_ARN.
+  role_arn: arn:aws:iam::124224456861:role/service-role/SageMaker-SageMakerAllAccess
+
+job:
+  user: yinpeidai
+  name_prefix: pi05-libero-pt
+  max_run_days: 4
+  volume_size: 200            # GB. Need room for /opt/ml/checkpoints (~30GB) + caches.
+  tags:
+    - key: tri.owner.email
+      value: yinpeidai@tri.global
+    - key: tri.project
+      value: MM:PJ-0077
+
+queue:
+  name: vla
+  priority: 10
+  share_identifier: default
+
+instance:
+  type: p5                    # one of: p4d, p4de, p5, p5en, p6
+  count: 1
+
+image:
+  base: 763104351884.dkr.ecr.{region}.amazonaws.com/pytorch-training:2.8.0-gpu-py312-cu129-ubuntu22.04-sagemaker
+  repo_name: yinpeidai-openpi-train
+
+# Two S3 channels mounted into the container at /opt/ml/input/data/<channel>/.
+# All read-only via FastFile. Layout expected by sm_entrypoint.sh:
+#   libero/{data,meta}/...           (raw LeRobot tree at the channel root;
+#                                     entrypoint symlinks to physical-
+#                                     intelligence/libero/ so HF_LEROBOT_HOME
+#                                     resolves)
+#   base_ckpt/model.safetensors      (PyTorch port of pi05_base)
+#
+# Norm-stats assets are tiny (~20 KB) and baked into the image at
+# /opt/ml/code/assets/pi05_libero/, so no `assets` channel is needed.
+data:
+  channels:
+    libero:
+      s3_uri: s3://tri-ml-datasets-uw2/yinpeidai/data/libero/
+      input_mode: FastFile
+    base_ckpt:
+      s3_uri: s3://tri-ml-datasets-uw2/yinpeidai/openpi/released_ckpt/openpi-assets/checkpoints/pi05_base_pytorch/
+      input_mode: FastFile
+
+  # Upload-only mirrors. Not mounted into the training job — exist so we have
+  # an authoritative S3 copy independent of any local ~/.cache/. Useful for
+  # future in-cloud conversion (JAX -> PyTorch), JAX-trainer SageMaker jobs,
+  # and disaster recovery.
+  uploads:
+    base_jax:
+      # Mirror of gs://openpi-assets/checkpoints/pi05_base (orbax checkpoint).
+      s3_uri: s3://tri-ml-datasets-uw2/yinpeidai/openpi/released_ckpt/openpi-assets/checkpoints/pi05_base/
+      local_path: ~/.cache/openpi/openpi-assets/checkpoints/pi05_base
+    libero_pytorch:
+      # Mirror of the released pi05_libero PyTorch ckpt (for eval / resume).
+      s3_uri: s3://tri-ml-datasets-uw2/yinpeidai/openpi/released_ckpt/openpi-assets/checkpoints/pi05_libero_pytorch/
+      local_path: ~/.cache/openpi/openpi-assets/checkpoints/pi05_libero_pytorch
+
+training:
+  config: pi05_libero
+  exp_name: sagemaker_p5_run1
+  resume: false
+  overwrite: false
+  # Free-form extra args appended to scripts/train_pytorch.py.
+  # E.g. "--num_train_steps=10000 --save_interval=2000".
+  extra_args: ""
+
+output:
+  # Checkpoint sync target. SageMaker mirrors /opt/ml/checkpoints/ <-> s3_prefix
+  # continuously while the job runs (so a spot interruption doesn't lose the
+  # latest checkpoint).
+  s3_prefix: s3://tri-ml-datasets-uw2/yinpeidai/openpi/checkpoints/
+  checkpoint_local_path: /opt/ml/checkpoints
+
+wandb:
+  enabled: true
+  project: openpi-libero-sagemaker

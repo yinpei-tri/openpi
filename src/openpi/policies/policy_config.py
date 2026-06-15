@@ -22,6 +22,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    use_ema: bool = True,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,6 +38,9 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        use_ema: For PyTorch checkpoints, overlay `ema.safetensors` on top of the live weights when
+            present. Matches the JAX path, which serializes EMA params into `params/`. No-op for
+            JAX checkpoints (their `params/` is already the EMA when EMA was enabled).
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -51,7 +55,9 @@ def create_trained_policy(
 
     logging.info("Loading model...")
     if is_pytorch:
-        model = train_config.model.load_pytorch(train_config, weight_path)
+        ema_path = os.path.join(checkpoint_dir, "ema.safetensors")
+        ema_path = ema_path if (use_ema and os.path.exists(ema_path)) else None
+        model = train_config.model.load_pytorch(train_config, weight_path, ema_path=ema_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))

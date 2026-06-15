@@ -240,10 +240,19 @@ class BaseModelConfig(abc.ABC):
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
 
-    def load_pytorch(self, train_config, weight_path: str):
+    def load_pytorch(self, train_config, weight_path: str, *, ema_path: str | None = None):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
         safetensors.torch.load_model(model, weight_path)
+        if ema_path is not None:
+            # EMA shadow only contains trainable params (filtered by requires_grad in EmaModel),
+            # so we overlay it on top of the live weights rather than loading it standalone —
+            # buffers and frozen params come from model.safetensors.
+            ema_state = safetensors.torch.load_file(ema_path, device="cpu")
+            missing, unexpected = model.load_state_dict(ema_state, strict=False)
+            if unexpected:
+                raise RuntimeError(f"Unexpected keys in EMA shadow at {ema_path}: {unexpected}")
+            logger.info("Loaded EMA weights from %s (overlaid %d tensors)", ema_path, len(ema_state))
         return model
 
     @abc.abstractmethod
