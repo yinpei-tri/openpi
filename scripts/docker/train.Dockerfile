@@ -19,8 +19,11 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
 
 WORKDIR /app
 
+# `libgl1` alone does not always provide libGL.so.1 on Ubuntu 22.04; libglx-mesa0
+# + libgl1-mesa-dri guarantee it (needed by cv2/OpenCV pulled transitively via lerobot).
 RUN apt-get update && apt-get install -y \
     git git-lfs linux-headers-generic build-essential clang libgl1 libglib2.0-0 \
+    libglx-mesa0 libgl1-mesa-dri \
  && rm -rf /var/lib/apt/lists/*
 
 ENV UV_LINK_MODE=copy

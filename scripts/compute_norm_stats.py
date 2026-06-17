@@ -86,11 +86,55 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
+def create_robocasa_webdataset_dataloader(
+    data_config: _config.DataConfig,
+    batch_size: int,
+    max_frames: int | None = None,
+) -> tuple[_data_loader.Dataset, int]:
+    """Stream RoboCasa WebDataset shards through repack+data_transforms for stats.
+
+    Stats land on the lean state + 12-d action (data transforms run, but NOT
+    Normalize/model_transforms) — exactly what training normalizes.
+
+    IMPORTANT: force ``subgoal_action_pad="episode"`` for the stats pass. The action
+    distribution is a property of the real robot commands and must NOT depend on the
+    padding strategy. The subtask-padded chunks zero ~30-40% of steps (every subgoal
+    boundary), which would heavily bias the scale toward zero. The episode chunk only
+    zero-pads the <1% episode-end tail — and for DELTA actions a zero delta means
+    "hold/stop", which is in-distribution (the robot passes through zero constantly),
+    so counting it is analogous to openpi/LeRobot copy-padding absolute actions and
+    counting them. One stats set serves BOTH ablation checkpoints (episode + subtask
+    targets) — the pad strategy is a TARGET choice, normalized identically.
+    """
+    import dataclasses as _dc
+
+    from openpi.training import robocasa_webdataset as _wds
+
+    settings = data_config.robocasa_webdataset_settings or _wds.WebDatasetConfig(
+        shards=data_config.robocasa_webdataset_shards
+    )
+    settings = _dc.replace(settings, subgoal_action_pad="episode")
+    inner = _wds.RoboCasaWebDataset(settings)
+    dataset = _data_loader._TorchIterableTransformed(
+        inner,
+        [*data_config.repack_transforms.inputs, *data_config.data_transforms.inputs, RemoveStrings()],
+    )
+    num_batches = (max_frames or len(inner) or 100_000) // batch_size
+    data_loader = _data_loader.TorchDataLoader(
+        dataset, local_batch_size=batch_size, num_workers=0, shuffle=False, num_batches=num_batches
+    )
+    return data_loader, num_batches
+
+
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
 
-    if data_config.rlds_data_dir is not None:
+    if data_config.robocasa_webdataset_shards is not None:
+        data_loader, num_batches = create_robocasa_webdataset_dataloader(
+            data_config, config.batch_size, max_frames
+        )
+    elif data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
             data_config, config.model.action_horizon, config.batch_size, max_frames
         )

@@ -106,6 +106,11 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # System1 progress head target: subgoal-completion fraction in [0,1] for the
+    # current frame within its subgoal span (raw fraction; x**k shaping applied in
+    # the loss). None for datasets without subgoal annotations.
+    progress: at.Float[ArrayT, "*b"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +131,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            progress=data.get("progress_frac"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -148,15 +154,28 @@ def preprocess_observation(
     train: bool = False,
     image_keys: Sequence[str] = IMAGE_KEYS,
     image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+    geometric_aug_cameras: Sequence[str] | None = None,
 ) -> Observation:
     """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
     filling in a default image mask (if necessary).
+
+    ``geometric_aug_cameras``: if provided, geometric augmentation (random crop +
+    rotate) is applied to exactly these image keys; all others get color-jitter
+    only. This is the explicit-list routing used for RoboCasa's 2-scene/1-wrist
+    layout. For System1 the anchor scene cams are included too (anchors get the
+    same aug as current views). If None, falls back to the legacy rule (geom aug
+    iff "wrist" not in key).
     """
 
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
     batch_shape = observation.state.shape[:-1]
+
+    def _wants_geom_aug(key: str) -> bool:
+        if geometric_aug_cameras is not None:
+            return key in geometric_aug_cameras
+        return "wrist" not in key
 
     out_images = {}
     for key in image_keys:
@@ -170,7 +189,7 @@ def preprocess_observation(
             image = image / 2.0 + 0.5
 
             transforms = []
-            if "wrist" not in key:
+            if _wants_geom_aug(key):
                 height, width = image.shape[1:3]
                 transforms += [
                     augmax.RandomCrop(int(width * 0.95), int(height * 0.95)),
@@ -205,6 +224,7 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        progress=observation.progress,
     )
 
 

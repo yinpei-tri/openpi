@@ -42,12 +42,24 @@ services:
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/cache/huggingface
       # Where wandb writes its local run dirs (handy if WANDB_MODE=offline).
       - ${WANDB_DIR:-./wandb}:/app/wandb
+      # RoboCasa System1 dataset (shards + anchors). Mounted read-only at a fixed
+      # in-container path; the config reads ROBOCASA_SHARDS_DIR (set below).
+      - ${ROBOCASA_DATA_HOST:-/home/yinpeidai/RoboAnnotator/data/robocasa_system1}:/data/robocasa_system1:ro
     environment:
       - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - OPENPI_DATA_HOME=/openpi_assets
       - HF_HOME=/cache/huggingface
       - XLA_PYTHON_CLIENT_MEM_FRACTION=${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.9}
+      # Point the RoboCasa config at the in-container mount (loader derives the
+      # anchors/ sibling automatically). Set to an s3:// prefix to stream from S3
+      # (then pass AWS creds below — the boto3 loader reads them).
+      - ROBOCASA_SHARDS_DIR=${ROBOCASA_SHARDS_DIR:-/data/robocasa_system1/shards}
+      # AWS creds passthrough (for s3:// shards). Empty when training from the local mount.
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2}
       - WANDB_API_KEY
       - WANDB_MODE=${WANDB_MODE:-offline}
       # Pass-through for the default CMD.

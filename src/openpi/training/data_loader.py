@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+import dataclasses
 import logging
 import multiprocessing
 import os
@@ -242,6 +243,18 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
+    if data_config.robocasa_webdataset_shards is not None:
+        return create_robocasa_webdataset_data_loader(
+            data_config,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            skip_norm_stats=skip_norm_stats,
+            framework=framework,
+        )
+
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
@@ -337,6 +350,81 @@ def create_torch_data_loader(
     return DataLoaderImpl(data_config, data_loader)
 
 
+class _TorchIterableTransformed(torch.utils.data.IterableDataset):
+    """Torch IterableDataset wrapping a RoboCasa WebDataset + per-sample transforms.
+
+    Yields individual transformed samples (dicts of numpy arrays); the surrounding
+    TorchDataLoader handles per-worker sharding (the inner dataset reads
+    torch.get_worker_info()), batching, collation, and JAX sharding.
+    """
+
+    def __init__(self, inner, transforms: Sequence[_transforms.DataTransformFn]):
+        self._inner = inner
+        self._transform = _transforms.compose(transforms)
+
+    def set_epoch(self, epoch: int) -> None:
+        if hasattr(self._inner, "set_epoch"):
+            self._inner.set_epoch(epoch)
+
+    def __iter__(self):
+        for sample in self._inner:
+            yield self._transform(sample)
+
+    def __len__(self) -> int:
+        return len(self._inner)
+
+
+def create_robocasa_webdataset_data_loader(
+    data_config: _config.DataConfig,
+    *,
+    batch_size: int,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    num_workers: int = 0,
+    seed: int = 0,
+    skip_norm_stats: bool = False,
+    framework: str = "jax",
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create the streaming RoboCasa System1 WebDataset loader (local shards or s3://)."""
+    from openpi.training import robocasa_webdataset as _wds
+
+    settings = data_config.robocasa_webdataset_settings or _wds.WebDatasetConfig(
+        shards=data_config.robocasa_webdataset_shards
+    )
+    settings = dataclasses.replace(settings, shards=data_config.robocasa_webdataset_shards, seed=seed)
+    inner = _wds.RoboCasaWebDataset(settings)
+
+    norm_stats = {}
+    if not skip_norm_stats:
+        if data_config.norm_stats is None:
+            raise ValueError(
+                "Normalization stats not found. Run scripts/compute_norm_stats.py --config-name=<your-config>."
+            )
+        norm_stats = data_config.norm_stats
+
+    transforms = [
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+        _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        *data_config.model_transforms.inputs,
+    ]
+    dataset = _TorchIterableTransformed(inner, transforms)
+
+    local_batch_size = batch_size // (jax.process_count() if framework == "jax" else 1)
+    data_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=local_batch_size,
+        sharding=None if framework == "pytorch" else sharding,
+        shuffle=False,  # streaming shuffle happens inside the iterable
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=seed,
+        framework=framework,
+    )
+    return DataLoaderImpl(data_config, data_loader)
+
+
 def create_rlds_data_loader(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -412,7 +500,10 @@ class TorchDataLoader:
         if jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
-        if len(dataset) < local_batch_size:
+        # Iterable (streaming) datasets have no meaningful/known length; skip the
+        # size guard for them. Map-style datasets keep the check.
+        is_iterable = isinstance(dataset, torch.utils.data.IterableDataset)
+        if not is_iterable and len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
         # Store sharding - None for PyTorch, JAX sharding for JAX

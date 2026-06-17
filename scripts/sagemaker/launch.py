@@ -129,10 +129,14 @@ def build_and_push_image(cfg: dict) -> str:
         f"{account}.dkr.ecr.{region}.amazonaws.com"
     )
 
+    # Trainer entrypoint baked into the image: sm_entrypoint.sh (PyTorch, default)
+    # or sm_entrypoint_jax.sh (JAX scripts/train.py). Set image.sm_entrypoint in config.
+    sm_entrypoint = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh")
+
     run(login_dlc)
     run(
         f"docker build --progress=plain -f {dockerfile} "
-        f"--build-arg AWS_REGION={region} -t {repo} ."
+        f"--build-arg AWS_REGION={region} --build-arg SM_ENTRYPOINT={sm_entrypoint} -t {repo} ."
     )
     run(f"docker tag {repo} {fullname}")
     run(login_self)
@@ -305,9 +309,14 @@ def main() -> None:
         checkpoint_local_path=None if local else cfg["output"]["checkpoint_local_path"],
         checkpoint_s3_uri=None if local else checkpoint_s3_uri,
         output_path=cfg["output"]["s3_prefix"],
-        # torch_distributed launches one process per GPU; sm_entrypoint.sh
-        # picks SM_NUM_GPUS / SM_HOST_COUNT off the env and runs torchrun.
-        distribution={"torch_distributed": {"enabled": True}},
+        # torch_distributed launches one process per GPU (PyTorch entrypoint runs
+        # torchrun). The JAX trainer is a SINGLE process that shards over all GPUs
+        # itself, so it must NOT use torch_distributed. Gate on image.sm_entrypoint.
+        distribution=(
+            {}
+            if cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh") == "sm_entrypoint_jax.sh"
+            else {"torch_distributed": {"enabled": True}}
+        ),
         max_run=max_run_seconds,
         environment=env,
         keep_alive_period_in_seconds=5 * 60,

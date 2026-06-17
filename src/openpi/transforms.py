@@ -326,12 +326,21 @@ class PromptFromLeRobotTask(DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
-    """Zero-pads states and actions to the model action dimension."""
+    """Zero-pads states and actions to the model action dimension.
+
+    ``pad_state`` should be False for pi0.5, which discretizes the state into the
+    prompt text (no fixed-width ``state_proj``); padding it there only injects
+    meaningless ``0`` tokens into the prompt and wastes the token budget. pi0
+    projects the state with a Linear built at ``action_dim`` and therefore needs
+    the padding (default True for backward compatibility).
+    """
 
     model_action_dim: int
+    pad_state: bool = True
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
+        if self.pad_state:
+            data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
         return data

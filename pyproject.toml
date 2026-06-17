@@ -38,6 +38,9 @@ dependencies = [
     "transformers==4.53.2",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    # boto3 is a TRAINER runtime dep now: the RoboCasa System1 WebDataset loader
+    # streams shards/anchors from s3:// via boto3 (not just a workstation launch dep).
+    "boto3>=1.43.15",
 ]
 
 

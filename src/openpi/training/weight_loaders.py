@@ -1,5 +1,6 @@
 import dataclasses
 import logging
+import os
 import re
 from typing import Protocol, runtime_checkable
 
@@ -46,12 +47,20 @@ class CheckpointWeightLoader(WeightLoader):
     """
 
     params_path: str
+    # Regex for params present in the model but absent from the checkpoint that
+    # should be kept (initialized fresh) rather than dropped. Defaults to LoRA
+    # adapters. System1 adds the progress head + anchor role embedding (which the
+    # released pi05_base checkpoint does not contain), so those configs widen this.
+    missing_regex: str = ".*lora.*"
 
     def load(self, params: at.Params) -> at.Params:
+        # Allow overriding the params path via env (e.g. SageMaker mounts the orbax
+        # base checkpoint as a FastFile channel instead of fetching from gs://).
+        params_path = os.environ.get("OPENPI_WEIGHT_LOADER_PARAMS_PATH", self.params_path)
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
-        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        loaded_params = _model.restore_params(download.maybe_download(params_path), restore_type=np.ndarray)
+        # Add all missing weights matched by `missing_regex` (e.g. LoRA, new heads).
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)

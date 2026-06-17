@@ -80,8 +80,11 @@ def save_state(
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
         train_state, params = _split_params(state)
-    if not save_optimizer:
-        train_state = dataclasses.replace(train_state, opt_state={})
+        # `opt_state={}` is a deliberate sentinel for "don't save optimizer"; the
+        # dataclasses.replace re-runs the TrainState typecheck, which rejects the
+        # empty-dict opt_state — so keep it under disabled typechecking too.
+        if not save_optimizer:
+            train_state = dataclasses.replace(train_state, opt_state={})
     items = {
         "assets": save_assets,
         "train_state": train_state,

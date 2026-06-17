@@ -78,13 +78,20 @@ ENV TRITON_CACHE_DIR=/opt/ml/output/triton
 ENV PATH=/.venv/bin:$PATH
 ENV PYTHONPATH=/opt/ml/code/src:/opt/ml/code/packages/openpi-client/src:${PYTHONPATH}
 
-# SageMaker contract.
+# SageMaker contract. Select the trainer entrypoint at build time:
+#   --build-arg SM_ENTRYPOINT=sm_entrypoint.sh       (PyTorch, default)
+#   --build-arg SM_ENTRYPOINT=sm_entrypoint_jax.sh   (JAX, scripts/train.py)
+ARG SM_ENTRYPOINT=sm_entrypoint.sh
 ENV SAGEMAKER_SUBMIT_DIRECTORY=/opt/ml/code
-ENV SAGEMAKER_PROGRAM=sm_entrypoint.sh
+ENV SAGEMAKER_PROGRAM=${SM_ENTRYPOINT}
 
-COPY scripts/sagemaker/sm_entrypoint.sh /opt/ml/code/sm_entrypoint.sh
-RUN chmod +x /opt/ml/code/sm_entrypoint.sh
+COPY scripts/sagemaker/sm_entrypoint.sh scripts/sagemaker/sm_entrypoint_jax.sh /opt/ml/code/
+RUN chmod +x /opt/ml/code/sm_entrypoint.sh /opt/ml/code/sm_entrypoint_jax.sh
+
+# Stash the chosen entrypoint at a fixed path so the ENTRYPOINT exec form (which
+# can't expand a build ARG) can call it.
+RUN ln -sf /opt/ml/code/${SM_ENTRYPOINT} /opt/ml/code/sm_entrypoint_active.sh
 
 # SageMaker invokes the entrypoint with hyperparameters appended; we ignore
 # them and read everything from env vars instead (set in launch.py).
-ENTRYPOINT ["/opt/ml/code/sm_entrypoint.sh"]
+ENTRYPOINT ["/opt/ml/code/sm_entrypoint_active.sh"]

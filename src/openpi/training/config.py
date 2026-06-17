@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -20,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.robocasa_policy as robocasa_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -32,6 +34,15 @@ import openpi.transforms as _transforms
 ModelType: TypeAlias = _model.ModelType
 # Work around a tyro issue with using nnx.filterlib.Filter directly.
 Filter: TypeAlias = nnx.filterlib.Filter
+
+# RoboCasa System1 shards location. Overridable via env so the SAME config works
+# bare-metal (host path), in Docker (bind-mount), and on SageMaker (channel mount
+# or s3://). Set ROBOCASA_SHARDS_DIR to a local dir or an s3://bucket/prefix.
+ROBOCASA_SHARDS_DEFAULT = "/home/yinpeidai/RoboAnnotator/data/robocasa_system1/shards"
+
+
+def _robocasa_shards() -> str:
+    return os.environ.get("ROBOCASA_SHARDS_DIR", ROBOCASA_SHARDS_DEFAULT)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,6 +108,14 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # If set, stream the RoboCasa System1 WebDataset shards from this spec (local
+    # shards/ dir or s3://bucket/prefix). This is the canonical training path — pi05
+    # reads ONLY these shards, never data_annotation. Settings in
+    # `robocasa_webdataset_settings` (a WebDatasetConfig). Mutually exclusive with
+    # rlds_data_dir.
+    robocasa_webdataset_shards: str | None = None
+    robocasa_webdataset_settings: Any = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -133,7 +152,9 @@ class ModelTransformFactory(GroupFactory):
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        # pi0.5 discretizes the state into the prompt text, so it does not
+                        # need (and should not get) a zero-padded continuous state vector.
+                        _transforms.PadStatesAndActions(model_config.action_dim, pad_state=False),
                     ],
                 )
             case _model.ModelType.PI0_FAST:
@@ -352,6 +373,70 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RoboCasaDataConfig(DataConfigFactory):
+    """System1 RoboCasa config: subgoal-conditioned pi0.5, streaming WebDataset.
+
+    Reads the per-frame, globally-shuffled WebDataset shards produced from
+    RoboAnnotator's annotation interface by
+    ``producers/preprocess_robocasa_to_tar.py``. pi05 reads ONLY these shards
+    (never ``data_annotation``). ``shards`` may be a local dir or an ``s3://``
+    prefix; the two random axes (level, phrasing) + pad mode are load-time knobs.
+    """
+
+    # WebDataset shards spec: local shards/ dir OR s3://bucket/prefix.
+    shards: str = tyro.MISSING
+    # Sample-construction knobs (load-time; re-tunable without re-converting).
+    subgoal_level: Literal["milestone", "child", "mixed"] = "child"
+    p_milestone: float = 0.5  # P(milestone) when subgoal_level == "mixed"
+    p_detail: float = 0.0  # P(prompt = subgoal_detail instead of subgoal)
+    include_base_pos: bool = True
+    use_anchor_images: bool = True
+    subgoal_action_pad: Literal["subtask", "episode"] = "subtask"
+    shuffle_buffer: int = 16000
+    shuffle_initial: int = 1000
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        from openpi.training import robocasa_webdataset as _wds
+
+        settings = _wds.WebDatasetConfig(
+            shards=self.shards,
+            action_horizon=model_config.action_horizon,
+            include_base_pos=self.include_base_pos,
+            use_anchor_images=self.use_anchor_images,
+            subgoal_level=self.subgoal_level,
+            p_milestone=self.p_milestone,
+            p_detail=self.p_detail,
+            subgoal_action_pad=self.subgoal_action_pad,
+            shuffle_buffer=self.shuffle_buffer,
+            shuffle_initial=self.shuffle_initial,
+        )
+        # NOTE: no DeltaActions/AbsoluteActions. RoboCasa actions are ALREADY delta
+        # commands (eef deltas + base velocity — the sim's control interface), so we
+        # must NOT convert to deltas-vs-state (only for absolute-action datasets like
+        # Aloha). State is passed through as-is for the same reason.
+        data_transforms = _transforms.Group(
+            inputs=[
+                robocasa_policy.RobocasaInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    include_base_pos=self.include_base_pos,
+                    use_anchor_images=self.use_anchor_images,
+                )
+            ],
+            outputs=[robocasa_policy.RobocasaOutputs()],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            robocasa_webdataset_shards=self.shards,
+            robocasa_webdataset_settings=settings,
         )
 
 
@@ -791,6 +876,120 @@ _CONFIGS = [
         ema_decay=None,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="./checkpoints/pi05_base_pytorch",
+        num_train_steps=200,
+        save_interval=100,
+        log_interval=10,
+        keep_period=None,
+    ),
+    #
+    # System1: subgoal-conditioned pi0.5 on RoboCasa (+ progress head).
+    #
+    TrainConfig(
+        name="pi05_robocasa_system1",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            image_keys=("scene_left", "scene_right", "wrist"),
+            # Anchor scene cams get the SAME geometric aug as the current scene cams
+            # (crop+rotate+resize); wrist + anchor_wrist get color-jitter only (color
+            # jitter is applied to all keys regardless).
+            geometric_aug_cameras=("scene_left", "scene_right", "anchor_scene_left", "anchor_scene_right"),
+            use_anchor_images=True,
+            use_progress_head=True,
+            progress_readout="shallow_transformer",
+            progress_k=2.0,
+            progress_loss_weight=1.0,
+        ),
+        data=RoboCasaDataConfig(
+            repo_id="robocasa_system1",
+            shards=_robocasa_shards(),
+            subgoal_level="child",
+            use_anchor_images=True,
+        ),
+        batch_size=64,
+        num_workers=8,
+        # Fixed LR 5e-5 (peak == decay, short warmup).
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500, peak_lr=5e-5, decay_steps=20_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        # pi05_base lacks the progress head + anchor role embedding; keep them fresh-init.
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(lora|progress_head|image_role_embedding).*",
+        ),
+        num_train_steps=20_000,
+        save_interval=5_000,
+        keep_period=5_000,
+    ),
+    # No-anchor variant: 3 current images only (anchor=none baseline) + progress head
+    # on the current frame. Halves image tokens vs the 6-image config so it fits the
+    # fast fsdp=2 topology on the local A6000s. The "train none first" baseline.
+    TrainConfig(
+        name="pi05_robocasa_system1_noanchor",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            image_keys=("scene_left", "scene_right", "wrist"),
+            geometric_aug_cameras=("scene_left", "scene_right"),
+            use_anchor_images=False,
+            use_progress_head=True,
+            progress_readout="shallow_transformer",
+            progress_k=2.0,
+            progress_loss_weight=1.0,
+        ),
+        data=RoboCasaDataConfig(
+            # Norm stats resolve via assets_base_dir/<config>/robocasa_system1 (baked
+            # into the image for SageMaker; under ./assets locally). asset_id pins the
+            # subdir name; same stats as pi05_robocasa_system1 (identical shards).
+            assets=AssetsConfig(asset_id="robocasa_system1"),
+            repo_id="robocasa_system1",
+            shards=_robocasa_shards(),
+            subgoal_level="child",
+            use_anchor_images=False,
+        ),
+        batch_size=2,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=500, peak_lr=5e-5, decay_steps=200_000, decay_lr=5e-5),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(lora|progress_head|image_role_embedding).*",
+        ),
+        num_train_steps=200_000,
+        save_interval=5_000,
+        keep_period=10_000,
+    ),
+    # Tiny smoke variant: anchor=none baseline, few steps.
+    TrainConfig(
+        name="pi05_robocasa_system1_debug",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            image_keys=("scene_left", "scene_right", "wrist"),
+            geometric_aug_cameras=("scene_left", "scene_right"),
+            use_anchor_images=False,
+            use_progress_head=True,
+            progress_readout="shallow_transformer",
+        ),
+        data=RoboCasaDataConfig(
+            assets=AssetsConfig(assets_dir="./assets/pi05_robocasa_system1_debug", asset_id="robocasa_system1"),
+            repo_id="robocasa_system1",
+            shards=_robocasa_shards(),
+            subgoal_level="child",
+            use_anchor_images=False,
+        ),
+        batch_size=4,
+        num_workers=0,
+        lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=10, peak_lr=5e-5, decay_steps=200, decay_lr=5e-5),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params",
+            missing_regex=".*(lora|progress_head|image_role_embedding).*",
+        ),
         num_train_steps=200,
         save_interval=100,
         log_interval=10,

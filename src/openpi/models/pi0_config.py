@@ -32,6 +32,33 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # --- System1 additions (RoboCasa subgoal-conditioned pi0.5 + progress head) ---
+    # Image keys the model expects, in prefix order. If None, falls back to the
+    # global model.IMAGE_KEYS (base_0_rgb/left_wrist_0_rgb/right_wrist_0_rgb).
+    # For RoboCasa System1: ("scene_left","scene_right","wrist") + optional
+    # ("anchor_scene_left","anchor_scene_right","anchor_wrist").
+    image_keys: tuple[str, ...] | None = None
+    # Cameras that receive geometric augmentation (crop+rotate). If None, falls back
+    # to the legacy rule (geom aug iff "wrist" not in key). Anchor views are
+    # deliberately excluded so the before/after geometry stays stable.
+    geometric_aug_cameras: tuple[str, ...] | None = None
+    # Add anchor (before) image groups + a learned anchor/current role embedding.
+    use_anchor_images: bool = False
+
+    # Progress head (subgoal-completion state value in [0,1]).
+    use_progress_head: bool = False
+    # Readout over the (detached) prefix: "shallow_transformer" | "mean_pool" | "prefix_token".
+    progress_readout: str = "shallow_transformer"
+    # If True, the head reads stop_grad(prefix) so progress never alters the VLM
+    # (ignored for "prefix_token", which is in-backbone by construction).
+    progress_stop_gradient: bool = True
+    # Aux loss weight and target shaping target = frac**progress_k.
+    progress_loss_weight: float = 1.0
+    progress_k: float = 2.0
+    # Shallow-transformer head depth / heads.
+    progress_num_layers: int = 2
+    progress_num_heads: int = 8
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -65,21 +92,22 @@ class Pi0Config(_model.BaseModelConfig):
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
+        # Image keys default to the global IMAGE_KEYS; System1 overrides them (and
+        # optionally adds anchor_* groups for the progress head).
+        keys = list(self.image_keys) if self.image_keys is not None else list(_model.IMAGE_KEYS)
+        if self.use_anchor_images:
+            keys = keys + [f"anchor_{k}" for k in keys]
+
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images={k: image_spec for k in keys},
+                image_masks={k: image_mask_spec for k in keys},
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                progress=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.float32) if self.use_progress_head else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 

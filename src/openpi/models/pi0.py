@@ -16,6 +16,12 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger("openpi")
 
 
+def _huber(x: at.Array, delta: float = 0.1) -> at.Array:
+    """Elementwise Huber / smooth-L1 (robust to fuzzy subgoal-boundary labels)."""
+    abs_x = jnp.abs(x)
+    return jnp.where(abs_x <= delta, 0.5 * jnp.square(x), delta * (abs_x - 0.5 * delta))
+
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -99,6 +105,42 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        # --- System1: configurable image keys, anchor role embedding, progress head ---
+        base_image_keys = tuple(config.image_keys) if config.image_keys is not None else _model.IMAGE_KEYS
+        # When anchors are enabled, the anchor_* groups must ALSO be in the model's
+        # image-key set, or preprocess_observation drops them and the backbone never
+        # sees the "before" views. (inputs_spec adds them the same way.)
+        if config.use_anchor_images:
+            self._image_keys = base_image_keys + tuple(f"anchor_{k}" for k in base_image_keys)
+        else:
+            self._image_keys = base_image_keys
+        self._geometric_aug_cameras = (
+            tuple(config.geometric_aug_cameras) if config.geometric_aug_cameras is not None else None
+        )
+        self._use_anchor_images = config.use_anchor_images
+        self._use_progress_head = config.use_progress_head
+        self._progress_readout = config.progress_readout
+        self._progress_stop_gradient = config.progress_stop_gradient
+        self._progress_loss_weight = config.progress_loss_weight
+        self._progress_k = config.progress_k
+        if config.use_anchor_images:
+            # Learned role embedding {current, anchor} added to each image group's tokens
+            # so the model can distinguish before vs now (the prefix is a bidirectional
+            # block; image order alone is a weak cue). Shape (2, paligemma_width).
+            self.image_role_embedding = nnx.Param(
+                nnx.initializers.normal(0.02)(rngs.params(), (2, paligemma_config.width))
+            )
+        if config.use_progress_head:
+            from openpi.models import progress_head as _progress_head
+
+            self.progress_head = _progress_head.ProgressHead(
+                paligemma_config.width,
+                readout=config.progress_readout,
+                num_layers=config.progress_num_layers,
+                num_heads=config.progress_num_heads,
+                rngs=rngs,
+            )
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -112,6 +154,15 @@ class Pi0(_model.BaseModel):
         # embed images
         for name in obs.images:
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+
+            # System1: add a learned anchor/current role embedding so the model can
+            # tell "before" (anchor_*) views apart from the current views (the prefix
+            # is one bidirectional block; token order alone is a weak cue).
+            if self._use_anchor_images and hasattr(self, "image_role_embedding"):
+                role = 1 if str(name).startswith("anchor_") else 0
+                image_tokens = image_tokens + self.image_role_embedding.value[role][None, None, :].astype(
+                    image_tokens.dtype
+                )
 
             tokens.append(image_tokens)
             input_mask.append(
@@ -190,7 +241,14 @@ class Pi0(_model.BaseModel):
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
-        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        progress_target = observation.progress
+        observation = _model.preprocess_observation(
+            preprocess_rng,
+            observation,
+            train=train,
+            image_keys=self._image_keys,
+            geometric_aug_cameras=self._geometric_aug_cameras,
+        )
 
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
@@ -211,7 +269,37 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        # Flow-matching loss per (batch, horizon-step).
+        flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [*b, ah]
+
+        # System1 progress head: aux state-value regression on frac**k.
+        # Added per-sample (broadcast over horizon) so the trainer's jnp.mean over
+        # [*b, ah] equals mean(flow) + w * mean(progress).
+        if self._use_progress_head and progress_target is not None:
+            progress_pred = self._predict_progress(prefix_out, prefix_mask)  # [*b], in [0,1]
+            target = jnp.clip(progress_target, 0.0, 1.0) ** self._progress_k
+            progress_loss = _huber(progress_pred - target)  # [*b]
+            # Spread the per-sample progress loss evenly across the horizon dim so the
+            # mean is exact, then weight.
+            flow_loss = flow_loss + self._progress_loss_weight * progress_loss[..., None] / self.action_horizon
+
+        return flow_loss
+
+    def _predict_progress(
+        self, prefix_out: at.Float[at.Array, "b s emb"], prefix_mask: at.Bool[at.Array, "b s"]
+    ) -> at.Float[at.Array, " b"]:
+        """Progress scalar in [0,1] from the (optionally detached) prefix features."""
+        feats = jax.lax.stop_gradient(prefix_out) if self._progress_stop_gradient else prefix_out
+        if self._progress_readout == "shallow_transformer":
+            logit = self.progress_head.from_sequence(feats, prefix_mask)
+        elif self._progress_readout in ("mean_pool", "prefix_token"):
+            # Masked mean over valid prefix tokens.
+            m = prefix_mask.astype(feats.dtype)[..., None]
+            pooled = (feats * m).sum(axis=1) / jnp.clip(m.sum(axis=1), 1e-6, None)
+            logit = self.progress_head.from_pooled(pooled)
+        else:
+            raise ValueError(f"unknown progress_readout: {self._progress_readout}")
+        return nnx.sigmoid(logit)
 
     @override
     def sample_actions(
@@ -222,7 +310,9 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
-        observation = _model.preprocess_observation(None, observation, train=False)
+        observation = _model.preprocess_observation(
+            None, observation, train=False, image_keys=self._image_keys
+        )
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
@@ -277,3 +367,20 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def predict_progress(self, observation: _model.Observation) -> at.Float[at.Array, " b"]:
+        """Inference-time subgoal-completion progress in [0,1] (state value).
+
+        Runs a single prefix forward pass (noise-independent) and reads the progress
+        head. Used by the eval server / System2 hand-off. Requires use_progress_head.
+        """
+        if not self._use_progress_head:
+            raise ValueError("predict_progress called but use_progress_head is False")
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=self._image_keys)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), _ = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        return self._predict_progress(prefix_out, prefix_mask)
