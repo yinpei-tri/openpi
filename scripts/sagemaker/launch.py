@@ -285,6 +285,19 @@ def main() -> None:
     s3_prefix = cfg["output"]["s3_prefix"].rstrip("/")
     checkpoint_s3_uri = f"{s3_prefix}/{job_name}/"
     output_s3_uri = s3_prefix
+
+    # The JAX trainer (orbax) does NOT use SageMaker's managed /opt/ml/checkpoints
+    # bidirectional sync: that sync sidecar races orbax's write-then-read-back of its
+    # array-metadata file on an eventually-consistent mount and crashes `finalize`.
+    # Instead the JAX entrypoint checkpoints to a consistent instance-EBS dir and runs
+    # its own `aws s3 sync` to this URI (passed via CHECKPOINT_S3_URI). The PyTorch
+    # path keeps SageMaker-managed checkpointing.
+    is_jax = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh") == "sm_entrypoint_jax.sh"
+    env["CHECKPOINT_S3_URI"] = checkpoint_s3_uri
+    # Periodic background-sync interval for the JAX entrypoint (seconds). Optional in
+    # the config; the entrypoint defaults to 1800 if unset.
+    if cfg["output"].get("ckpt_sync_interval") is not None:
+        env["CKPT_SYNC_INTERVAL"] = str(cfg["output"]["ckpt_sync_interval"])
     config_name = cfg["training"]["config"]
     exp_name = cfg["training"]["exp_name"]
     wandb_state = f"online (project={cfg['wandb']['project']})" if cfg["wandb"]["enabled"] else "disabled"
@@ -313,8 +326,10 @@ def main() -> None:
         instance_count=cfg["instance"]["count"],
         instance_type="local_gpu" if local else instance_type,
         job_name=job_name,
-        checkpoint_local_path=None if local else cfg["output"]["checkpoint_local_path"],
-        checkpoint_s3_uri=None if local else checkpoint_s3_uri,
+        # JAX path self-manages S3 sync (see CHECKPOINT_S3_URI above), so leave
+        # SageMaker's managed checkpoint sync OFF for it. PyTorch path keeps it on.
+        checkpoint_local_path=None if (local or is_jax) else cfg["output"]["checkpoint_local_path"],
+        checkpoint_s3_uri=None if (local or is_jax) else checkpoint_s3_uri,
         output_path=cfg["output"]["s3_prefix"],
         # torch_distributed launches one process per GPU (PyTorch entrypoint runs
         # torchrun). The JAX trainer is a SINGLE process that shards over all GPUs

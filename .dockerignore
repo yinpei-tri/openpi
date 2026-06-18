@@ -1,3 +1,16 @@
 .venv
 checkpoints
 data
+
+# Large local-only dirs that must never enter the Docker build context.
+.local_data
+.local_output
+openpi_pretrained_model
+.git
+*.png
+__pycache__
+**/__pycache__
+.pytest_cache
+.ruff_cache
+wandb
+scripts/sagemaker/secrets.env

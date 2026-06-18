@@ -55,8 +55,48 @@ elif [[ -d "$BASE_CKPT_DIR" ]]; then
     export OPENPI_WEIGHT_LOADER_PARAMS_PATH="$BASE_CKPT_DIR"
 fi
 
-# SageMaker syncs /opt/ml/checkpoints -> checkpoint_s3_uri and /opt/ml/output on exit.
-mkdir -p /opt/ml/checkpoints /opt/ml/output/wandb
+# Checkpointing: do NOT use SageMaker's managed /opt/ml/checkpoints sync for the JAX
+# trainer. That mount is eventually-consistent (a background sync sidecar), and orbax
+# writes a tiny array-metadata file then immediately reads it back in `finalize` to
+# validate it — the read-back can return an empty file there, crashing the save with
+# `JSONDecodeError: Expecting value`. Instead checkpoint to a plain instance-EBS dir
+# (strong read-after-write) and run our OWN `aws s3 sync` to CHECKPOINT_S3_URI:
+# a periodic background upload (crash protection) + an authoritative final sync on exit.
+# launch.py leaves SageMaker-managed checkpoint sync off and passes CHECKPOINT_S3_URI.
+CKPT_DIR="/opt/ml/local_checkpoints"
+mkdir -p "$CKPT_DIR" /opt/ml/output/wandb
+
+# Periodic background upload (default every 30 min; override via CKPT_SYNC_INTERVAL).
+# Crash insurance: if the instance dies mid-run, S3 still has checkpoints up to the
+# last tick (local EBS dies with the instance). We EXCLUDE orbax's in-progress
+# `*.orbax-checkpoint-tmp-*` dirs so a partially-written checkpoint never lands in S3;
+# orbax renames the tmp dir to its final name only once the save is complete. No
+# `--delete` here (a periodic delete could race orbax's pruning) — the final sync
+# reconciles. Long interval keeps S3 traffic/overhead low.
+SYNC_PID=""
+if [[ -n "${CHECKPOINT_S3_URI:-}" ]]; then
+    echo "Periodic checkpoint upload: $CKPT_DIR -> ${CHECKPOINT_S3_URI} (every ${CKPT_SYNC_INTERVAL:-1800}s)"
+    (
+        while true; do
+            sleep "${CKPT_SYNC_INTERVAL:-1800}"
+            aws s3 sync "$CKPT_DIR" "${CHECKPOINT_S3_URI}" \
+                --exclude "*.orbax-checkpoint-tmp-*/*" --only-show-errors || true
+        done
+    ) &
+    SYNC_PID=$!
+fi
+
+# Final sync on exit (success OR failure): stop the periodic loop, then one
+# authoritative `--delete` sync so S3 mirrors orbax's settled local dir exactly
+# (drops any tmp dirs / pruned steps the periodic uploads may have left behind).
+final_sync() {
+    [[ -n "$SYNC_PID" ]] && kill "$SYNC_PID" 2>/dev/null || true
+    if [[ -n "${CHECKPOINT_S3_URI:-}" ]]; then
+        echo "Final checkpoint upload: $CKPT_DIR -> ${CHECKPOINT_S3_URI}"
+        aws s3 sync "$CKPT_DIR" "${CHECKPOINT_S3_URI}" --delete --only-show-errors || true
+    fi
+}
+trap final_sync EXIT
 
 EXTRA_ARGS=()
 [[ "${OVERWRITE:-0}" == "1" ]] && EXTRA_ARGS+=("--overwrite")
@@ -69,13 +109,18 @@ echo "=== SageMaker openpi JAX launch ==="
 echo "config=$CONFIG  exp=$EXP  gpus=$NGPU"
 echo "ROBOCASA_SHARDS_DIR=$ROBOCASA_SHARDS_DIR"
 echo "base_ckpt=${OPENPI_WEIGHT_LOADER_PARAMS_PATH:-<config default>}"
-echo "assets=$ASSETS_DIR/$CONFIG  checkpoints=/opt/ml/checkpoints"
+echo "assets=$ASSETS_DIR/$CONFIG  checkpoints=$CKPT_DIR (synced to ${CHECKPOINT_S3_URI:-<none>} every ${CKPT_SYNC_INTERVAL:-1800}s + on exit)"
 echo "extra_args=${EXTRA_ARGS[*]:-}"
 echo "==================================="
 
-exec python scripts/train.py \
+# NOTE: not `exec` — we need the EXIT trap (final_sync) to run after training, so the
+# last checkpoint is flushed to S3. Propagate the trainer's exit code to SageMaker.
+python scripts/train.py \
     "$CONFIG" \
     --exp-name="$EXP" \
     --assets-base-dir="$ASSETS_DIR" \
-    --checkpoint-base-dir=/opt/ml/checkpoints \
+    --checkpoint-base-dir="$CKPT_DIR" \
     "${EXTRA_ARGS[@]}"
+TRAIN_RC=$?
+echo "Trainer exited with code $TRAIN_RC"
+exit $TRAIN_RC
