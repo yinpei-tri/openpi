@@ -152,12 +152,8 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config,
     if not is_main:
         return
 
-    # Save on the configured interval, plus on the final step *only* if the
-    # interval doesn't already cover it (avoids back-to-back saves at e.g.
-    # 29999 and 30000 when num_train_steps is a multiple of save_interval).
-    is_interval = global_step % config.save_interval == 0 and global_step > 0
-    is_final = global_step == config.num_train_steps - 1
-    if is_interval or (is_final and (global_step + 1) % config.save_interval != 0):
+    # Only save if it's time to save or if it's the final step
+    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps:
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"

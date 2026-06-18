@@ -80,16 +80,20 @@ def save_state(
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
         train_state, params = _split_params(state)
-        # `opt_state={}` is a deliberate sentinel for "don't save optimizer"; the
-        # dataclasses.replace re-runs the TrainState typecheck, which rejects the
-        # empty-dict opt_state — so keep it under disabled typechecking too.
-        if not save_optimizer:
-            train_state = dataclasses.replace(train_state, opt_state={})
-    items = {
-        "assets": save_assets,
-        "train_state": train_state,
-        "params": {"params": params},
-    }
+    # main's refactor: when not saving the optimizer, simply omit train_state from
+    # the saved items (rather than zeroing opt_state) — avoids the TrainState
+    # typecheck issue the old opt_state={} path hit, so no extra guard needed.
+    if not save_optimizer:
+        items = {
+            "assets": save_assets,
+            "params": {"params": params},
+        }
+    else:
+        items = {
+            "assets": save_assets,
+            "train_state": train_state,
+            "params": {"params": params},
+        }
     checkpoint_manager.save(step, items)
 
 
@@ -116,15 +120,13 @@ def restore_state(
             )
         except Exception:
             logging.warning("Could not restore optimizer state from checkpoint, restoring params only")
-            train_state_no_opt = dataclasses.replace(train_state, opt_state={})
             restored = checkpoint_manager.restore(
                 step,
                 items={
-                    "train_state": train_state_no_opt,
                     "params": {"params": params},
                 },
             )
-            restored["train_state"] = dataclasses.replace(restored["train_state"], opt_state=state.opt_state)
+            restored["train_state"] = train_state
     return _merge_params(restored["train_state"], restored["params"])
 
 

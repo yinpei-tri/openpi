@@ -40,8 +40,6 @@ services:
       # private home, not the user's real home.
       - ${OPENPI_DATA_HOME:-${HOME}/.cache/openpi}:/openpi_assets
       - ${HF_HOME:-${HOME}/.cache/huggingface}:/cache/huggingface
-      # Where wandb writes its local run dirs (handy if WANDB_MODE=offline).
-      - ${WANDB_DIR:-./wandb}:/app/wandb
       # RoboCasa System1 dataset (shards + anchors). Mounted read-only at a fixed
       # in-container path; the config reads ROBOCASA_SHARDS_DIR (set below).
       - ${ROBOCASA_DATA_HOST:-/home/yinpeidai/RoboAnnotator/data/robocasa_system1}:/data/robocasa_system1:ro
