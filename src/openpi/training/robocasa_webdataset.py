@@ -236,21 +236,15 @@ class RoboCasaWebDataset:
         # --- arrays (state + 3 action chunks + masks) ---
         arrays = np.load(io.BytesIO(raw["arrays.npz"]))
 
-        # --- images ---
+        # --- images + state ---
+        # State is already PREPROCESSED (lean, base x/y/yaw pre-made relative) in the
+        # shards; RobocasaInputs passes it through (dim-detects lean vs raw).
         sample: dict[str, Any] = {
             "observation/scene_left": _decode_jpeg(raw["scene_left.jpg"]),
             "observation/scene_right": _decode_jpeg(raw["scene_right.jpg"]),
             "observation/wrist": _decode_jpeg(raw["wrist.jpg"]),
             "observation/state": arrays["state"].astype(np.float32),
         }
-        if self.cfg.include_base_pos:
-            # Episode-start base pose; RobocasaInputs encodes base pos + heading relative to it.
-            ref = meta.get("base_pos_ref")
-            sample["observation/base_pos_ref"] = (
-                np.asarray(ref, dtype=np.float32) if ref is not None else sample["observation/state"][0:3]
-            )
-            if meta.get("base_yaw_ref") is not None:
-                sample["observation/base_yaw_ref"] = np.float32(meta["base_yaw_ref"])
 
         if self.cfg.use_anchor_images:
             # Anchor for the CHOSEN level, read by key from the (path-addressable)

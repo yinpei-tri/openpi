@@ -5,19 +5,28 @@ and back. Used for BOTH training and inference, so it must be a pure
 representation conversion (no training-only sample-construction logic — that lives
 in ``training/robocasa_dataset.py`` and the WebDataset loader).
 
+The PRODUCER bakes the lean state/action into the shards (see
+``producers/preprocess_robocasa_to_tar.py``), so during TRAINING this transform is
+mostly a passthrough. At INFERENCE the RoboCasa env supplies the RAW 16-dim state,
+so ``lean_state_from_raw`` runs here too (dim-detected). These conversions are the
+single source of truth; the producer vendors a byte-identical copy.
+
 Key representation choices (see the System1 plan):
 - 3 native cameras: ``scene_left``, ``scene_right`` (third-person) and ``wrist``
   (``robot0_eye_in_hand``). Anchor (before) views optionally added under
   ``anchor_*`` keys for the progress head; the anchor is the start frame of the
   conditioning subgoal span and gets the SAME image augmentation as the current
   views (anchor scene cams listed in ``geometric_aug_cameras``).
-- Lean state: ``eef_pos_rel(3) + eef_rot_6D(6) + gripper_width(1)`` and optionally
-  ``base_pos_rel(3)`` (relative to an episode/rollout reference). The two RoboCasa
-  state quaternions are converted to the continuous 6D rotation representation
-  (Zhou et al. 2019); ``base_rotation`` is dropped. ``control_mode`` is NOT in the
-  state (the subgoal verb, e.g. "navigate to…", implies the regime).
-- Action stays the sim's native 12-dim interface (``eef_rot`` delta is axis-angle).
-  Only padded to the model action dim; recovered to 12 on output.
+- Lean state (14-d): ``eef_pos_rel(3) + eef_rot_6D(6) + gripper_width(1) +
+  base_pos_rel_xy(2) + base_yaw_sincos(2)``. The two RoboCasa state quaternions
+  become continuous 6D / sin-cos (Zhou et al. 2019; no pi singularity, no yaw wrap).
+  Base x,y + yaw are RELATIVE to the episode/rollout start (invariant to the kitchen
+  world origin). DROPPED: base_position z (≈0.70 in 98.7% of all 44M teleop frames),
+  base_rotation roll/pitch (base is pure yaw). ``control_mode`` is NOT in the state
+  (the subgoal verb, e.g. "navigate to…", implies the regime).
+- Lean action (11-d): the sim's 12-d delta interface MINUS the torso command
+  (base_motion[3]), which is identically 0 across ALL 57,350 teleop episodes. The
+  output transform re-inserts torso=0 to rebuild the sim's native 12-d command.
 """
 
 import dataclasses
@@ -45,8 +54,11 @@ CAMERA_KEYS = (SCENE_LEFT, SCENE_RIGHT, WRIST)
 # Anchor (before) view keys: same cameras, prefixed.
 ANCHOR_PREFIX = "anchor_"
 
-# RoboCasa raw action dim (recovered on output).
-ROBOCASA_ACTION_DIM = 12
+# RoboCasa native (sim) dims, and the dead torso command we drop.
+ROBOCASA_STATE_DIM = 16   # raw state width (env supplies this at inference)
+ROBOCASA_ACTION_DIM = 12  # sim controller expects this many dims
+ACTION_TORSO_IDX = 3      # base_motion[3]; identically 0 in all teleop data
+LEAN_ACTION_DIM = 11      # ROBOCASA_ACTION_DIM minus torso
 
 
 def _parse_image(image) -> np.ndarray:
@@ -96,12 +108,13 @@ def lean_state_from_raw(
     """RoboCasa raw 16-dim state -> lean state.
 
     Layout: eef_pos_rel(3) + eef_rot_6D(6) + gripper_width(1)
-            [+ base_pos_rel(3) + rel_base_yaw_sincos(2)].
-    Base position/heading are encoded RELATIVE to the episode/rollout-start reference
+            [+ base_pos_rel_xy(2) + rel_base_yaw_sincos(2)].
+    Base x,y + heading are RELATIVE to the episode/rollout-start reference
     (``base_pos_ref`` (3,), ``base_yaw_ref`` scalar) so they're invariant to the
-    kitchen's absolute world origin. Relative yaw is encoded as (sin, cos) to avoid
-    the +/-pi wraparound discontinuity (the base can do full turns). EEF rotation
-    stays 6D (continuous; RoboCasa's gripper sits near the axis-angle pi singularity).
+    kitchen's absolute world origin; relative yaw -> (sin, cos) (no +/-pi wrap).
+    DROPPED: base z (near-constant 0.70) and base roll/pitch (base is pure yaw).
+    EEF rotation stays 6D (continuous; RoboCasa's gripper sits near the axis-angle
+    pi singularity).
     """
     raw_state = np.asarray(raw_state, dtype=np.float32)
     eef_pos = raw_state[..., STATE_EEF_POS]
@@ -110,21 +123,36 @@ def lean_state_from_raw(
     gripper_width = (grip[..., 0] - grip[..., 1])[..., None]
     parts = [eef_pos, eef_rot6d, gripper_width]
     if include_base_pos:
-        base_pos = raw_state[..., STATE_BASE_POS]
+        base_xy = raw_state[..., 0:2]  # drop z (dim 2)
         if base_pos_ref is not None:
-            base_pos = base_pos - np.asarray(base_pos_ref, dtype=np.float32)
+            base_xy = base_xy - np.asarray(base_pos_ref, dtype=np.float32)[..., 0:2]
         yaw = _yaw_from_quat_xyzw(raw_state[..., STATE_BASE_QUAT])
         if base_yaw_ref is not None:
             yaw = yaw - np.float32(base_yaw_ref)
         rel_yaw_sincos = np.stack([np.sin(yaw), np.cos(yaw)], axis=-1)
-        parts += [base_pos, rel_yaw_sincos]
+        parts += [base_xy, rel_yaw_sincos]
     return np.concatenate(parts, axis=-1)
 
 
 # Lean state dim depends only on include_base_pos.
 def lean_state_dim(*, include_base_pos: bool) -> int:
-    # eef_pos(3) + rot6d(6) + grip(1) [+ base_pos(3) + rel_yaw_sincos(2)]
-    return 10 + (5 if include_base_pos else 0)
+    # eef_pos(3) + rot6d(6) + grip(1) [+ base_xy(2) + rel_yaw_sincos(2)]
+    return 10 + (4 if include_base_pos else 0)
+
+
+def lean_action_from_raw(raw_action: np.ndarray) -> np.ndarray:
+    """RoboCasa raw 12-dim action -> lean 11-dim (drop torso = base_motion[3])."""
+    raw_action = np.asarray(raw_action, dtype=np.float32)
+    return np.concatenate([raw_action[..., :ACTION_TORSO_IDX], raw_action[..., ACTION_TORSO_IDX + 1 :]], axis=-1)
+
+
+def sim_action_from_lean(lean_action: np.ndarray) -> np.ndarray:
+    """Lean 11-dim action -> sim native 12-dim (re-insert torso=0 at base_motion[3])."""
+    lean_action = np.asarray(lean_action)
+    torso = np.zeros((*lean_action.shape[:-1], 1), dtype=lean_action.dtype)
+    return np.concatenate(
+        [lean_action[..., :ACTION_TORSO_IDX], torso, lean_action[..., ACTION_TORSO_IDX:]], axis=-1
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,14 +173,22 @@ class RobocasaInputs(transforms.DataTransformFn):
         scene_right = _parse_image(data["observation/scene_right"])
         wrist = _parse_image(data["observation/wrist"])
 
-        base_pos_ref = data.get("observation/base_pos_ref")
-        base_yaw_ref = data.get("observation/base_yaw_ref")
-        state = lean_state_from_raw(
-            data["observation/state"],
-            include_base_pos=self.include_base_pos,
-            base_pos_ref=base_pos_ref,
-            base_yaw_ref=None if base_yaw_ref is None else float(np.asarray(base_yaw_ref).reshape(-1)[0]),
-        )
+        # State is LEAN when it comes from the producer's shards (training) and RAW
+        # when it comes from the RoboCasa env (inference). Detect by dim and convert
+        # raw -> lean; lean passes through unchanged.
+        raw_state = np.asarray(data["observation/state"], dtype=np.float32)
+        target_dim = lean_state_dim(include_base_pos=self.include_base_pos)
+        if raw_state.shape[-1] == ROBOCASA_STATE_DIM:
+            base_pos_ref = data.get("observation/base_pos_ref")
+            base_yaw_ref = data.get("observation/base_yaw_ref")
+            state = lean_state_from_raw(
+                raw_state,
+                include_base_pos=self.include_base_pos,
+                base_pos_ref=base_pos_ref,
+                base_yaw_ref=None if base_yaw_ref is None else float(np.asarray(base_yaw_ref).reshape(-1)[0]),
+            )
+        else:
+            state = raw_state  # already lean (from shards)
 
         image = {SCENE_LEFT: scene_left, SCENE_RIGHT: scene_right, WRIST: wrist}
         image_mask = {SCENE_LEFT: np.True_, SCENE_RIGHT: np.True_, WRIST: np.True_}
@@ -169,7 +205,11 @@ class RobocasaInputs(transforms.DataTransformFn):
         inputs = {"state": state, "image": image, "image_mask": image_mask}
 
         if "actions" in data:
-            inputs["actions"] = np.asarray(data["actions"], dtype=np.float32)
+            # Actions are LEAN (11-d) from shards; if RAW (12-d) ever arrives, drop torso.
+            act = np.asarray(data["actions"], dtype=np.float32)
+            if act.shape[-1] == ROBOCASA_ACTION_DIM:
+                act = lean_action_from_raw(act)
+            inputs["actions"] = act
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
         # Progress label + span metadata are training-only targets (pass through).
@@ -182,7 +222,12 @@ class RobocasaInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class RobocasaOutputs(transforms.DataTransformFn):
-    """Recover the native 12-dim RoboCasa action from the padded model output."""
+    """Recover the sim's native 12-dim RoboCasa action from the model output.
+
+    The model emits LEAN_ACTION_DIM (11) real dims (after un-padding from action_dim);
+    re-insert torso=0 at base_motion[3] to rebuild the sim's 12-d command.
+    """
 
     def __call__(self, data: dict) -> dict:
-        return {"actions": np.asarray(data["actions"][:, :ROBOCASA_ACTION_DIM])}
+        lean = np.asarray(data["actions"][:, :LEAN_ACTION_DIM])
+        return {"actions": sim_action_from_lean(lean)}
