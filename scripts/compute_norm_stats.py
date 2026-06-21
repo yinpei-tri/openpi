@@ -90,6 +90,7 @@ def create_robocasa_webdataset_dataloader(
     data_config: _config.DataConfig,
     batch_size: int,
     max_frames: int | None = None,
+    num_workers: int = 8,
 ) -> tuple[_data_loader.Dataset, int]:
     """Stream RoboCasa WebDataset shards through repack+data_transforms for stats.
 
@@ -125,16 +126,23 @@ def create_robocasa_webdataset_dataloader(
         [*data_config.repack_transforms.inputs, *data_config.data_transforms.inputs, RemoveStrings()],
     )
     num_batches = (max_frames or len(inner) or 100_000) // batch_size
+    # The stats pass is CPU-bound (JPEG decode + recompute-lean-from-raw per sample);
+    # RoboCasaWebDataset shards across DataLoader workers (_worker_shards) so workers
+    # decode disjoint shards in parallel. RunningStats aggregates order-invariantly.
     data_loader = _data_loader.TorchDataLoader(
-        dataset, local_batch_size=batch_size, num_workers=0, shuffle=False, num_batches=num_batches
+        dataset, local_batch_size=batch_size, num_workers=num_workers, shuffle=False, num_batches=num_batches
     )
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(config_name: str, max_frames: int | None = None, batch_size: int = 128, num_workers: int = 8):
     import dataclasses as _dc
 
     config = _config.get_config(config_name)
+    # Stats batch size + workers are independent of the train config (RunningStats is
+    # batch- and order-invariant). Defaults: bs=128 (fewer iters than a tiny train batch
+    # like bs=2 -> 150k) + 8 parallel workers (the pass is CPU-bound on JPEG decode +
+    # lean recompute). Override with --batch-size / --num-workers.
 
     # RoboCasa anchor state: compute stats on the 14-d CURRENT state only. The anchor
     # (subgoal-start) state is the SAME physical quantity at a different timestep, so it
@@ -150,15 +158,15 @@ def main(config_name: str, max_frames: int | None = None):
 
     if data_config.robocasa_webdataset_shards is not None:
         data_loader, num_batches = create_robocasa_webdataset_dataloader(
-            data_config, config.batch_size, max_frames
+            data_config, batch_size, max_frames, num_workers
         )
     elif data_config.rlds_data_dir is not None:
         data_loader, num_batches = create_rlds_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, max_frames
+            data_config, config.model.action_horizon, batch_size, max_frames
         )
     else:
         data_loader, num_batches = create_torch_dataloader(
-            data_config, config.model.action_horizon, config.batch_size, config.model, config.num_workers, max_frames
+            data_config, config.model.action_horizon, batch_size, config.model, config.num_workers, max_frames
         )
 
     keys = ["state", "actions"]

@@ -1054,7 +1054,7 @@ _CONFIGS = [
         num_workers=0,
         lr_schedule=_optimizer.CosineDecaySchedule(warmup_steps=10, peak_lr=5e-5, decay_steps=200, decay_lr=5e-5),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=None,
+        ema_decay=0.999,  # EMA on by default (pass --ema-decay=None to fit small GPUs)
         weight_loader=weight_loaders.CheckpointWeightLoader(
             "gs://openpi-assets/checkpoints/pi05_base/params",
             missing_regex=".*(lora|progress_head|image_role_embedding).*",
