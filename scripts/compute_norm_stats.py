@@ -105,6 +105,11 @@ def create_robocasa_webdataset_dataloader(
     so counting it is analogous to openpi/LeRobot copy-padding absolute actions and
     counting them. One stats set serves BOTH ablation checkpoints (episode + subtask
     targets) — the pad strategy is a TARGET choice, normalized identically.
+
+    The anchor-state handling (compute 14-d current-state stats, then tile x2) is done
+    in ``main`` by building the stats data_config with ``include_anchor_state=False`` —
+    that forces BOTH the loader AND the RobocasaInputs transform to 14-d, so this
+    function always sees the clean 14-d current state.
     """
     import dataclasses as _dc
 
@@ -127,8 +132,21 @@ def create_robocasa_webdataset_dataloader(
 
 
 def main(config_name: str, max_frames: int | None = None):
+    import dataclasses as _dc
+
     config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
+
+    # RoboCasa anchor state: compute stats on the 14-d CURRENT state only. The anchor
+    # (subgoal-start) state is the SAME physical quantity at a different timestep, so it
+    # must share the current state's normalization — else a spurious offset between the
+    # two halves corrupts the before/after delta. We force include_anchor_state=False
+    # for the stats build (forces BOTH the loader and the RobocasaInputs transform to
+    # 14-d), then TILE the resulting state stats x2 -> 28-d with identical halves.
+    tile_state_stats = getattr(config.data, "include_anchor_state", False)
+    data_factory = config.data
+    if tile_state_stats:
+        data_factory = _dc.replace(config.data, include_anchor_state=False)
+    data_config = data_factory.create(config.assets_dirs, config.model)
 
     if data_config.robocasa_webdataset_shards is not None:
         data_loader, num_batches = create_robocasa_webdataset_dataloader(
@@ -151,6 +169,17 @@ def main(config_name: str, max_frames: int | None = None):
             stats[key].update(np.asarray(batch[key]))
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+
+    # If the training config appends the anchor state (state 14 -> 28), TILE the 14-d
+    # current-state stats x2 so both halves share the identical current-state
+    # normalization (the principled choice — see the note at the top of main).
+    if tile_state_stats:
+        s = norm_stats["state"]
+        tile = lambda a: None if a is None else np.concatenate([a, a], axis=-1)
+        norm_stats["state"] = normalize.NormStats(
+            mean=tile(s.mean), std=tile(s.std), q01=tile(s.q01), q99=tile(s.q99)
+        )
+        print(f"Tiled state norm stats x2 -> {norm_stats['state'].mean.shape[-1]}-d (anchor state enabled)")
 
     output_path = config.assets_dirs / data_config.repo_id
     print(f"Writing stats to: {output_path}")

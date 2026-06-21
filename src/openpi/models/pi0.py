@@ -138,6 +138,7 @@ class Pi0(_model.BaseModel):
                 readout=config.progress_readout,
                 num_layers=config.progress_num_layers,
                 num_heads=config.progress_num_heads,
+                hidden=config.progress_hidden,
                 rngs=rngs,
             )
 
@@ -238,8 +239,14 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+        return_metrics: bool = False,
+    ) -> at.Float[at.Array, "*b ah"] | tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         progress_target = observation.progress
         observation = _model.preprocess_observation(
@@ -272,18 +279,33 @@ class Pi0(_model.BaseModel):
         # Flow-matching loss per (batch, horizon-step).
         flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [*b, ah]
 
+        # Per-component metrics for logging (means over the batch). Always includes the
+        # flow loss; progress entries are added when the head is active.
+        metrics: dict[str, at.Array] = {"flow_loss": jnp.mean(flow_loss)}
+
         # System1 progress head: aux state-value regression on frac**k.
-        # Added per-sample (broadcast over horizon) so the trainer's jnp.mean over
-        # [*b, ah] equals mean(flow) + w * mean(progress).
+        # progress_loss is per-sample [*b]; broadcast over the horizon axis and add.
+        # The trainer does jnp.mean over [*b, ah]; broadcasting a per-sample value over
+        # ah slots then meaning over ah recovers it exactly, so the realized weight is
+        # exactly progress_loss_weight. Do NOT divide by action_horizon — that would
+        # attenuate the weight by 1/ah. Progress is a per-sample VLM readout and has
+        # nothing to do with the action horizon.
+        total_loss = flow_loss
         if self._use_progress_head and progress_target is not None:
             progress_pred = self._predict_progress(prefix_out, prefix_mask)  # [*b], in [0,1]
             target = jnp.clip(progress_target, 0.0, 1.0) ** self._progress_k
             progress_loss = _huber(progress_pred - target)  # [*b]
-            # Spread the per-sample progress loss evenly across the horizon dim so the
-            # mean is exact, then weight.
-            flow_loss = flow_loss + self._progress_loss_weight * progress_loss[..., None] / self.action_horizon
+            total_loss = flow_loss + self._progress_loss_weight * progress_loss[..., None]
+            metrics["progress_loss"] = jnp.mean(progress_loss)
+            metrics["progress_loss_weighted"] = self._progress_loss_weight * jnp.mean(progress_loss)
+            # Diagnostics on the prediction itself (un-shaped fraction error + outputs).
+            metrics["progress_mae"] = jnp.mean(jnp.abs(progress_pred - target))
+            metrics["progress_pred_mean"] = jnp.mean(progress_pred)
+            metrics["progress_target_mean"] = jnp.mean(target)
 
-        return flow_loss
+        if return_metrics:
+            return total_loss, metrics
+        return total_loss
 
     def _predict_progress(
         self, prefix_out: at.Float[at.Array, "b s emb"], prefix_mask: at.Bool[at.Array, "b s"]

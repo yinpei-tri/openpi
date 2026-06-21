@@ -128,6 +128,16 @@ class ModelTransformFactory(GroupFactory):
 
     # If provided, will determine the default prompt that be used by the model.
     default_prompt: str | None = None
+    # RoboCasa System1: when the anchor/initial state is appended onto the current
+    # state, split the discretized state into two labeled prompt segments at this index
+    # (``State: <current>; Initial State: <anchor>``). None = single segment (default,
+    # unchanged for all other datasets).
+    state_split: int | None = None
+    state_split_label: str = "Initial State"
+    # Separator before ``State:`` (stock pi05 ", "; RoboCasa System1 uses "\n").
+    task_state_sep: str = ", "
+    # Keep intentional structural newlines in the prompt (RoboCasa's "Scope:" line).
+    preserve_newlines: bool = False
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -151,6 +161,10 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
+                            state_split=self.state_split,
+                            state_split_label=self.state_split_label,
+                            task_state_sep=self.task_state_sep,
+                            preserve_newlines=self.preserve_newlines,
                         ),
                         # pi0.5 discretizes the state into the prompt text, so it does not
                         # need (and should not get) a zero-padded continuous state vector.
@@ -390,11 +404,33 @@ class RoboCasaDataConfig(DataConfigFactory):
     # WebDataset shards spec: local shards/ dir OR s3://bucket/prefix.
     shards: str = tyro.MISSING
     # Sample-construction knobs (load-time; re-tunable without re-converting).
-    subgoal_level: Literal["milestone", "child", "mixed"] = "child"
-    p_milestone: float = 0.5  # P(milestone) when subgoal_level == "mixed"
-    p_detail: float = 0.0  # P(prompt = subgoal_detail instead of subgoal)
-    include_base_pos: bool = True
+    # Default recipe: condition on a MIX of milestone+child subgoals (so System2 can
+    # issue at either granularity) and a mix of short + detailed phrasings, with the
+    # action chunk zero-padded at the chosen subgoal's boundary (System1 learns to
+    # stop/settle so System2 can hand off the next subgoal).
+    subgoal_level: Literal["milestone", "child", "mixed"] = "mixed"
+    p_milestone: float = 0.5  # P(milestone vs child) when subgoal_level == "mixed"
+    p_detail: float = 0.5  # P(prompt = subgoal_detail instead of the terse subgoal)
+    include_base_pose: bool = True
     use_anchor_images: bool = True
+    # Prepend the whole-task goal to the subgoal prompt for disambiguating context
+    # ("<task>; Current Subgoal: <subgoal>"). ON by default; flip off with
+    # --data.no-include-task-goal for the composable-subgoal-only ablation.
+    include_task_goal: bool = True
+    # Append the anchor (subgoal-start) lean state to the current state so pi0.5's
+    # discretized prompt ints carry the proprioceptive before/after delta (rendered as
+    # "Initial State: …; Current State: …"). ON by default; flip off with
+    # --data.no-include-anchor-state.
+    include_anchor_state: bool = True
+    # Emit the metadata conditioning line ("Scope: milestone|step") so the VLA knows to
+    # execute a long vs short action span. ON by default; flip off with
+    # --data.no-include-metadata. (Future offline-RL tags Quality/Mistake join this line.)
+    include_metadata: bool = True
+    # Recompute lean state from the shard's RAW state via robocasa_policy (the same path
+    # as inference) and assert it matches the producer's baked lean — a drift guard. ON
+    # by default; flip off with --data.no-recompute-lean-from-raw to pass baked lean
+    # through (marginally cheaper, no verification).
+    recompute_lean_from_raw: bool = True
     subgoal_action_pad: Literal["subtask", "episode"] = "subtask"
     shuffle_buffer: int = 16000
     shuffle_initial: int = 1000
@@ -406,8 +442,10 @@ class RoboCasaDataConfig(DataConfigFactory):
         settings = _wds.WebDatasetConfig(
             shards=self.shards,
             action_horizon=model_config.action_horizon,
-            include_base_pos=self.include_base_pos,
+            include_base_pose=self.include_base_pose,
             use_anchor_images=self.use_anchor_images,
+            include_anchor_state=self.include_anchor_state,
+            recompute_lean_from_raw=self.recompute_lean_from_raw,
             subgoal_level=self.subgoal_level,
             p_milestone=self.p_milestone,
             p_detail=self.p_detail,
@@ -424,13 +462,30 @@ class RoboCasaDataConfig(DataConfigFactory):
                 robocasa_policy.RobocasaInputs(
                     action_dim=model_config.action_dim,
                     model_type=model_config.model_type,
-                    include_base_pos=self.include_base_pos,
+                    include_base_pose=self.include_base_pose,
                     use_anchor_images=self.use_anchor_images,
+                    include_task_goal=self.include_task_goal,
+                    include_anchor_state=self.include_anchor_state,
+                    include_metadata=self.include_metadata,
                 )
             ],
             outputs=[robocasa_policy.RobocasaOutputs()],
         )
-        model_transforms = ModelTransformFactory()(model_config)
+        # When the anchor/initial state is appended, tell the tokenizer to render it as
+        # a second labeled prompt segment ("State: <current>; Initial State: <anchor>")
+        # split at the current lean-state width.
+        state_split = (
+            robocasa_policy.lean_state_dim(include_base_pose=self.include_base_pose)
+            if self.include_anchor_state
+            else None
+        )
+        model_transforms = ModelTransformFactory(
+            state_split=state_split,
+            state_split_label="Initial State",
+            task_state_sep="\n",
+            # Keep the "Scope:" metadata line's newline (only matters when include_metadata).
+            preserve_newlines=self.include_metadata,
+        )(model_config)
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             data_transforms=data_transforms,
@@ -890,6 +945,11 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=20,
+            # 256 (vs the pi05 default 200): the worst-case prompt — longest task_goal
+            # (50 tok) + longest detailed subgoal (34) + BOTH 14-d state segments
+            # (current + anchor "Initial State", ~120 tok together) + scaffolding —
+            # measures 216 tokens, so 200 truncates the state ints. 256 leaves ~40 spare.
+            max_token_len=256,
             image_keys=("scene_left", "scene_right", "wrist"),
             # Anchor scene cams get the SAME geometric aug as the current scene cams
             # (crop+rotate+resize); wrist + anchor_wrist get color-jitter only (color
@@ -897,14 +957,13 @@ _CONFIGS = [
             geometric_aug_cameras=("scene_left", "scene_right", "anchor_scene_left", "anchor_scene_right"),
             use_anchor_images=True,
             use_progress_head=True,
-            progress_readout="shallow_transformer",
-            progress_k=2.0,
-            progress_loss_weight=1.0,
+            # progress_readout / progress_k / progress_loss_weight (0.5) / stop_gradient
+            # (False) all inherit the Pi0Config defaults; override per-ablation via CLI.
         ),
         data=RoboCasaDataConfig(
             repo_id="robocasa_system1",
             shards=_robocasa_shards(),
-            subgoal_level="child",
+            # subgoal_level / p_milestone / p_detail inherit the mixed default.
             use_anchor_images=True,
         ),
         batch_size=64,
@@ -932,13 +991,17 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=20,
+            # 256 (vs the pi05 default 200): the worst-case prompt — longest task_goal
+            # (50 tok) + longest detailed subgoal (34) + BOTH 14-d state segments
+            # (current + anchor "Initial State", ~120 tok together) + scaffolding —
+            # measures 216 tokens, so 200 truncates the state ints. 256 leaves ~40 spare.
+            max_token_len=256,
             image_keys=("scene_left", "scene_right", "wrist"),
             geometric_aug_cameras=("scene_left", "scene_right"),
             use_anchor_images=False,
             use_progress_head=True,
-            progress_readout="shallow_transformer",
-            progress_k=2.0,
-            progress_loss_weight=1.0,
+            # progress_readout / progress_k / progress_loss_weight (0.5) / stop_gradient
+            # (False) all inherit the Pi0Config defaults; override per-ablation via CLI.
         ),
         data=RoboCasaDataConfig(
             # Norm stats resolve via assets_base_dir/<config>/robocasa_system1 (baked
@@ -947,7 +1010,7 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="robocasa_system1"),
             repo_id="robocasa_system1",
             shards=_robocasa_shards(),
-            subgoal_level="child",
+            # subgoal_level / p_milestone / p_detail inherit the mixed default.
             use_anchor_images=False,
         ),
         batch_size=2,
@@ -969,6 +1032,11 @@ _CONFIGS = [
         model=pi0_config.Pi0Config(
             pi05=True,
             action_horizon=20,
+            # 256 (vs the pi05 default 200): the worst-case prompt — longest task_goal
+            # (50 tok) + longest detailed subgoal (34) + BOTH 14-d state segments
+            # (current + anchor "Initial State", ~120 tok together) + scaffolding —
+            # measures 216 tokens, so 200 truncates the state ints. 256 leaves ~40 spare.
+            max_token_len=256,
             image_keys=("scene_left", "scene_right", "wrist"),
             geometric_aug_cameras=("scene_left", "scene_right"),
             use_anchor_images=False,

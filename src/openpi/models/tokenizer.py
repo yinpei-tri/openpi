@@ -19,13 +19,42 @@ class PaligemmaTokenizer:
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
-    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
-        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+    def tokenize(
+        self,
+        prompt: str,
+        state: np.ndarray | None = None,
+        *,
+        state_split: int | None = None,
+        state_split_label: str = "Initial State",
+        task_state_sep: str = ", ",
+        preserve_newlines: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        # ``preserve_newlines``: keep intentional structural newlines in the prompt (e.g.
+        # RoboCasa System1's "Scope:" metadata line). Default strips them (stock pi05).
+        cleaned_text = prompt.strip().replace("_", " ")
+        if not preserve_newlines:
+            cleaned_text = cleaned_text.replace("\n", " ")
         if state is not None:
             # This is the Pi05 format, where the state is part of the discrete language input.
+            # ``task_state_sep`` is the separator before ``State:`` (stock ", "; RoboCasa
+            # System1 uses "\n" so the state block starts on its own line).
             discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
-            state_str = " ".join(map(str, discretized_state))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+            if state_split is not None and 0 < state_split < len(discretized_state):
+                # Render the state as TWO labeled segments (e.g. RoboCasa System1's
+                # current state + appended anchor/initial state). The vector is laid out
+                # [current, anchor]; we render the INITIAL (anchor) state FIRST, then the
+                # current state ("before -> after" reads naturally), and rename the main
+                # segment "Current State". The whole vector was normalized together
+                # upstream, so both halves share the same digitization bins.
+                cur_str = " ".join(map(str, discretized_state[:state_split]))
+                init_str = " ".join(map(str, discretized_state[state_split:]))
+                full_prompt = (
+                    f"Task: {cleaned_text}{task_state_sep}"
+                    f"{state_split_label}: {init_str}; Current State: {cur_str};\nAction: "
+                )
+            else:
+                state_str = " ".join(map(str, discretized_state))
+                full_prompt = f"Task: {cleaned_text}{task_state_sep}State: {state_str};\nAction: "
             tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         else:
             # This is the Pi0 format, where the state is part of the continuous action expert input.

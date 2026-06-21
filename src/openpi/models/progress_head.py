@@ -54,7 +54,7 @@ class ProgressHead(nnx.Module):
         readout: str = "shallow_transformer",
         num_layers: int = 2,
         num_heads: int = 8,
-        hidden: int = 256,
+        hidden: int = 512,
         rngs: nnx.Rngs,
     ):
         self.readout = readout

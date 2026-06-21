@@ -248,6 +248,16 @@ class AbsoluteActions(DataTransformFn):
 class TokenizePrompt(DataTransformFn):
     tokenizer: _tokenizer.PaligemmaTokenizer
     discrete_state_input: bool = False
+    # If set, render the discretized state as TWO labeled segments split at this index
+    # (``State: <:split>; <label>: <split:>``). Used by RoboCasa System1 when the
+    # anchor/initial state is appended onto the current state; default None = single
+    # ``State:`` segment (unchanged for every other dataset).
+    state_split: int | None = None
+    state_split_label: str = "Initial State"
+    # Separator before ``State:`` (stock pi05 ", "; RoboCasa System1 uses "\n").
+    task_state_sep: str = ", "
+    # Keep intentional structural newlines in the prompt (RoboCasa's "Scope:" line).
+    preserve_newlines: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -262,7 +272,14 @@ class TokenizePrompt(DataTransformFn):
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
-        tokens, token_masks = self.tokenizer.tokenize(prompt, state)
+        tokens, token_masks = self.tokenizer.tokenize(
+            prompt,
+            state,
+            state_split=self.state_split,
+            state_split_label=self.state_split_label,
+            preserve_newlines=self.preserve_newlines,
+            task_state_sep=self.task_state_sep,
+        )
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 

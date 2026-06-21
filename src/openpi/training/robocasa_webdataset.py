@@ -46,8 +46,18 @@ class WebDatasetConfig:
 
     shards: str  # glob-ish dir or brace pattern; local path or s3://bucket/prefix
     action_horizon: int = 20
-    include_base_pos: bool = True
+    include_base_pose: bool = True
     use_anchor_images: bool = True
+    # Append the anchor (subgoal-start) lean state to the per-frame sample so the
+    # policy can concatenate it onto the current state (proprioceptive before/after).
+    include_anchor_state: bool = False
+    # If True (default), send the RAW state (current + anchor) + the episode base
+    # reference instead of the pre-baked lean state, so the policy recomputes lean from
+    # raw via the SAME robocasa_policy.lean_state_from_raw used at inference — and also
+    # ship the baked lean so the policy can ASSERT recompute == baked (catches any drift
+    # between the producer's lean math and the policy's). If False, pass the baked lean
+    # straight through (cheaper; no verification).
+    recompute_lean_from_raw: bool = True
     # Anchor store (path-addressable). If None, derived as the `anchors/` sibling of
     # `shards`. Anchors are NOT embedded in shards (~1M frames at full scale); the
     # loader reads them by key on demand. For S3, STAGE this dir to local disk first
@@ -237,14 +247,24 @@ class RoboCasaWebDataset:
         arrays = np.load(io.BytesIO(raw["arrays.npz"]))
 
         # --- images + state ---
-        # State is already PREPROCESSED (lean, base x/y/yaw pre-made relative) in the
-        # shards; RobocasaInputs passes it through (dim-detects lean vs raw).
         sample: dict[str, Any] = {
             "observation/scene_left": _decode_jpeg(raw["scene_left.jpg"]),
             "observation/scene_right": _decode_jpeg(raw["scene_right.jpg"]),
             "observation/wrist": _decode_jpeg(raw["wrist.jpg"]),
-            "observation/state": arrays["state"].astype(np.float32),
         }
+        if self.cfg.recompute_lean_from_raw and "raw_state" in arrays:
+            # Send the RAW 16-d state + the episode base reference (frame-0 raw_state)
+            # so RobocasaInputs recomputes lean via the SAME path used at inference, and
+            # ALSO ship the baked lean so it can assert recompute == baked (drift guard).
+            ref = arrays["raw_state_ref"]
+            sample["observation/state"] = arrays["raw_state"].astype(np.float32)
+            sample["observation/base_pos_ref"] = ref[0:3].astype(np.float32)
+            sample["observation/base_yaw_ref"] = np.float32(_rp._yaw_from_quat_xyzw(ref[3:7]))
+            sample["observation/state_lean_baked"] = arrays["state"].astype(np.float32)
+        else:
+            # Pass the pre-baked lean state straight through (RobocasaInputs dim-detects
+            # it as already-lean and skips conversion).
+            sample["observation/state"] = arrays["state"].astype(np.float32)
 
         if self.cfg.use_anchor_images:
             # Anchor for the CHOSEN level, read by key from the (path-addressable)
@@ -257,6 +277,20 @@ class RoboCasaWebDataset:
             for ck in CAM_KEYS:
                 sample[f"observation/anchor_{ck}"] = self._read_anchor(anchor_key, ck)
 
+        if self.cfg.include_anchor_state:
+            # Anchor (subgoal-start) state for the CHOSEN level. Mirror the current-state
+            # handling: send RAW anchor (+ baked lean anchor to verify) when recomputing,
+            # else the pre-baked lean anchor. The policy concatenates it onto the current.
+            lvl = "milestone" if use_milestone else "child"
+            akey = f"anchor_state_{lvl}"
+            raw_akey = f"raw_anchor_state_{lvl}"
+            if self.cfg.recompute_lean_from_raw and raw_akey in arrays:
+                sample["observation/anchor_state"] = arrays[raw_akey].astype(np.float32)
+                if akey in arrays:
+                    sample["observation/anchor_state_lean_baked"] = arrays[akey].astype(np.float32)
+            elif akey in arrays:
+                sample["observation/anchor_state"] = arrays[akey].astype(np.float32)
+
         # --- actions (chosen pad variant) ---
         if self.cfg.subgoal_action_pad == "episode":
             actions = arrays["action_episode"]
@@ -266,6 +300,12 @@ class RoboCasaWebDataset:
 
         # --- targets / meta ---
         sample["prompt"] = prompt
+        sample["task_goal"] = meta.get("task_goal", "")
+        # Conditioning metadata (rendered as "Scope: …" in the prompt): the OBSERVED
+        # subgoal level for this sample. "milestone" = long action span, "step" = short
+        # (one fine action). At inference the eval adapter sets this to the level System2
+        # is issuing. (Future offline-RL tags like Quality/Mistake will join this dict.)
+        sample["scope"] = "milestone" if use_milestone else "step"
         sample["progress_frac"] = np.float32(level["progress_frac"])
         sample["subgoal_start"] = np.int32(level["start"])
         sample["subgoal_end"] = np.int32(level["end"])

@@ -47,15 +47,31 @@ class Pi0Config(_model.BaseModelConfig):
 
     # Progress head (subgoal-completion state value in [0,1]).
     use_progress_head: bool = False
-    # Readout over the (detached) prefix: "shallow_transformer" | "mean_pool" | "prefix_token".
+    # Readout over the prefix: "shallow_transformer" | "mean_pool" | "prefix_token".
     progress_readout: str = "shallow_transformer"
-    # If True, the head reads stop_grad(prefix) so progress never alters the VLM
-    # (ignored for "prefix_token", which is in-backbone by construction).
-    progress_stop_gradient: bool = True
-    # Aux loss weight and target shaping target = frac**progress_k.
-    progress_loss_weight: float = 1.0
-    progress_k: float = 2.0
-    # Shallow-transformer head depth / heads.
+    # If True, the head reads stop_grad(prefix) so the progress loss never alters the
+    # VLM. Default FALSE: the prefix's FINAL-layer output (what the head reads) gets
+    # NO gradient from the action loss (the action expert only consumes the prefix via
+    # K/V inside attention, not its last-layer output), so insulating it would leave
+    # the readout representation stale at pretrained init. Letting progress gradient
+    # flow (small weight) trains that representation + co-shapes the backbone.
+    progress_stop_gradient: bool = False
+    # Aux loss weight (target = frac**progress_k). 0.5: progress is a first-class
+    # product (System2 reads it), so it co-trains the VLM substantially — watch
+    # flow_loss vs progress_loss in wandb to confirm actions don't regress.
+    progress_loss_weight: float = 0.5
+    # Progress target = frac**progress_k. k=1 (LINEAR): progress is the literal
+    # time-fraction through the subgoal span — uniform gradient across the whole span,
+    # no flat/dead zone early, trivially interpretable for System2's hand-off threshold.
+    # (k>1 back-loads resolution toward completion — better for pure transit subgoals but
+    # understates uniform contact subgoals like grasp; revisit per-primitive if eval
+    # curves show transit subgoals need it.)
+    progress_k: float = 1.0
+    # Shallow-transformer head width / depth / heads. The head down-projects the
+    # 2048-d PaliGemma prefix to progress_hidden, then runs the attention readout
+    # there (head_dim = progress_hidden / progress_num_heads = 64 by default). 512 is
+    # a cheap middle ground (~8M params) between the 256 default and full 2048.
+    progress_hidden: int = 512
     progress_num_layers: int = 2
     progress_num_heads: int = 8
 

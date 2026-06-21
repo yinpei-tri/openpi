@@ -29,6 +29,42 @@ import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
 
+def robocasa_exp_tag(config: _config.TrainConfig) -> str:
+    """Settings tag appended to exp_name for RoboCasa System1 runs.
+
+    Ablations are driven by CLI overrides on a single config, so the only thing that
+    distinguishes one run's checkpoint dir / wandb name from another is exp_name.
+    Append a DETERMINISTIC tag derived from the ablation knobs so runs never collide
+    and are self-describing. Deterministic => same settings reproduce the same path,
+    so --resume still works. Returns "" for non-RoboCasa configs.
+    """
+    data = config.data  # the RoboCasaDataConfig factory (has the knobs directly)
+    if not hasattr(data, "subgoal_level") or not hasattr(data, "shards"):
+        return ""  # not a RoboCasa run
+    m = config.model
+    parts = [
+        f"lvl-{data.subgoal_level}",
+        f"pm{data.p_milestone:g}",
+        f"pd{data.p_detail:g}",
+        f"pad-{data.subgoal_action_pad}",
+        ("anchor" if getattr(m, "use_anchor_images", False) else "noanchor"),
+        # Both prompt-content flags default ON, so render BOTH states explicitly
+        # (taskgoal/notaskgoal, anchorstate/noanchorstate) — an absent tag would be
+        # ambiguous once the default is on.
+        ("taskgoal" if getattr(data, "include_task_goal", False) else "notaskgoal"),
+        ("anchorstate" if getattr(data, "include_anchor_state", False) else "noanchorstate"),
+        ("scope" if getattr(data, "include_metadata", False) else "noscope"),
+    ]
+    if getattr(m, "use_progress_head", False):
+        # progress readout + whether the head is insulated from the VLM (stop-grad)
+        # + its loss weight — so insulated/non-insulated (and reweighted) runs differ.
+        sg = "sg" if getattr(m, "progress_stop_gradient", True) else "nosg"
+        parts.append(f"prog-{m.progress_readout}-{sg}-w{getattr(m, 'progress_loss_weight', 1.0):g}")
+    else:
+        parts.append("noprog")
+    return "_".join(parts)
+
+
 def init_logging():
     """Custom logging format for better readability."""
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -144,19 +180,23 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
-    @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        # Ask the model for per-component metrics (e.g. flow_loss / progress_loss) so we
+        # can log them separately. Models that don't return metrics yield an empty dict.
+        out = model.compute_loss(rng, observation, actions, train=True, return_metrics=True)
+        chunked_loss, metrics = out if isinstance(out, tuple) else (out, {})
+        return jnp.mean(chunked_loss), metrics
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    (loss, loss_metrics), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+        model, train_rng, observation, actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -188,6 +228,9 @@ def train_step(
         "loss": loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        # Per-component losses + diagnostics from the model (flow_loss, progress_loss,
+        # progress_mae, progress_pred/target_mean, ...). Logged individually to wandb.
+        **loss_metrics,
     }
     return new_state, info
 
@@ -195,6 +238,14 @@ def train_step(
 def main(config: _config.TrainConfig, tentative_run: bool = False):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
+
+    # For RoboCasa System1, ablations are CLI overrides on one config, so append a
+    # deterministic settings tag to exp_name -> distinct, self-describing checkpoint
+    # dirs + wandb names that never collide. No-op for other configs / if already tagged.
+    tag = robocasa_exp_tag(config)
+    if tag and config.exp_name and f"__{tag}" not in config.exp_name:
+        config = dataclasses.replace(config, exp_name=f"{config.exp_name}__{tag}")
+        logging.info(f"RoboCasa exp_name tagged -> {config.exp_name}")
 
     if config.batch_size % jax.device_count() != 0:
         raise ValueError(
