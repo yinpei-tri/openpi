@@ -131,7 +131,10 @@ def lean_state_from_raw(
             yaw = yaw - np.float32(base_yaw_ref)
         rel_yaw_sincos = np.stack([np.sin(yaw), np.cos(yaw)], axis=-1)
         parts += [base_xy, rel_yaw_sincos]
-    return np.concatenate(parts, axis=-1)
+    # Cast to float32: quat_xyzw_to_rot6d / yaw use Python-literal constants (1, 2.0)
+    # that promote the intermediates to float64. The producer vendors the identical
+    # cast, so baked == recomputed still holds bit-for-bit.
+    return np.concatenate(parts, axis=-1).astype(np.float32)
 
 
 # Lean state dim depends only on include_base_pose.
