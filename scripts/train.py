@@ -184,8 +184,12 @@ def train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         # Ask the model for per-component metrics (e.g. flow_loss / progress_loss) so we
-        # can log them separately. Models that don't return metrics yield an empty dict.
-        out = model.compute_loss(rng, observation, actions, train=True, return_metrics=True)
+        # can log them separately. Only Pi0 supports the return_metrics kwarg; other
+        # models (e.g. Pi0FAST) keep the original signature, so fall back without it.
+        try:
+            out = model.compute_loss(rng, observation, actions, train=True, return_metrics=True)
+        except TypeError:
+            out = model.compute_loss(rng, observation, actions, train=True)
         chunked_loss, metrics = out if isinstance(out, tuple) else (out, {})
         return jnp.mean(chunked_loss), metrics
 
