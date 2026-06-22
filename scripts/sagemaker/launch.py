@@ -161,15 +161,9 @@ def sanitize(name: str) -> str:
     return name.strip("-") or "job"
 
 
-def make_job_name(prefix: str, user: str, exp_name: str = "") -> str:
-    # {user}-{exp_name}-{MMDD-HHMM}: the exp_name makes runs distinguishable at a glance
-    # (the long settings tag stays in the checkpoint S3 path + wandb run name). The fixed
-    # name_prefix (e.g. pi05-robocasa-s1-jax) is dropped from the JOB name to leave room
-    # for exp_name under SageMaker's 63-char cap; it still names the base_job_name. Short
-    # MMDD-HHMM stamp keeps runs unique without eating the budget.
-    parts = [user] + ([exp_name] if exp_name else [])
-    base = sanitize("-".join(parts))
-    stamp = datetime.now().strftime("%m%d-%H%M")
+def make_job_name(prefix: str, user: str) -> str:
+    base = sanitize(f"{user}-{prefix}" if prefix else user)
+    stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     return f"{base}-{stamp}"[:63].rstrip("-")
 
 
@@ -270,7 +264,7 @@ def main() -> None:
     for k, v in secrets.items():
         env.setdefault(k, v)
 
-    job_name = make_job_name(cfg["job"]["name_prefix"], cfg["job"]["user"], cfg["training"]["exp_name"])
+    job_name = make_job_name(cfg["job"]["name_prefix"], cfg["job"]["user"])
     max_run_seconds = int(cfg["job"]["max_run_days"]) * 24 * 60 * 60
 
     # Build the inputs dict — one TrainingInput per channel so we can pin
