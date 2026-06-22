@@ -205,7 +205,14 @@ def main() -> None:
     region = cfg["aws"]["region"]
     if region not in QUEUE_SUFFIX or instance_type not in QUEUE_SUFFIX[region]:
         raise SystemExit(f"No queue mapping for region={region} instance={instance_type}")
-    queue_name = f"fss-{cfg['queue']['name']}-{QUEUE_SUFFIX[region][instance_type]}"
+    # The bare queue is `fss-{name}-{suffix}`, but when submission goes through the
+    # cross-account `shared-sagemaker` scheduler the SubmitServiceJob jobQueue must be
+    # the QUALIFIED name `shared-sagemaker__{region}__fss-...`. Allow an explicit
+    # override (queue.full_name) for that case; else build the bare name.
+    if cfg["queue"].get("full_name"):
+        queue_name = cfg["queue"]["full_name"]
+    else:
+        queue_name = f"fss-{cfg['queue']['name']}-{QUEUE_SUFFIX[region][instance_type]}"
     print(f"Queue: {queue_name}")
 
     secrets = load_secrets("secrets.env")

@@ -19,7 +19,7 @@ job:
   volume_size: 300            # shards ~16GB + anchors + checkpoints + caches
   tags:
     - key: tri.owner.email
-      value: yinpeidai@tri.global
+      value: yinpei.dai@tri.global
     - key: tri.project
       value: MM:PJ-0077
 
