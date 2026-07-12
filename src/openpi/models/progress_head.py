@@ -1,8 +1,10 @@
 """Subgoal-completion progress head for System1 pi0.5.
 
-A state-value scalar in [0,1] predicting how far the current frame is through its
-subgoal span. Reads the PaliGemma *prefix* outputs (the clean image+language
-representation, noise-independent), NOT the noised action-expert suffix. The
+Predicts how far the current frame is through its subgoal span — either a state-value
+scalar in [0,1] (continuous mode, ``num_outputs=1``) or a K-way progress bucket
+(classes mode, ``num_outputs=K``; cross-entropy in pi0.py). Reads the PaliGemma
+*prefix* outputs (the clean image+language representation, noise-independent), NOT the
+noised action-expert suffix. The
 default reads ``stop_grad(prefix)`` so the progress objective never alters the VLM
 features (Markovian action policy is preserved); ``prefix_token`` is the only
 variant that would let gradients into the backbone (handled in pi0.py).
@@ -45,7 +47,13 @@ class _Block(nnx.Module):
 
 
 class ProgressHead(nnx.Module):
-    """Progress readout over prefix features -> scalar logit (sigmoid applied by caller)."""
+    """Progress readout over prefix features.
+
+    Emits ``num_outputs`` logits per sample: ``num_outputs=1`` for the continuous
+    state-value (caller applies sigmoid), or ``num_outputs=K`` for the K-way progress
+    classifier (caller applies softmax / cross-entropy). The readout squeezes the last
+    axis only when ``num_outputs == 1`` (continuous), else keeps the class axis.
+    """
 
     def __init__(
         self,
@@ -55,9 +63,11 @@ class ProgressHead(nnx.Module):
         num_layers: int = 2,
         num_heads: int = 8,
         hidden: int = 512,
+        num_outputs: int = 1,
         rngs: nnx.Rngs,
     ):
         self.readout = readout
+        self.num_outputs = num_outputs
         if readout == "shallow_transformer":
             self.in_proj = nnx.Linear(in_features, hidden, rngs=rngs)
             # Learned [PROG] query token (1, 1, hidden).
@@ -69,23 +79,28 @@ class ProgressHead(nnx.Module):
             for i in range(num_layers):
                 setattr(self, f"block_{i}", _Block(hidden, num_heads, rngs=rngs))
             self.out_norm = nnx.LayerNorm(hidden, rngs=rngs)
-            self.out = nnx.Linear(hidden, 1, rngs=rngs)
+            self.out = nnx.Linear(hidden, num_outputs, rngs=rngs)
         elif readout in ("mean_pool", "prefix_token"):
             self.mlp1 = nnx.Linear(in_features, hidden, rngs=rngs)
-            self.mlp2 = nnx.Linear(hidden, 1, rngs=rngs)
+            self.mlp2 = nnx.Linear(hidden, num_outputs, rngs=rngs)
         else:
             raise ValueError(f"unknown progress_readout: {readout}")
 
-    def from_pooled(self, feat: at.Float[at.Array, "b d"]) -> at.Float[at.Array, " b"]:
+    def _squeeze(self, logits: at.Array) -> at.Array:
+        # Continuous head (num_outputs==1): drop the trailing unit axis -> [b].
+        # Classifier (num_outputs==K): keep the class axis -> [b, K].
+        return jnp.squeeze(logits, axis=-1) if self.num_outputs == 1 else logits
+
+    def from_pooled(self, feat: at.Float[at.Array, "b d"]) -> at.Array:
         """For mean_pool / prefix_token: feat is a single pooled vector per batch."""
         h = nnx.gelu(self.mlp1(feat))
-        return jnp.squeeze(self.mlp2(h), axis=-1)
+        return self._squeeze(self.mlp2(h))
 
     def from_sequence(
         self,
         tokens: at.Float[at.Array, "b s d"],
         mask: at.Bool[at.Array, "b s"] | None = None,
-    ) -> at.Float[at.Array, " b"]:
+    ) -> at.Array:
         """For shallow_transformer: attend a [PROG] token over the prefix tokens."""
         b = tokens.shape[0]
         x = self.in_proj(tokens)
@@ -99,4 +114,4 @@ class ProgressHead(nnx.Module):
         for i in range(self.num_layers):
             x = getattr(self, f"block_{i}")(x, mask=attn_mask)
         prog_out = self.out_norm(x[:, 0])  # the [PROG] token output
-        return jnp.squeeze(self.out(prog_out), axis=-1)
+        return self._squeeze(self.out(prog_out))

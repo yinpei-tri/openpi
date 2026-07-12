@@ -169,10 +169,14 @@ def _as_str(x) -> str:
 # into the training data, so append-only. Today only `scope` (subgoal level) is
 # populated; Quality / Mistake / etc. are reserved for future offline-RL data (curated
 # failures + System1 rollouts) and are emitted only when the key is present + non-empty.
-METADATA_FIELDS: tuple[tuple[str, str], ...] = (
-    ("scope", "Scope"),       # "milestone" (long span) | "step" (short, one fine action)
-    # ("quality", "Quality"),   # FUTURE: 0-5 trajectory quality (needs a scorer)
-    # ("mistake", "Mistake"),   # FUTURE: "true"/"false" (needs curated failure data)
+# Offline-RL conditioning tags rendered on the SECOND prompt line, in this FIXED order
+# as "Label: value; Label: value". Maps a sample-dict key -> the human-facing label.
+# system1_full populates quality (Success/Suboptimal), est_length (planned subgoal
+# length), and executed_step (how many steps already taken).
+CONDITIONING_FIELDS: tuple[tuple[str, str], ...] = (
+    ("quality", "Quality"),
+    ("est_length", "Estimated Length"),
+    ("executed_step", "Executed Step"),
 )
 
 
@@ -181,30 +185,28 @@ def build_prompt(
     task_goal: str | None = None,
     *,
     include_task_goal: bool = False,
-    metadata: dict | None = None,
+    conditioning: dict | None = None,
 ) -> str:
-    """Assemble the language prompt fed to pi0.5 (the SINGLE prompt-assembly point).
+    """Assemble the TEXT portion of the pi0.5 prompt (single prompt-assembly point).
 
-    Used by BOTH the WebDataset loader (training) and the eval adapter (inference) so
-    the conditioning text is identical. Both the whole-task goal and the subgoal are
-    LOWERCASED for normalization (the PaliGemma tokenizer strips/_-cleans but does NOT
-    lowercase, and RoboCasa subgoals come in as full sentences with varied casing).
+    Used by BOTH the WebDataset loader (training) and the eval adapter (inference) so the
+    conditioning text is identical. The whole-task goal and subgoal are LOWERCASED (the
+    PaliGemma tokenizer strips/_-cleans but does NOT lowercase).
 
-    - ``include_task_goal=False`` (default): prompt = the subgoal alone. System1 is a
-      clean, composable subgoal executor — leaning on the whole-task string couples the
-      policy to the task and hurts recombined / OOD subgoal sequences.
-    - ``include_task_goal=True``: prepend the whole-task goal as disambiguating context
-      -> ``"<task>; Current Subgoal: <subgoal>"`` (an ablation; System2/the env always
-      knows the task, so it's free at inference).
+    Returns up to two lines (the tokenizer then appends the state block + gripper +
+    "\\nAction: "):
 
-    ``metadata`` (optional): conditioning tags rendered on a SECOND line, e.g.
-    ``Scope: step`` (subgoal level). At TRAINING set them to the OBSERVED value; at
-    INFERENCE set them to the DESIRED value (decision-transformer style). The tokenizer
-    wraps the whole thing as ``Task: <line1>\\n<line2>\\nState: <ints>;``.
+        Task: <task>; Current Subgoal: <subgoal>
+        Quality: <q>; Estimated Length: <n>; Executed Step: <k>
+
+    - ``include_task_goal`` prepends the whole-task goal as disambiguating context.
+    - ``conditioning`` (optional): offline-RL tags rendered on the SECOND line, in the
+      FIXED order (quality, est_length, executed_step). At TRAINING set them to the
+      OBSERVED value; at INFERENCE to the DESIRED value (decision-transformer style).
+      Only non-empty tags are emitted.
     """
-    # Strip any newlines from the raw text components so the ONLY newline in the prompt
-    # is the structural one before the metadata line (the tokenizer preserves newlines
-    # for RoboCasa, so a stray newline in subgoal text would inject a spurious line).
+    # Strip any newlines from the raw text components so the ONLY newlines in the prompt
+    # are the structural ones (the tokenizer preserves newlines for RoboCasa).
     subgoal = _as_str(subgoal).strip().lower().replace("\n", " ")
     if include_task_goal and task_goal:
         # Strip trailing sentence punctuation off the task goal so the join reads
@@ -214,15 +216,13 @@ def build_prompt(
     else:
         line1 = subgoal
 
-    if metadata:
+    if conditioning:
         tags = []
-        for key, label in METADATA_FIELDS:
-            val = metadata.get(key)
+        for key, label in CONDITIONING_FIELDS:
+            val = conditioning.get(key)
             if val is not None and str(val) != "":
-                tags.append(f"{label}: {_as_str(val).strip().lower()}")
+                tags.append(f"{label}: {_as_str(val).strip()}")
         if tags:
-            # Second line (pi0.7 puts metadata tags after the task text); the tokenizer
-            # then appends "\nState: …\nAction: ".
             return line1 + "\n" + "; ".join(tags)
     return line1
 
@@ -260,10 +260,11 @@ class RobocasaInputs(transforms.DataTransformFn):
     # guarding against drift between the producer's lean math and this transform's. The
     # check is skipped when no baked-lean is present (e.g. inference).
     verify_lean_atol: float = 1e-4
-    # Emit the metadata line (e.g. "Scope: milestone|step") in the prompt. Tells the VLA
-    # the subgoal level so it executes a long (milestone) vs short (step) action span —
-    # the conditioning hook that later carries offline-RL tags (Quality/Mistake/...).
-    include_metadata: bool = True
+    # Emit the offline-RL conditioning line ("Quality: …; Estimated Length: …; Executed
+    # Step: …") in the prompt. At inference set these to the DESIRED values.
+    include_conditioning: bool = True
+    # Append "Current Gripper: Open|Close;" after the state block.
+    include_gripper_flag: bool = True
 
     def _to_lean_state(self, raw_state: np.ndarray, data: dict, baked_lean: np.ndarray | None = None) -> np.ndarray:
         """Lean state from a stored-lean OR raw-16-dim vector (dim-detected).
@@ -345,20 +346,23 @@ class RobocasaInputs(transforms.DataTransformFn):
             inputs["actions"] = act
         if "prompt" in data:
             # Single prompt-assembly point (train + inference): lowercase + optionally
-            # prepend the whole-task goal + a metadata line. The loader/eval adapter pass
-            # the raw subgoal phrasing in `prompt`, the episode task in `task_goal`, and
-            # conditioning tags (e.g. `scope`) read here into the metadata dict.
-            metadata = None
-            if self.include_metadata:
-                metadata = {key: data[key] for key, _ in METADATA_FIELDS if key in data}
+            # prepend the whole-task goal + an offline-RL conditioning line. The
+            # loader/eval adapter pass the raw subgoal in `prompt`, the episode task in
+            # `task_goal`, and conditioning tags (quality/est_length/executed_step).
+            conditioning = None
+            if self.include_conditioning:
+                conditioning = {key: data[key] for key, _ in CONDITIONING_FIELDS if key in data}
             inputs["prompt"] = build_prompt(
                 data["prompt"],
                 data.get("task_goal"),
                 include_task_goal=self.include_task_goal,
-                metadata=metadata,
+                conditioning=conditioning,
             )
-        # Progress label + span metadata are training-only targets (pass through).
-        for k in ("progress_frac", "subgoal_start", "subgoal_end", "frame_index"):
+            # Pass the gripper flag through for TokenizePrompt (appends "Current Gripper:").
+            if self.include_gripper_flag and data.get("gripper_flag") not in (None, ""):
+                inputs["gripper_flag"] = data["gripper_flag"]
+        # Progress labels + span metadata are training-only targets (pass through).
+        for k in ("progress_frac", "progress_class", "subgoal_start", "subgoal_end", "frame_index"):
             if k in data:
                 inputs[k] = data[k]
 

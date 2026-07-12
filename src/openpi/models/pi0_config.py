@@ -45,8 +45,17 @@ class Pi0Config(_model.BaseModelConfig):
     # Add anchor (before) image groups + a learned anchor/current role embedding.
     use_anchor_images: bool = False
 
-    # Progress head (subgoal-completion state value in [0,1]).
+    # Progress head (subgoal-completion prediction).
     use_progress_head: bool = False
+    # Prediction target/loss:
+    # - "continuous": a scalar state-value in [0,1], Huber-regressed on frac**progress_k
+    #   (reads Observation.progress).
+    # - "classes": a `progress_num_classes`-way classifier, cross-entropy on the discrete
+    #   progress class 0..K-1 (reads Observation.progress_class). System2 reads the
+    #   argmax / softmax bucket.
+    progress_mode: str = "continuous"
+    # Number of buckets when progress_mode == "classes" (system1_full uses 10).
+    progress_num_classes: int = 10
     # Readout over the prefix: "shallow_transformer" | "mean_pool" | "prefix_token".
     progress_readout: str = "shallow_transformer"
     # If True, the head reads stop_grad(prefix) so the progress loss never alters the
@@ -116,13 +125,20 @@ class Pi0Config(_model.BaseModelConfig):
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={k: image_spec for k in keys},
-                image_masks={k: image_mask_spec for k in keys},
+                images=dict.fromkeys(keys, image_spec),
+                image_masks=dict.fromkeys(keys, image_mask_spec),
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
                 progress=(
-                    jax.ShapeDtypeStruct([batch_size], jnp.float32) if self.use_progress_head else None
+                    jax.ShapeDtypeStruct([batch_size], jnp.float32)
+                    if (self.use_progress_head and self.progress_mode == "continuous")
+                    else None
+                ),
+                progress_class=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.int32)
+                    if (self.use_progress_head and self.progress_mode == "classes")
+                    else None
                 ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)

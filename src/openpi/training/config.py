@@ -38,11 +38,17 @@ Filter: TypeAlias = nnx.filterlib.Filter
 # RoboCasa System1 shards location. Overridable via env so the SAME config works
 # bare-metal (host path), in Docker (bind-mount), and on SageMaker (channel mount
 # or s3://). Set ROBOCASA_SHARDS_DIR to a local dir or an s3://bucket/prefix.
-ROBOCASA_SHARDS_DEFAULT = "/home/yinpeidai/RoboAnnotator/data/robocasa_system1/shards"
+ROBOCASA_SHARDS_DEFAULT = tyro.MISSING
 
 
 def _robocasa_shards() -> str:
     return os.environ.get("ROBOCASA_SHARDS_DIR", ROBOCASA_SHARDS_DEFAULT)
+
+
+def _robocasa_shuffle_buffer(default: int = 16000) -> int:
+    """Reservoir-shuffle buffer size; override via env for quick smoke tests (a smaller
+    buffer fills faster so step 0 starts sooner, at the cost of weaker decorrelation)."""
+    return int(os.environ.get("ROBOCASA_SHUFFLE_BUFFER", default))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -136,8 +142,10 @@ class ModelTransformFactory(GroupFactory):
     state_split_label: str = "Initial State"
     # Separator before ``State:`` (stock pi05 ", "; RoboCasa System1 uses "\n").
     task_state_sep: str = ", "
-    # Keep intentional structural newlines in the prompt (RoboCasa's "Scope:" line).
+    # Keep intentional structural newlines in the prompt (RoboCasa's conditioning line).
     preserve_newlines: bool = False
+    # RoboCasa System1: append "Current Gripper: <flag>;" after the state block.
+    use_gripper_flag: bool = False
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -165,6 +173,7 @@ class ModelTransformFactory(GroupFactory):
                             state_split_label=self.state_split_label,
                             task_state_sep=self.task_state_sep,
                             preserve_newlines=self.preserve_newlines,
+                            use_gripper_flag=self.use_gripper_flag,
                         ),
                         # pi0.5 discretizes the state into the prompt text, so it does not
                         # need (and should not get) a zero-padded continuous state vector.
@@ -403,36 +412,37 @@ class RoboCasaDataConfig(DataConfigFactory):
 
     # WebDataset shards spec: local shards/ dir OR s3://bucket/prefix.
     shards: str = tyro.MISSING
-    # Sample-construction knobs (load-time; re-tunable without re-converting).
-    # Default recipe: condition on a MIX of milestone+child subgoals (so System2 can
-    # issue at either granularity) and a mix of short + detailed phrasings, with the
-    # action chunk zero-padded at the chosen subgoal's boundary (System1 learns to
-    # stop/settle so System2 can hand off the next subgoal).
-    subgoal_level: Literal["milestone", "child", "mixed"] = "mixed"
-    p_milestone: float = 0.5  # P(milestone vs child) when subgoal_level == "mixed"
-    p_detail: float = 0.5  # P(prompt = subgoal_detail instead of the terse subgoal)
+    # --- prompt scope (system1_full bakes ONE subgoal per frame) ---
+    # Which text drives "Current Subgoal": "subgoal" (terse) | "subgoal_detail" (verbose)
+    # | "milestone" (the milestone_text). Currently training on the terse subgoal only.
+    prompt_source: Literal["subgoal", "subgoal_detail", "milestone"] = "subgoal"
     include_base_pose: bool = True
     use_anchor_images: bool = True
     # Prepend the whole-task goal to the subgoal prompt for disambiguating context
-    # ("<task>; Current Subgoal: <subgoal>"). ON by default; flip off with
-    # --data.no-include-task-goal for the composable-subgoal-only ablation.
+    # ("<task>; Current Subgoal: <subgoal>"). ON by default.
     include_task_goal: bool = True
     # Append the anchor (subgoal-start) lean state to the current state so pi0.5's
     # discretized prompt ints carry the proprioceptive before/after delta (rendered as
-    # "Initial State: …; Current State: …"). ON by default; flip off with
-    # --data.no-include-anchor-state.
+    # "Initial State: …; Current State: …"). ON by default.
     include_anchor_state: bool = True
-    # Emit the metadata conditioning line ("Scope: milestone|step") so the VLA knows to
-    # execute a long vs short action span. ON by default; flip off with
-    # --data.no-include-metadata. (Future offline-RL tags Quality/Mistake join this line.)
-    include_metadata: bool = True
+    # Emit the offline-RL conditioning line ("Quality: …; Estimated Length: …; Executed
+    # Step: …") in the prompt. ON by default.
+    include_conditioning: bool = True
+    # Append "Current Gripper: Open|Close;" after the state block. ON by default.
+    include_gripper_flag: bool = True
     # Recompute lean state from the shard's RAW state via robocasa_policy (the same path
     # as inference) and assert it matches the producer's baked lean — a drift guard. ON
-    # by default; flip off with --data.no-recompute-lean-from-raw to pass baked lean
-    # through (marginally cheaper, no verification).
+    # by default; flip off with --data.no-recompute-lean-from-raw to pass baked lean through.
     recompute_lean_from_raw: bool = True
-    subgoal_action_pad: Literal["subtask", "episode"] = "subtask"
-    shuffle_buffer: int = 16000
+    # Action label: "subgoal" (subgoal settle-padded chunk) | "episode" (episode-padded).
+    subgoal_action_pad: Literal["subgoal", "episode"] = "subgoal"
+    # Re-derive the settle-pad in the loader from the real chunk + subgoal mask instead of
+    # using the baked padded chunk (padding applied to UNNORMALIZED lean actions, before
+    # Normalize). OFF by default (use the baked chunk).
+    repad_actions: bool = False
+    # Reservoir-shuffle buffer size. Defaults from the env helper so a smoke test can
+    # shrink it (ROBOCASA_SHUFFLE_BUFFER=4000) for a fast first batch without editing code.
+    shuffle_buffer: int = dataclasses.field(default_factory=_robocasa_shuffle_buffer)
     shuffle_initial: int = 1000
 
     @override
@@ -446,10 +456,11 @@ class RoboCasaDataConfig(DataConfigFactory):
             use_anchor_images=self.use_anchor_images,
             include_anchor_state=self.include_anchor_state,
             recompute_lean_from_raw=self.recompute_lean_from_raw,
-            subgoal_level=self.subgoal_level,
-            p_milestone=self.p_milestone,
-            p_detail=self.p_detail,
+            prompt_source=self.prompt_source,
+            include_conditioning=self.include_conditioning,
+            include_gripper_flag=self.include_gripper_flag,
             subgoal_action_pad=self.subgoal_action_pad,
+            repad_actions=self.repad_actions,
             shuffle_buffer=self.shuffle_buffer,
             shuffle_initial=self.shuffle_initial,
         )
@@ -466,7 +477,8 @@ class RoboCasaDataConfig(DataConfigFactory):
                     use_anchor_images=self.use_anchor_images,
                     include_task_goal=self.include_task_goal,
                     include_anchor_state=self.include_anchor_state,
-                    include_metadata=self.include_metadata,
+                    include_conditioning=self.include_conditioning,
+                    include_gripper_flag=self.include_gripper_flag,
                 )
             ],
             outputs=[robocasa_policy.RobocasaOutputs()],
@@ -483,8 +495,9 @@ class RoboCasaDataConfig(DataConfigFactory):
             state_split=state_split,
             state_split_label="Initial State",
             task_state_sep="\n",
-            # Keep the "Scope:" metadata line's newline (only matters when include_metadata).
-            preserve_newlines=self.include_metadata,
+            # The conditioning line + gripper add structural newlines to preserve.
+            preserve_newlines=True,
+            use_gripper_flag=self.include_gripper_flag,
         )(model_config)
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -957,13 +970,25 @@ _CONFIGS = [
             geometric_aug_cameras=("scene_left", "scene_right", "anchor_scene_left", "anchor_scene_right"),
             use_anchor_images=True,
             use_progress_head=True,
-            # progress_readout / progress_k / progress_loss_weight (0.5) / stop_gradient
-            # (False) all inherit the Pi0Config defaults; override per-ablation via CLI.
+            # 10-way progress CLASSIFIER (cross-entropy on subgoal_progress_class 0..9),
+            # not the continuous state-value. progress_readout / progress_loss_weight (0.5)
+            # / stop_gradient (False) inherit the Pi0Config defaults; override via CLI.
+            progress_mode="classes",
+            progress_num_classes=10,
+            # Readout head: width 1024 / depth 2 (~25M). Wider than the 512 default for
+            # more decoding capacity, but only 2 layers — depth is what drives head
+            # activation/backprop memory (S^2 attention over the ~850-token prefix x
+            # num_layers), so 4 layers cost too much (dropped max batch 192->128 and
+            # OOM'd at 160). Width is the cheaper capacity lever here. Revisit depth only
+            # if progress_acc / progress_class_mae plateau.
+            progress_hidden=1024,
+            progress_num_layers=2,
         ),
         data=RoboCasaDataConfig(
             repo_id="robocasa_system1",
             shards=_robocasa_shards(),
-            # subgoal_level / p_milestone / p_detail inherit the mixed default.
+            # Train on the terse subgoal only (no subgoal_detail / milestone mixing).
+            prompt_source="subgoal",
             use_anchor_images=True,
         ),
         batch_size=64,
@@ -1047,7 +1072,7 @@ _CONFIGS = [
             assets=AssetsConfig(assets_dir="./assets/pi05_robocasa_system1_debug", asset_id="robocasa_system1"),
             repo_id="robocasa_system1",
             shards=_robocasa_shards(),
-            subgoal_level="child",
+            prompt_source="subgoal",
             use_anchor_images=False,
         ),
         batch_size=4,

@@ -123,6 +123,8 @@ class Pi0(_model.BaseModel):
         self._progress_stop_gradient = config.progress_stop_gradient
         self._progress_loss_weight = config.progress_loss_weight
         self._progress_k = config.progress_k
+        self._progress_mode = config.progress_mode
+        self._progress_num_classes = config.progress_num_classes
         if config.use_anchor_images:
             # Learned role embedding {current, anchor} added to each image group's tokens
             # so the model can distinguish before vs now (the prefix is a bidirectional
@@ -139,6 +141,7 @@ class Pi0(_model.BaseModel):
                 num_layers=config.progress_num_layers,
                 num_heads=config.progress_num_heads,
                 hidden=config.progress_hidden,
+                num_outputs=(config.progress_num_classes if config.progress_mode == "classes" else 1),
                 rngs=rngs,
             )
 
@@ -249,6 +252,7 @@ class Pi0(_model.BaseModel):
     ) -> at.Float[at.Array, "*b ah"] | tuple[at.Float[at.Array, "*b ah"], dict[str, at.Array]]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         progress_target = observation.progress
+        progress_class_target = observation.progress_class
         observation = _model.preprocess_observation(
             preprocess_rng,
             observation,
@@ -291,37 +295,53 @@ class Pi0(_model.BaseModel):
         # attenuate the weight by 1/ah. Progress is a per-sample VLM readout and has
         # nothing to do with the action horizon.
         total_loss = flow_loss
-        if self._use_progress_head and progress_target is not None:
-            progress_pred = self._predict_progress(prefix_out, prefix_mask)  # [*b], in [0,1]
-            target = jnp.clip(progress_target, 0.0, 1.0) ** self._progress_k
-            progress_loss = _huber(progress_pred - target)  # [*b]
-            total_loss = flow_loss + self._progress_loss_weight * progress_loss[..., None]
-            metrics["progress_loss"] = jnp.mean(progress_loss)
-            metrics["progress_loss_weighted"] = self._progress_loss_weight * jnp.mean(progress_loss)
-            # Diagnostics on the prediction itself (un-shaped fraction error + outputs).
-            metrics["progress_mae"] = jnp.mean(jnp.abs(progress_pred - target))
-            metrics["progress_pred_mean"] = jnp.mean(progress_pred)
-            metrics["progress_target_mean"] = jnp.mean(target)
+        if self._use_progress_head:
+            logits = self._progress_logits(prefix_out, prefix_mask)  # [*b] or [*b, K]
+            if self._progress_mode == "classes" and progress_class_target is not None:
+                # K-way classification: softmax cross-entropy on the discrete bucket.
+                labels = progress_class_target.astype(jnp.int32)
+                logp = jax.nn.log_softmax(logits, axis=-1)
+                onehot = jax.nn.one_hot(labels, self._progress_num_classes, dtype=logp.dtype)
+                progress_loss = -jnp.sum(onehot * logp, axis=-1)  # [*b]
+                total_loss = flow_loss + self._progress_loss_weight * progress_loss[..., None]
+                pred_class = jnp.argmax(logits, axis=-1)
+                metrics["progress_loss"] = jnp.mean(progress_loss)
+                metrics["progress_loss_weighted"] = self._progress_loss_weight * jnp.mean(progress_loss)
+                metrics["progress_acc"] = jnp.mean((pred_class == labels).astype(jnp.float32))
+                # Bucket-distance MAE (how far off the argmax is, in class units).
+                metrics["progress_class_mae"] = jnp.mean(jnp.abs(pred_class - labels).astype(jnp.float32))
+            elif self._progress_mode == "continuous" and progress_target is not None:
+                # Scalar state-value: Huber regression on frac**k.
+                progress_pred = nnx.sigmoid(logits)  # [*b], in [0,1]
+                target = jnp.clip(progress_target, 0.0, 1.0) ** self._progress_k
+                progress_loss = _huber(progress_pred - target)  # [*b]
+                total_loss = flow_loss + self._progress_loss_weight * progress_loss[..., None]
+                metrics["progress_loss"] = jnp.mean(progress_loss)
+                metrics["progress_loss_weighted"] = self._progress_loss_weight * jnp.mean(progress_loss)
+                metrics["progress_mae"] = jnp.mean(jnp.abs(progress_pred - target))
+                metrics["progress_pred_mean"] = jnp.mean(progress_pred)
+                metrics["progress_target_mean"] = jnp.mean(target)
 
         if return_metrics:
             return total_loss, metrics
         return total_loss
 
-    def _predict_progress(
+    def _progress_logits(
         self, prefix_out: at.Float[at.Array, "b s emb"], prefix_mask: at.Bool[at.Array, "b s"]
-    ) -> at.Float[at.Array, " b"]:
-        """Progress scalar in [0,1] from the (optionally detached) prefix features."""
+    ) -> at.Array:
+        """Raw progress-head output from the (optionally detached) prefix features.
+
+        Returns [b] (continuous, pre-sigmoid logit) or [b, K] (classes, class logits).
+        """
         feats = jax.lax.stop_gradient(prefix_out) if self._progress_stop_gradient else prefix_out
         if self._progress_readout == "shallow_transformer":
-            logit = self.progress_head.from_sequence(feats, prefix_mask)
-        elif self._progress_readout in ("mean_pool", "prefix_token"):
+            return self.progress_head.from_sequence(feats, prefix_mask)
+        if self._progress_readout in ("mean_pool", "prefix_token"):
             # Masked mean over valid prefix tokens.
             m = prefix_mask.astype(feats.dtype)[..., None]
             pooled = (feats * m).sum(axis=1) / jnp.clip(m.sum(axis=1), 1e-6, None)
-            logit = self.progress_head.from_pooled(pooled)
-        else:
-            raise ValueError(f"unknown progress_readout: {self._progress_readout}")
-        return nnx.sigmoid(logit)
+            return self.progress_head.from_pooled(pooled)
+        raise ValueError(f"unknown progress_readout: {self._progress_readout}")
 
     @override
     def sample_actions(
@@ -390,11 +410,12 @@ class Pi0(_model.BaseModel):
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
 
-    def predict_progress(self, observation: _model.Observation) -> at.Float[at.Array, " b"]:
-        """Inference-time subgoal-completion progress in [0,1] (state value).
+    def predict_progress(self, observation: _model.Observation) -> at.Array:
+        """Inference-time subgoal-completion progress. Used by the eval server / System2.
 
-        Runs a single prefix forward pass (noise-independent) and reads the progress
-        head. Used by the eval server / System2 hand-off. Requires use_progress_head.
+        Runs a single prefix forward pass (noise-independent) and reads the progress head.
+        Returns a scalar in [0,1] per sample (continuous mode) OR class probabilities
+        [b, K] (classes mode; take argmax for the bucket). Requires use_progress_head.
         """
         if not self._use_progress_head:
             raise ValueError("predict_progress called but use_progress_head is False")
@@ -405,4 +426,7 @@ class Pi0(_model.BaseModel):
         (prefix_out, _), _ = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
-        return self._predict_progress(prefix_out, prefix_mask)
+        logits = self._progress_logits(prefix_out, prefix_mask)
+        if self._progress_mode == "classes":
+            return jax.nn.softmax(logits, axis=-1)  # [b, K]
+        return nnx.sigmoid(logits)  # [b]

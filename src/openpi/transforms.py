@@ -256,8 +256,11 @@ class TokenizePrompt(DataTransformFn):
     state_split_label: str = "Initial State"
     # Separator before ``State:`` (stock pi05 ", "; RoboCasa System1 uses "\n").
     task_state_sep: str = ", "
-    # Keep intentional structural newlines in the prompt (RoboCasa's "Scope:" line).
+    # Keep intentional structural newlines in the prompt (RoboCasa's conditioning line).
     preserve_newlines: bool = False
+    # If True, append "Current Gripper: <flag>;" after the state block, reading the flag
+    # from data["gripper_flag"] (RoboCasa System1). No-op if the field is absent/empty.
+    use_gripper_flag: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -272,6 +275,13 @@ class TokenizePrompt(DataTransformFn):
         if not isinstance(prompt, str):
             prompt = prompt.item()
 
+        # Pop the gripper flag (a string) so it's consumed here and never reaches the
+        # batch collation — JAX can't make an array from a string dtype.
+        g = data.pop("gripper_flag", None)
+        gripper_flag = None
+        if self.use_gripper_flag and g not in (None, ""):
+            gripper_flag = g.item() if (hasattr(g, "item") and not isinstance(g, str)) else str(g)
+
         tokens, token_masks = self.tokenizer.tokenize(
             prompt,
             state,
@@ -279,6 +289,7 @@ class TokenizePrompt(DataTransformFn):
             state_split_label=self.state_split_label,
             preserve_newlines=self.preserve_newlines,
             task_state_sep=self.task_state_sep,
+            gripper_flag=gripper_flag,
         )
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 

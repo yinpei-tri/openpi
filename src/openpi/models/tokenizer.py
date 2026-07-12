@@ -28,6 +28,7 @@ class PaligemmaTokenizer:
         state_split_label: str = "Initial State",
         task_state_sep: str = ", ",
         preserve_newlines: bool = False,
+        gripper_flag: str | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         # ``preserve_newlines``: keep intentional structural newlines in the prompt (e.g.
         # RoboCasa System1's "Scope:" metadata line). Default strips them (stock pi05).
@@ -39,6 +40,10 @@ class PaligemmaTokenizer:
             # ``task_state_sep`` is the separator before ``State:`` (stock ", "; RoboCasa
             # System1 uses "\n" so the state block starts on its own line).
             discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            # Optional "Current Gripper: Open|Close;" tag appended after the state block
+            # (RoboCasa System1: the discretized gripper width is coarse, so the explicit
+            # open/close flag is a cleaner conditioning signal).
+            grip_str = f" Current Gripper: {gripper_flag};" if gripper_flag else ""
             if state_split is not None and 0 < state_split < len(discretized_state):
                 # Render the state as TWO labeled segments (e.g. RoboCasa System1's
                 # current state + appended anchor/initial state). The vector is laid out
@@ -50,11 +55,11 @@ class PaligemmaTokenizer:
                 init_str = " ".join(map(str, discretized_state[state_split:]))
                 full_prompt = (
                     f"Task: {cleaned_text}{task_state_sep}"
-                    f"{state_split_label}: {init_str}; Current State: {cur_str};\nAction: "
+                    f"{state_split_label}: {init_str}; Current State: {cur_str};{grip_str}\nAction: "
                 )
             else:
                 state_str = " ".join(map(str, discretized_state))
-                full_prompt = f"Task: {cleaned_text}{task_state_sep}State: {state_str};\nAction: "
+                full_prompt = f"Task: {cleaned_text}{task_state_sep}State: {state_str};{grip_str}\nAction: "
             tokens = self._tokenizer.encode(full_prompt, add_bos=True)
         else:
             # This is the Pi0 format, where the state is part of the continuous action expert input.

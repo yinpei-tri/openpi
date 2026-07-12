@@ -108,8 +108,12 @@ class Observation(Generic[ArrayT]):
 
     # System1 progress head target: subgoal-completion fraction in [0,1] for the
     # current frame within its subgoal span (raw fraction; x**k shaping applied in
-    # the loss). None for datasets without subgoal annotations.
+    # the loss). None for datasets without subgoal annotations. Used by the CONTINUOUS
+    # progress head.
     progress: at.Float[ArrayT, "*b"] | None = None
+    # System1 progress head target (CLASSES mode): the discrete progress bucket
+    # 0..K-1 for the current frame. None for datasets without subgoal annotations.
+    progress_class: at.Int[ArrayT, "*b"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -132,6 +136,7 @@ class Observation(Generic[ArrayT]):
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
             progress=data.get("progress_frac"),
+            progress_class=data.get("progress_class"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -225,6 +230,7 @@ def preprocess_observation(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         progress=observation.progress,
+        progress_class=observation.progress_class,
     )
 
 
