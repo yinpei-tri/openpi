@@ -66,6 +66,22 @@ fi
 CKPT_DIR="/opt/ml/local_checkpoints"
 mkdir -p "$CKPT_DIR" /opt/ml/output/wandb
 
+# Rank guard for multi-node: only the FIRST host (rank 0) uploads checkpoints, else the
+# N nodes race the same S3 sync. SageMaker exposes hosts + current_host in
+# resourceconfig.json; the sorted-first host is rank 0. Single-node -> always rank 0.
+# (Only rank 0's orbax process writes the full checkpoint anyway — other ranks
+# contribute shards via the collective but process_index 0 owns the save.)
+IS_RANK0=1
+RC="/opt/ml/input/config/resourceconfig.json"
+if [[ -f "$RC" ]]; then
+    FIRST_HOST=$(python3 -c "import json;print(sorted(json.load(open('$RC'))['hosts'])[0])" 2>/dev/null || echo "")
+    CUR_HOST=$(python3 -c "import json;print(json.load(open('$RC'))['current_host'])" 2>/dev/null || echo "")
+    if [[ -n "$FIRST_HOST" && "$CUR_HOST" != "$FIRST_HOST" ]]; then
+        IS_RANK0=0
+        echo "This host ($CUR_HOST) is NOT rank 0 ($FIRST_HOST): skipping S3 checkpoint sync."
+    fi
+fi
+
 # Periodic background upload (default every 30 min; override via CKPT_SYNC_INTERVAL).
 # Crash insurance: if the instance dies mid-run, S3 still has checkpoints up to the
 # last tick (local EBS dies with the instance). We EXCLUDE orbax's in-progress
@@ -74,7 +90,7 @@ mkdir -p "$CKPT_DIR" /opt/ml/output/wandb
 # `--delete` here (a periodic delete could race orbax's pruning) — the final sync
 # reconciles. Long interval keeps S3 traffic/overhead low.
 SYNC_PID=""
-if [[ -n "${CHECKPOINT_S3_URI:-}" ]]; then
+if [[ "$IS_RANK0" == "1" && -n "${CHECKPOINT_S3_URI:-}" ]]; then
     echo "Periodic checkpoint upload: $CKPT_DIR -> ${CHECKPOINT_S3_URI} (every ${CKPT_SYNC_INTERVAL:-1800}s)"
     (
         while true; do
@@ -91,7 +107,7 @@ fi
 # (drops any tmp dirs / pruned steps the periodic uploads may have left behind).
 final_sync() {
     [[ -n "$SYNC_PID" ]] && kill "$SYNC_PID" 2>/dev/null || true
-    if [[ -n "${CHECKPOINT_S3_URI:-}" ]]; then
+    if [[ "$IS_RANK0" == "1" && -n "${CHECKPOINT_S3_URI:-}" ]]; then
         echo "Final checkpoint upload: $CKPT_DIR -> ${CHECKPOINT_S3_URI}"
         aws s3 sync "$CKPT_DIR" "${CHECKPOINT_S3_URI}" --delete --only-show-errors || true
     fi

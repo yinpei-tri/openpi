@@ -27,6 +27,7 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+import openpi.training.distributed as _distributed
 
 
 def robocasa_exp_tag(config: _config.TrainConfig) -> str:
@@ -242,7 +243,14 @@ def train_step(
 
 def main(config: _config.TrainConfig, tentative_run: bool = False):
     init_logging()
-    logging.info(f"Running on: {platform.node()}")
+    # Multi-node: initialize the JAX distributed runtime BEFORE any JAX device op, so the
+    # N processes form one global device mesh (16 devices for 2x8). No-op single-node.
+    # Must run in both the tentative and real invocations (each is a fresh process call).
+    _distributed.maybe_init_distributed()
+    logging.info(
+        f"Running on: {platform.node()} | jax process {jax.process_index()}/{jax.process_count()} "
+        f"| local devices {jax.local_device_count()} | global devices {jax.device_count()}"
+    )
 
     # For RoboCasa System1, ablations are CLI overrides on one config, so append a
     # deterministic settings tag to exp_name -> distinct, self-describing checkpoint
@@ -285,6 +293,24 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+
+    # Multi-node sanity: prove the global batch is sharded across ALL devices (16 for
+    # 2x8) and that THIS process only holds its local slice. Printed once, on every
+    # process, so the SageMaker logs from both nodes show the split.
+    _obs_actions = batch
+    _first = next(iter(_obs_actions[0].images.values()))
+    try:
+        _shards = _first.sharding
+        _n_global_shards = len(_first.addressable_shards) if hasattr(_first, "addressable_shards") else -1
+        logging.info(
+            f"[data-dist] proc={jax.process_index()}/{jax.process_count()} "
+            f"global_batch_shape={_first.shape} "
+            f"local_shard_shape={_first.addressable_data(0).shape if hasattr(_first, 'addressable_data') else 'n/a'} "
+            f"n_addressable_shards={_n_global_shards} devices={jax.device_count()} "
+            f"mesh={mesh.shape}"
+        )
+    except Exception as _e:  # noqa: BLE001 - debug only
+        logging.info(f"[data-dist] shard introspection skipped: {_e}")
 
     # Log images from first batch to sanity check.
     images_to_log = [

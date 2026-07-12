@@ -255,6 +255,18 @@ def create_data_loader(
             framework=framework,
         )
 
+    if data_config.libero_webdataset_shards is not None:
+        return create_libero_webdataset_data_loader(
+            data_config,
+            sharding=sharding,
+            shuffle=shuffle,
+            num_batches=num_batches,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            skip_norm_stats=skip_norm_stats,
+            framework=framework,
+        )
+
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
@@ -425,6 +437,62 @@ def create_robocasa_webdataset_data_loader(
     return DataLoaderImpl(data_config, data_loader)
 
 
+def create_libero_webdataset_data_loader(
+    data_config: _config.DataConfig,
+    *,
+    batch_size: int,
+    sharding: jax.sharding.Sharding | None = None,
+    shuffle: bool = False,
+    num_batches: int | None = None,
+    num_workers: int = 0,
+    seed: int = 0,
+    skip_norm_stats: bool = False,
+    framework: str = "jax",
+) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
+    """Create the streaming LIBERO WebDataset loader (local shards or s3://).
+
+    Multi-node ready: the inner LiberoWebDataset splits shards by jax.process_index(),
+    each process feeds its LOCAL batch shard, and TorchDataLoader.__iter__ assembles the
+    global sharded array via make_array_from_process_local_data.
+    """
+    from openpi.training import libero_webdataset as _lwds
+
+    settings = data_config.libero_webdataset_settings or _lwds.LiberoWebDatasetConfig(
+        shards=data_config.libero_webdataset_shards
+    )
+    settings = dataclasses.replace(settings, shards=data_config.libero_webdataset_shards, seed=seed)
+    inner = _lwds.LiberoWebDataset(settings)
+
+    norm_stats = {}
+    if not skip_norm_stats:
+        if data_config.norm_stats is None:
+            raise ValueError(
+                "Normalization stats not found. Run scripts/compute_norm_stats.py --config-name=<your-config>."
+            )
+        norm_stats = data_config.norm_stats
+
+    transforms = [
+        *data_config.repack_transforms.inputs,
+        *data_config.data_transforms.inputs,
+        _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
+        *data_config.model_transforms.inputs,
+    ]
+    dataset = _TorchIterableTransformed(inner, transforms)
+
+    local_batch_size = batch_size // (jax.process_count() if framework == "jax" else 1)
+    data_loader = TorchDataLoader(
+        dataset,
+        local_batch_size=local_batch_size,
+        sharding=None if framework == "pytorch" else sharding,
+        shuffle=False,  # streaming shuffle happens inside the iterable
+        num_batches=num_batches,
+        num_workers=num_workers,
+        seed=seed,
+        framework=framework,
+    )
+    return DataLoaderImpl(data_config, data_loader)
+
+
 def create_rlds_data_loader(
     data_config: _config.DataConfig,
     action_horizon: int,
@@ -497,12 +565,21 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
+        # Multi-node: each JAX process feeds its LOCAL batch shard; make_array_from_
+        # process_local_data (in __iter__) assembles the global sharded array. This is
+        # only sound when each process reads a DISJOINT data shard — iterable WebDataset
+        # loaders split shards by jax.process_index() (see robocasa/libero webdataset
+        # `_worker_shards`). Map-style datasets do NOT split by process, so reject them.
+        is_iterable = isinstance(dataset, torch.utils.data.IterableDataset)
+        if jax.process_count() > 1 and not is_iterable:
+            raise NotImplementedError(
+                "Multi-process (multi-node) data loading is only supported for iterable "
+                "WebDataset loaders that split shards by jax.process_index(); map-style "
+                "datasets would replicate data across processes."
+            )
 
         # Iterable (streaming) datasets have no meaningful/known length; skip the
         # size guard for them. Map-style datasets keep the check.
-        is_iterable = isinstance(dataset, torch.utils.data.IterableDataset)
         if not is_iterable and len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 

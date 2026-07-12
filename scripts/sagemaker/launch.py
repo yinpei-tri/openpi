@@ -292,7 +292,10 @@ def main() -> None:
     # Instead the JAX entrypoint checkpoints to a consistent instance-EBS dir and runs
     # its own `aws s3 sync` to this URI (passed via CHECKPOINT_S3_URI). The PyTorch
     # path keeps SageMaker-managed checkpointing.
-    is_jax = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh") == "sm_entrypoint_jax.sh"
+    # Any JAX entrypoint (robocasa or libero-multinode) self-manages S3 sync and must NOT
+    # use torch_distributed. Match by the "_jax" suffix so new JAX entrypoints are covered.
+    _entrypoint = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh")
+    is_jax = _entrypoint.endswith("_jax.sh")
     env["CHECKPOINT_S3_URI"] = checkpoint_s3_uri
     # Periodic background-sync interval for the JAX entrypoint (seconds). Optional in
     # the config; the entrypoint defaults to 1800 if unset.
@@ -332,11 +335,12 @@ def main() -> None:
         checkpoint_s3_uri=None if (local or is_jax) else checkpoint_s3_uri,
         output_path=cfg["output"]["s3_prefix"],
         # torch_distributed launches one process per GPU (PyTorch entrypoint runs
-        # torchrun). The JAX trainer is a SINGLE process that shards over all GPUs
-        # itself, so it must NOT use torch_distributed. Gate on image.sm_entrypoint.
+        # torchrun). JAX trainers run ONE process per NODE (each owns all local GPUs) and
+        # form the mesh via jax.distributed.initialize, so they must NOT use
+        # torch_distributed — even multi-node. Gate on the "_jax" entrypoint suffix.
         distribution=(
             {}
-            if cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh") == "sm_entrypoint_jax.sh"
+            if is_jax
             else {"torch_distributed": {"enabled": True}}
         ),
         max_run=max_run_seconds,

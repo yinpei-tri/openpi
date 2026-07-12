@@ -85,8 +85,8 @@ ARG SM_ENTRYPOINT=sm_entrypoint.sh
 ENV SAGEMAKER_SUBMIT_DIRECTORY=/opt/ml/code
 ENV SAGEMAKER_PROGRAM=${SM_ENTRYPOINT}
 
-COPY scripts/sagemaker/sm_entrypoint.sh scripts/sagemaker/sm_entrypoint_jax.sh /opt/ml/code/
-RUN chmod +x /opt/ml/code/sm_entrypoint.sh /opt/ml/code/sm_entrypoint_jax.sh
+COPY scripts/sagemaker/sm_entrypoint.sh scripts/sagemaker/sm_entrypoint_jax.sh scripts/sagemaker/sm_entrypoint_libero_jax.sh /opt/ml/code/
+RUN chmod +x /opt/ml/code/sm_entrypoint.sh /opt/ml/code/sm_entrypoint_jax.sh /opt/ml/code/sm_entrypoint_libero_jax.sh
 
 # Stash the chosen entrypoint at a fixed path so the ENTRYPOINT exec form (which
 # can't expand a build ARG) can call it.

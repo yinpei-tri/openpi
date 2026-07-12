@@ -122,6 +122,12 @@ class DataConfig:
     robocasa_webdataset_shards: str | None = None
     robocasa_webdataset_settings: Any = None
 
+    # If set, stream the LIBERO WebDataset shards from this spec (local dir or
+    # s3://bucket/prefix). Multi-node ready (shards split by jax.process_index()).
+    # Settings in `libero_webdataset_settings` (a LiberoWebDatasetConfig).
+    libero_webdataset_shards: str | None = None
+    libero_webdataset_settings: Any = None
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -396,6 +402,50 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LiberoWebDataConfig(DataConfigFactory):
+    """LIBERO via the streaming WebDataset shards (multi-node ready), not LeRobot.
+
+    Same LiberoInputs/Outputs + norm stats as LeRobotLiberoDataConfig, but the samples
+    come from the preprocessed tar shards (local dir or s3://), split across JAX
+    processes for multi-node training. ``shards`` may be comma-separated to pool dirs.
+    """
+
+    shards: str = tyro.MISSING
+    extra_delta_transform: bool = False
+    shuffle_buffer: int = 8000
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        from openpi.training import libero_webdataset as _lwds
+
+        settings = _lwds.LiberoWebDatasetConfig(
+            shards=self.shards,
+            action_horizon=model_config.action_horizon,
+            shuffle_buffer=self.shuffle_buffer,
+        )
+        # The WebDataset loader already emits observation/* + actions + prompt keys, so
+        # no repack is needed (unlike the LeRobot path). Same data/model transforms.
+        data_transforms = _transforms.Group(
+            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            outputs=[libero_policy.LiberoOutputs()],
+        )
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        model_transforms = ModelTransformFactory()(model_config)
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            libero_webdataset_shards=self.shards,
+            libero_webdataset_settings=settings,
         )
 
 
@@ -920,6 +970,31 @@ _CONFIGS = [
         save_interval=10_000,
         keep_period=10_000
 
+    ),
+    # LIBERO via streaming WebDataset shards (multi-node ready) — same model/transforms
+    # as pi05_libero, but reads the preprocessed tar shards from S3 and shards them across
+    # JAX processes for multi-node training. Reuses pi05_libero's norm stats. Set the
+    # shards path via --data.shards=s3://... (or the config default below).
+    TrainConfig(
+        name="pi05_libero_wds",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LiberoWebDataConfig(
+            repo_id="physical-intelligence/libero",
+            shards="s3://tri-ml-datasets-uw2/yinpeidai/preprocessed/libero/shards",
+            assets=AssetsConfig(assets_dir="./assets/pi05_libero", asset_id="physical-intelligence/libero"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=256,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        save_interval=10_000,
+        keep_period=10_000,
     ),
     # Debug variant of pi05_libero for a 2x A6000 (or similar small multi-GPU) box. Same data + model
     # as pi05_libero, but tiny batch + few steps so a smoke run finishes quickly. Reuses

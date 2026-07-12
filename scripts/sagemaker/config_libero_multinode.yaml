@@ -1,0 +1,65 @@
+# SageMaker launch config: MULTI-NODE (2x p5) LIBERO JAX training (pi05_libero_wds).
+#   python scripts/sagemaker/launch.py --config scripts/sagemaker/config_libero_multinode.yaml
+#
+# Multi-node JAX: instance.count=2 -> SageMaker runs ONE process per node; the trainer
+# calls jax.distributed.initialize (reads resourceconfig.json) to form a 16-GPU mesh.
+# LIBERO shards stream directly from S3 (path baked into pi05_libero_wds --data.shards),
+# so there is NO dataset data-channel — only base_ckpt is mounted.
+
+aws:
+  region: us-west-2
+  profile: sagemaker
+  role_arn: arn:aws:iam::124224456861:role/service-role/SageMaker-SageMakerAllAccess
+
+job:
+  user: yinpeidai
+  name_prefix: pi05-libero-wds-multinode
+  max_run_days: 2
+  volume_size: 300
+  tags:
+    - key: tri.owner.email
+      value: yinpei.dai@tri.global
+    - key: tri.project
+      value: MM:PJ-0077
+
+queue:
+  name: vla
+  priority: 10
+  share_identifier: default
+
+instance:
+  type: p5          # 8x H100 per node
+  count: 2          # <-- 2 nodes = 16 GPUs total; batch 256 = 128/node
+
+image:
+  base: 763104351884.dkr.ecr.{region}.amazonaws.com/pytorch-training:2.8.0-gpu-py312-cu129-ubuntu22.04-sagemaker
+  repo_name: yinpeidai-openpi-train-jax
+  # Multi-node LIBERO entrypoint (streams shards from S3, rank-0 checkpoint sync).
+  sm_entrypoint: sm_entrypoint_libero_jax.sh
+
+# Only the base ckpt is mounted; LIBERO shards stream from S3 via the config's
+# --data.shards (boto3). Norm stats are baked into the image at
+# /opt/ml/code/assets/pi05_libero/.
+data:
+  channels:
+    base_ckpt:
+      s3_uri: s3://tri-ml-datasets-uw2/yinpeidai/openpi/released_ckpt/openpi-assets/checkpoints/pi05_base/
+      input_mode: FastFile
+
+training:
+  config: pi05_libero_wds
+  exp_name: multinode_smoke
+  resume: false
+  overwrite: false
+  # 2 nodes, fsdp over all 16 GPUs, global batch 256 (128/node). SMOKE: 3k steps.
+  # batch must be divisible by the GLOBAL device count (16).
+  extra_args: "--fsdp-devices=16 --batch-size=256 --ema-decay=0.999 --num-train-steps=3000 --save-interval=1000 --keep-period=1000 --project-name=openpi-libero-multinode"
+
+output:
+  s3_prefix: s3://tri-ml-datasets-uw2/yinpeidai/openpi/checkpoints/
+  checkpoint_local_path: /opt/ml/checkpoints
+  ckpt_sync_interval: 1800   # 30 min so the periodic sync fires during the smoke
+
+wandb:
+  enabled: true
+  project: openpi-libero-multinode
