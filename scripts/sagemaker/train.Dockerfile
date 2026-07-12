@@ -22,7 +22,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
 WORKDIR /opt/ml/code
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git git-lfs build-essential libgl1 libglib2.0-0 awscli \
+    git git-lfs build-essential clang libgl1 libglib2.0-0 awscli \
  && rm -rf /var/lib/apt/lists/*
 
 ENV UV_LINK_MODE=copy

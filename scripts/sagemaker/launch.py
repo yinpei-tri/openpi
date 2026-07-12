@@ -98,6 +98,11 @@ def run(cmd: str) -> None:
     subprocess.run(cmd, shell=True, check=True, cwd=REPO_ROOT)
 
 
+def _has_buildx() -> bool:
+    """True if `docker buildx` is available (needed for the Dockerfile's BuildKit syntax)."""
+    return subprocess.run("docker buildx version", shell=True, capture_output=True).returncode == 0
+
+
 def ecr_account(region: str, profile: str) -> str:
     out = subprocess.check_output(
         ["aws", "--region", region, "--profile", profile,
@@ -134,8 +139,14 @@ def build_and_push_image(cfg: dict) -> str:
     sm_entrypoint = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh")
 
     run(login_dlc)
+    # Use buildx (BuildKit) — the Dockerfile needs it for `COPY --from` + `RUN --mount`.
+    # `--load` imports the result into the local daemon so the subsequent tag/push works
+    # (the docker-container builder doesn't auto-load). Falls back gracefully if buildx
+    # isn't present: `docker build` on daemons with integrated BuildKit also works.
+    build_cmd = "docker buildx build" if _has_buildx() else "docker build"
+    load_flag = " --load" if _has_buildx() else ""
     run(
-        f"docker build --progress=plain -f {dockerfile} "
+        f"{build_cmd} --progress=plain{load_flag} -f {dockerfile} "
         f"--build-arg AWS_REGION={region} --build-arg SM_ENTRYPOINT={sm_entrypoint} -t {repo} ."
     )
     run(f"docker tag {repo} {fullname}")
