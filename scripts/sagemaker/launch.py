@@ -297,16 +297,16 @@ def main() -> None:
     checkpoint_s3_uri = f"{s3_prefix}/{job_name}/"
     output_s3_uri = s3_prefix
 
-    # The JAX trainer (orbax) does NOT use SageMaker's managed /opt/ml/checkpoints
-    # bidirectional sync: that sync sidecar races orbax's write-then-read-back of its
-    # array-metadata file on an eventually-consistent mount and crashes `finalize`.
-    # Instead the JAX entrypoint checkpoints to a consistent instance-EBS dir and runs
-    # its own `aws s3 sync` to this URI (passed via CHECKPOINT_S3_URI). The PyTorch
-    # path keeps SageMaker-managed checkpointing.
-    # Any JAX entrypoint (robocasa or libero-multinode) self-manages S3 sync and must NOT
-    # use torch_distributed. Match by the "_jax" suffix so new JAX entrypoints are covered.
+    # Two independent properties of the entrypoint:
+    #   is_jax            -> JAX trainer: one process/node, NO torch_distributed.
+    #   self_manages_ckpt -> the entrypoint runs its OWN `aws s3 sync` (single-node
+    #                        robocasa) so SageMaker-managed checkpoint sync must be OFF.
+    # The multi-node libero entrypoint does NOT self-manage: orbax multi-host needs a
+    # filesystem visible to all nodes, so it writes to the MANAGED /opt/ml/checkpoints
+    # (both nodes' copies sync to the same S3), and managed sync must stay ON.
     _entrypoint = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh")
     is_jax = _entrypoint.endswith("_jax.sh")
+    self_manages_ckpt = _entrypoint == "sm_entrypoint_jax.sh"  # robocasa single-node only
     env["CHECKPOINT_S3_URI"] = checkpoint_s3_uri
     # Periodic background-sync interval for the JAX entrypoint (seconds). Optional in
     # the config; the entrypoint defaults to 1800 if unset.
@@ -340,10 +340,11 @@ def main() -> None:
         instance_count=cfg["instance"]["count"],
         instance_type="local_gpu" if local else instance_type,
         job_name=job_name,
-        # JAX path self-manages S3 sync (see CHECKPOINT_S3_URI above), so leave
-        # SageMaker's managed checkpoint sync OFF for it. PyTorch path keeps it on.
-        checkpoint_local_path=None if (local or is_jax) else cfg["output"]["checkpoint_local_path"],
-        checkpoint_s3_uri=None if (local or is_jax) else checkpoint_s3_uri,
+        # Managed checkpoint sync OFF only for entrypoints that self-manage it (robocasa
+        # single-node). The multi-node libero path uses managed /opt/ml/checkpoints, so
+        # it stays ON. PyTorch path also keeps it on.
+        checkpoint_local_path=None if (local or self_manages_ckpt) else cfg["output"]["checkpoint_local_path"],
+        checkpoint_s3_uri=None if (local or self_manages_ckpt) else checkpoint_s3_uri,
         output_path=cfg["output"]["s3_prefix"],
         # torch_distributed launches one process per GPU (PyTorch entrypoint runs
         # torchrun). JAX trainers run ONE process per NODE (each owns all local GPUs) and

@@ -17,9 +17,33 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
 
+def _disable_array_metadata_store() -> None:
+    """Disable orbax's per-process ArrayMetadata store (orbax >=0.11).
+
+    That store makes the primary host create an ``array_metadatas/`` base dir and
+    non-primary hosts WAIT for it to appear on the same path. On SageMaker there is no
+    shared POSIX FS across nodes, so process 1 waits 600s for a dir process 0 created on
+    a different node's disk, times out, and aborts the save (also causes the
+    finalize JSONDecodeError on the eventually-consistent /opt/ml/checkpoints mount).
+    The store only carries optional subchunk metadata (older orbax had none), so
+    disabling it is safe and removes the cross-host base-dir coordination. Each host
+    still writes its own param shards; the shared /opt/ml/checkpoints (S3-synced) is the
+    common store. Must be called before the CheckpointManager is built.
+    """
+    try:
+        ocp.type_handlers.register_type_handler(
+            jax.Array,
+            ocp.type_handlers.ArrayHandler(array_metadata_store=None),
+            override=True,
+        )
+    except Exception:  # noqa: BLE001 - best-effort; never block training on this
+        logging.warning("Could not disable orbax ArrayMetadata store; continuing with defaults.")
+
+
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
 ) -> tuple[ocp.CheckpointManager, bool]:
+    _disable_array_metadata_store()
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
     if checkpoint_dir.exists():
