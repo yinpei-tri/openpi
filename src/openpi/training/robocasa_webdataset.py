@@ -354,9 +354,15 @@ class RoboCasaWebDataset:
         sample["est_length"] = np.int32(meta.get("est_length", 0))
         sample["executed_step"] = np.int32(meta.get("executed_step", 0))
         sample["gripper_flag"] = meta.get("gripper_flag", "")
-        # Progress targets: continuous frac + 10-way class (subgoal level).
+        # Progress targets: continuous frac + K-way class (subgoal level). The producer
+        # emits subgoal_progress_class 1-INDEXED (1..progress_classes, e.g. 1..10); the
+        # classifier head wants 0-indexed labels 0..K-1, so shift by -1 and clip into
+        # range (defends against an out-of-range label silently becoming an all-zeros
+        # one-hot row = dead gradient). progress_frac stays the raw [0,1] fraction.
         sample["progress_frac"] = np.float32(meta.get("subgoal_progress_frac", meta.get("progress_frac", 0.0)))
-        sample["progress_class"] = np.int32(meta.get("subgoal_progress_class", 0))
+        k = self.cfg.progress_num_classes
+        raw_cls = int(meta.get("subgoal_progress_class", 1))
+        sample["progress_class"] = np.int32(np.clip(raw_cls - 1, 0, k - 1))
         sp = meta.get("span", [0, 0])
         sample["subgoal_start"] = np.int32(sp[0])
         sample["subgoal_end"] = np.int32(sp[1])

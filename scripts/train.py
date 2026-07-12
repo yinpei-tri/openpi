@@ -39,27 +39,28 @@ def robocasa_exp_tag(config: _config.TrainConfig) -> str:
     so --resume still works. Returns "" for non-RoboCasa configs.
     """
     data = config.data  # the RoboCasaDataConfig factory (has the knobs directly)
-    if not hasattr(data, "subgoal_level") or not hasattr(data, "shards"):
+    # RoboCasa runs are identified by the system1_full knob `prompt_source`.
+    if not hasattr(data, "prompt_source") or not hasattr(data, "shards"):
         return ""  # not a RoboCasa run
     m = config.model
     parts = [
-        f"lvl-{data.subgoal_level}",
-        f"pm{data.p_milestone:g}",
-        f"pd{data.p_detail:g}",
-        f"pad-{data.subgoal_action_pad}",
+        f"src-{data.prompt_source}",
+        f"pad-{getattr(data, 'subgoal_action_pad', 'subgoal')}",
+        ("repad" if getattr(data, "repad_actions", False) else "bakedpad"),
         ("anchor" if getattr(m, "use_anchor_images", False) else "noanchor"),
-        # Both prompt-content flags default ON, so render BOTH states explicitly
-        # (taskgoal/notaskgoal, anchorstate/noanchorstate) — an absent tag would be
-        # ambiguous once the default is on.
+        # Prompt-content flags default ON, so render BOTH states explicitly — an absent
+        # tag would be ambiguous once the default is on.
         ("taskgoal" if getattr(data, "include_task_goal", False) else "notaskgoal"),
         ("anchorstate" if getattr(data, "include_anchor_state", False) else "noanchorstate"),
-        ("scope" if getattr(data, "include_metadata", False) else "noscope"),
+        ("cond" if getattr(data, "include_conditioning", False) else "nocond"),
+        ("grip" if getattr(data, "include_gripper_flag", False) else "nogrip"),
     ]
     if getattr(m, "use_progress_head", False):
-        # progress readout + whether the head is insulated from the VLM (stop-grad)
-        # + its loss weight — so insulated/non-insulated (and reweighted) runs differ.
+        # mode (classes/continuous) + readout + insulation (stop-grad) + loss weight,
+        # so ablations over any of these get distinct checkpoint/wandb names.
         sg = "sg" if getattr(m, "progress_stop_gradient", True) else "nosg"
-        parts.append(f"prog-{m.progress_readout}-{sg}-w{getattr(m, 'progress_loss_weight', 1.0):g}")
+        mode = getattr(m, "progress_mode", "continuous")
+        parts.append(f"prog-{mode}-{m.progress_readout}-{sg}-w{getattr(m, 'progress_loss_weight', 1.0):g}")
     else:
         parts.append("noprog")
     return "_".join(parts)

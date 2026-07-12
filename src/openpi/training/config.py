@@ -1025,8 +1025,12 @@ _CONFIGS = [
             geometric_aug_cameras=("scene_left", "scene_right"),
             use_anchor_images=False,
             use_progress_head=True,
-            # progress_readout / progress_k / progress_loss_weight (0.5) / stop_gradient
-            # (False) all inherit the Pi0Config defaults; override per-ablation via CLI.
+            # Match the production config's objective (10-way classifier), else this
+            # ablation would train the OLD continuous Huber head and not be comparable.
+            progress_mode="classes",
+            progress_num_classes=10,
+            # progress_readout / progress_loss_weight (0.5) / stop_gradient (False)
+            # inherit the Pi0Config defaults; override per-ablation via CLI.
         ),
         data=RoboCasaDataConfig(
             # Norm stats resolve via assets_base_dir/<config>/robocasa_system1 (baked
@@ -1035,7 +1039,8 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="robocasa_system1"),
             repo_id="robocasa_system1",
             shards=_robocasa_shards(),
-            # subgoal_level / p_milestone / p_detail inherit the mixed default.
+            # Terse subgoal only (prompt_source default); no anchor images/state.
+            prompt_source="subgoal",
             use_anchor_images=False,
         ),
         batch_size=2,
@@ -1067,6 +1072,9 @@ _CONFIGS = [
             use_anchor_images=False,
             use_progress_head=True,
             progress_readout="shallow_transformer",
+            # Faithful smoke of the production path: 10-way classifier, not continuous.
+            progress_mode="classes",
+            progress_num_classes=10,
         ),
         data=RoboCasaDataConfig(
             assets=AssetsConfig(assets_dir="./assets/pi05_robocasa_system1_debug", asset_id="robocasa_system1"),
