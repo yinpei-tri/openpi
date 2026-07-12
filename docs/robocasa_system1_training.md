@@ -266,3 +266,23 @@ anchor == current (delta 0), matching the frame-0 training samples.
 - **`/tmp` is volatile** on the dev box — write logs under the repo (`.local_output/`).
 - S3 first-batch latency: the reservoir buffer (`shuffle_buffer`/`shuffle_initial`)
   fills from S3 before step 0 (~1-2 min). Lower `shuffle_initial` for quick smokes.
+
+## TODO / known limitations
+
+- **Multi-dir shard pooling + anchors (fix BEFORE pooling dirs).** `--data.shards`
+  accepts a comma-separated list of dirs (e.g. `normal` + `failure_augmented`), pooled
+  into one dataset. But `_read_anchor` (`training/robocasa_webdataset.py`) does NOT bind
+  a sample back to its source dir's anchor store — it searches the anchor roots in order
+  and takes the FIRST that has `<flat_id>/f<frame>.jpg`. If two pooled dirs share a
+  `flat_id`, a sample can get the WRONG rollout's "before" frame, silently training the
+  progress head on a mismatched anchor. **Single-dir runs are unaffected.** Fix: carry
+  the source-dir index from `_worker_shards` → sample → `_read_anchor` so each sample
+  resolves its anchor in its own dir's store.
+- **`shuffle_initial` is currently a no-op.** `WebDatasetConfig.shuffle_initial` is
+  plumbed through but the `__iter__` reservoir loop only reads `shuffle_buffer` (emits
+  once the buffer reaches `shuffle_buffer`). To speed up smoke-test startup, lower
+  `shuffle_buffer` (env `ROBOCASA_SHUFFLE_BUFFER`), not `shuffle_initial` — or wire
+  `shuffle_initial` in to emit at a smaller warm-up threshold.
+- **Drift-verify skips on a dim mismatch.** `RobocasaInputs._to_lean_state` only asserts
+  recompute==baked when shapes match; a dim mismatch (the exact drift it guards against)
+  short-circuits instead of raising. Make it raise on a shape mismatch.
