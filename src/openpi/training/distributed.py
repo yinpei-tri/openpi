@@ -26,6 +26,10 @@ logger = logging.getLogger("openpi")
 _SM_RESOURCE_CONFIG = "/opt/ml/input/config/resourceconfig.json"
 _DEFAULT_COORDINATOR_PORT = "12355"
 
+# Guard against a second jax.distributed.initialize() in the same process (train.py
+# calls main() twice — tentative + real — but init must happen exactly once, up front).
+_INITIALIZED = False
+
 
 def _resolve_topology() -> tuple[str, int, int] | None:
     """Return (coordinator_address, num_processes, process_id), or None for single-node."""
@@ -57,9 +61,13 @@ def maybe_init_distributed() -> None:
     Safe to call exactly once at process start (before any JAX device op). Logs the
     resolved topology so the SageMaker logs show each node's rank + device counts.
     """
+    global _INITIALIZED
+    if _INITIALIZED:
+        return
     topo = _resolve_topology()
     if topo is None:
         logger.info("Distributed: single-node (no jax.distributed.initialize).")
+        _INITIALIZED = True
         return
     coordinator, num_processes, process_id = topo
     logger.info(
@@ -73,6 +81,7 @@ def maybe_init_distributed() -> None:
         num_processes=num_processes,
         process_id=process_id,
     )
+    _INITIALIZED = True
     logger.info(
         f"Distributed: initialized. jax.process_index={jax.process_index()} "
         f"jax.process_count={jax.process_count()} global_devices={jax.device_count()}"

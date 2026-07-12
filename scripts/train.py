@@ -243,10 +243,6 @@ def train_step(
 
 def main(config: _config.TrainConfig, tentative_run: bool = False):
     init_logging()
-    # Multi-node: initialize the JAX distributed runtime BEFORE any JAX device op, so the
-    # N processes form one global device mesh (16 devices for 2x8). No-op single-node.
-    # Must run in both the tentative and real invocations (each is a fresh process call).
-    _distributed.maybe_init_distributed()
     logging.info(
         f"Running on: {platform.node()} | jax process {jax.process_index()}/{jax.process_count()} "
         f"| local devices {jax.local_device_count()} | global devices {jax.device_count()}"
@@ -370,6 +366,12 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
 
 
 if __name__ == "__main__":
+    # Multi-node: initialize the JAX distributed runtime ONCE, at process start, BEFORE
+    # any JAX device op (including the tentative run below, which initializes the XLA
+    # backend via jax.device_count / jit). Calling it inside main() was too late — the
+    # tentative run already brought up XLA in this same process, so the real run's
+    # initialize() raised "must be called before any JAX calls". No-op single-node.
+    _distributed.maybe_init_distributed()
     config = _config.cli()
     main(config, tentative_run=True)
     time.sleep(20)
