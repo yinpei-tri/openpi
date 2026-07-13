@@ -134,6 +134,20 @@ class LiberoWebDataset:
             raise ValueError(f"No .tar shards found at {cfg.shards}")
         self._epoch = 0
         self._debug_logged = False
+        # CRITICAL for multi-node: capture (process_index, process_count) HERE, in the
+        # main process, where jax.distributed has already been initialized. torch
+        # DataLoader workers are spawned as FRESH interpreters that never call
+        # jax.distributed.initialize(), so jax.process_index()/process_count() inside a
+        # worker return 0/1 -> every node would read ALL shards in the same order and
+        # feed DUPLICATE data. Freezing the values now and reading them in the worker
+        # (via _process_info) guarantees each node gets its disjoint shard slice.
+        try:
+            import jax
+
+            self._proc_idx = jax.process_index()
+            self._proc_cnt = jax.process_count()
+        except Exception:
+            self._proc_idx, self._proc_cnt = 0, 1
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = epoch
@@ -152,13 +166,13 @@ class LiberoWebDataset:
         return total
 
     def _process_info(self) -> tuple[int, int]:
-        """(process_index, process_count) for multi-node shard splitting."""
-        try:
-            import jax
+        """(process_index, process_count) for multi-node shard splitting.
 
-            return jax.process_index(), jax.process_count()
-        except Exception:
-            return 0, 1
+        Returns the values FROZEN at construction time in the main process. Do NOT call
+        jax.process_index() here: this runs inside a spawned torch worker where JAX is
+        not distributed-initialized and would report 0/1 (see __init__).
+        """
+        return self._proc_idx, self._proc_cnt
 
     def _worker_shards(self) -> list[str]:
         """Shards for THIS (jax-process, torch-worker), shuffled per epoch.
@@ -233,3 +247,10 @@ class LiberoWebDataset:
                     yield buffer.pop()
         rng.shuffle(buffer)
         yield from buffer
+        # Advance the epoch so the NEXT pass reshuffles shards + reservoir. TorchDataLoader
+        # re-invokes __iter__ each time the dataset is exhausted (data_loader.py restarts
+        # the iterator), and set_epoch() is never called + can't reach persistent workers.
+        # All feeders start at epoch 0 and complete each pass in lockstep, so the seed
+        # (seed+epoch) stays aligned across processes -> the shard stride split remains
+        # disjoint while the order changes epoch-to-epoch.
+        self._epoch += 1

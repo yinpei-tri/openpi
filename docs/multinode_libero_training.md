@@ -18,8 +18,8 @@ uv run --group sagemaker scripts/sagemaker/launch.py \
 # --dry-run first to sanity-check; must build the image on a BuildKit-capable machine.
 ```
 
-This queues a 2× p5 (H100) job: `instance.count=2`, `--fsdp-devices=16 --batch-size=256`,
-3k-step smoke. LIBERO shards stream from `s3://.../preprocessed/libero/shards`.
+This queues a 2× p5 (H100) job: `instance.count=2`, `--fsdp-devices=8 --batch-size=256`.
+LIBERO shards stream from `s3://.../preprocessed/libero/shards`.
 
 ## How JAX multi-node differs from PyTorch
 
@@ -41,7 +41,7 @@ multi-node — `launch.py` gates this on the `*_jax.sh` entrypoint suffix.
 | `src/openpi/training/libero_webdataset.py` | Streaming LIBERO loader; **splits shards by `jax.process_index()` then torch worker** (disjoint per node) + reservoir shuffle. `[data-shard-split]` debug print per feeder. |
 | `src/openpi/training/data_loader.py` | Multi-process allowed for iterable WebDataset loaders; each process feeds its LOCAL batch, `make_array_from_process_local_data` assembles the global sharded array. |
 | `scripts/sagemaker/sm_entrypoint_libero_jax.sh` | One process/node; streams shards from S3 (no data channel); **rank-0-only** S3 checkpoint sync; `SM_MASTER_PORT` coordinator port. |
-| `scripts/sagemaker/config_libero_multinode.yaml` | `instance.count=2`, libero entrypoint, `--fsdp-devices=16 --batch-size=256`. |
+| `scripts/sagemaker/config_libero_multinode.yaml` | `instance.count=2`, libero entrypoint, `--fsdp-devices=8 --batch-size=256`. |
 
 ## Why data must be split by process (correctness)
 
@@ -58,8 +58,10 @@ Map-style datasets do NOT split by process, so `data_loader.py` still rejects th
 ## Batch-size / FSDP rules
 
 - `batch_size % jax.device_count() == 0` — device_count is GLOBAL (16 on 2 nodes).
-- `jax.device_count() % fsdp_devices == 0` — `--fsdp-devices=16` → mesh `(1, 16)` = pure
-  16-way FSDP across both nodes.
+- `jax.device_count() % fsdp_devices == 0` — `--fsdp-devices=8` → mesh `(2, 8)`: shard the
+  model 8-way WITHIN each node (all-gather on NVLink) and data-parallel across the 2 nodes
+  (only the gradient all-reduce crosses the inter-node link). This is cheaper than 16-way
+  cross-node FSDP, which would all-gather params over the slow inter-node link every layer.
 - Global batch 256 = 128/node. (256 does not fit on ONE 8×80GB node with EMA — that was
   the whole reason for 2 nodes; see the RoboCasa memory notes.)
 
@@ -67,10 +69,13 @@ Map-style datasets do NOT split by process, so `data_loader.py` still rejects th
 
 - `Distributed: initializing jax.distributed | coordinator=<algo-1>:12355 num_processes=2 process_id=0/1`
   then `initialized ... global_devices=16` — the mesh formed across both hosts.
-- `[data-dist] proc=0/2 ... n_addressable_shards=8 ... mesh={batch:1, fsdp:16}` on each
-  process — the global batch is sharded across all 16 devices.
+- `[data-dist] proc=0/2 ... n_addressable_shards=8 ... mesh={batch:2, fsdp:8}` on each
+  process — the global batch is sharded across all 16 devices (8 addressable per node).
+  The per-shard `image means` fingerprint MUST differ between proc=0 and proc=1; identical
+  values mean both nodes loaded duplicate data (the shard split lost the process identity).
 - `[data-shard-split] jax_proc=0/2 torch_worker=... -> N/1055 shards` — each feeder's
-  disjoint shard slice.
+  disjoint shard slice. `jax_proc=0/1` here (instead of 0/2 and 1/2) is the bug signature:
+  the worker subprocess didn't see the distributed process count.
 - `grad_norm` per step — should be finite and comparable to single-node (~0.4–0.8). NaN
   or wildly different ⇒ the cross-node collective is misconfigured.
 - Checkpoint sync lines appear on **rank 0 only** (`algo-1`); the other host logs

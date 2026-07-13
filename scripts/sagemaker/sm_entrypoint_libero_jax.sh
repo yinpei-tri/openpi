@@ -53,23 +53,71 @@ CKPT_DIR="/opt/ml/local_checkpoints"
 mkdir -p "$CKPT_DIR" /opt/ml/output/wandb
 [[ "$IS_RANK0" == "0" ]] && echo "Not rank 0: skipping S3 checkpoint sync (process 0 owns the full checkpoint)."
 
+# --resume: a NEW SageMaker job gets fresh, EMPTY local volumes, so we must first pull the
+# previous job's checkpoint tree down from S3 or the trainer silently starts from scratch.
+# Restore on EVERY host (each host's orbax reads its own local filesystem on restore).
+if [[ "${RESUME:-0}" == "1" ]]; then
+    : "${RESUME_S3_URI:?RESUME=1 but RESUME_S3_URI unset; set output.resume_s3_uri to the previous job checkpoint root}"
+    echo "Restoring checkpoints on this host: ${RESUME_S3_URI} -> $CKPT_DIR"
+    aws s3 sync "${RESUME_S3_URI}" "$CKPT_DIR" --only-show-errors
+    if [[ ! -d "$CKPT_DIR/$CONFIG/$EXP" ]] || \
+       [[ -z "$(find "$CKPT_DIR/$CONFIG/$EXP" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -print -quit)" ]]; then
+        echo "ERROR: no checkpoint steps found at ${RESUME_S3_URI}${CONFIG}/${EXP}/ — cannot resume." >&2
+        exit 1
+    fi
+fi
+
+SYNC_INTERVAL="${CKPT_SYNC_INTERVAL:-1800}"
+if [[ ! "$SYNC_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: CKPT_SYNC_INTERVAL must be a positive integer, got: $SYNC_INTERVAL" >&2
+    exit 1
+fi
+
+# Periodic + final S3 sync (rank 0 only). A file lock serializes the periodic loop against
+# the final sync so two `aws s3 sync` never race the same prefix. tmp dirs are excluded so
+# an in-progress orbax save never lands in S3. Failures are surfaced (no blanket `|| true`)
+# so SageMaker cannot report success without durable checkpoints.
 SYNC_PID=""
+SYNC_LOCK="/tmp/openpi-checkpoint-s3-sync.lock"
 if [[ "$IS_RANK0" == "1" && -n "${CHECKPOINT_S3_URI:-}" ]]; then
-    echo "Periodic checkpoint upload: $CKPT_DIR -> ${CHECKPOINT_S3_URI} (every ${CKPT_SYNC_INTERVAL:-1800}s)"
+    echo "Periodic checkpoint upload: $CKPT_DIR -> ${CHECKPOINT_S3_URI} (every ${SYNC_INTERVAL}s)"
     (
         while true; do
-            sleep "${CKPT_SYNC_INTERVAL:-1800}"
-            aws s3 sync "$CKPT_DIR" "${CHECKPOINT_S3_URI}" --exclude "*.orbax-checkpoint-tmp-*/*" --only-show-errors || true
+            sleep "$SYNC_INTERVAL"
+            if ! flock "$SYNC_LOCK" aws s3 sync "$CKPT_DIR" "${CHECKPOINT_S3_URI}" \
+                --exclude "*.orbax-checkpoint-tmp-*/*" --only-show-errors; then
+                echo "WARNING: periodic checkpoint upload failed; final upload will retry." >&2
+            fi
         done
     ) &
     SYNC_PID=$!
 fi
 final_sync() {
-    [[ -n "$SYNC_PID" ]] && kill "$SYNC_PID" 2>/dev/null || true
+    local trainer_rc=$?
+    local sync_rc=0
+    trap - EXIT
+    set +e
+    # Stop the periodic loop AND wait for any in-flight sync to release the lock before we
+    # run the authoritative final sync (otherwise the two race the same prefix).
+    [[ -n "$SYNC_PID" ]] && kill "$SYNC_PID" 2>/dev/null
+    [[ -n "$SYNC_PID" ]] && wait "$SYNC_PID" 2>/dev/null
     if [[ "$IS_RANK0" == "1" && -n "${CHECKPOINT_S3_URI:-}" ]]; then
         echo "Final checkpoint upload: $CKPT_DIR -> ${CHECKPOINT_S3_URI}"
-        aws s3 sync "$CKPT_DIR" "${CHECKPOINT_S3_URI}" --delete --only-show-errors || true
+        flock "$SYNC_LOCK" aws s3 sync "$CKPT_DIR" "${CHECKPOINT_S3_URI}" --delete \
+            --exclude "*.orbax-checkpoint-tmp-*/*" --only-show-errors
+        sync_rc=$?
+        if [[ "$sync_rc" == "0" ]]; then
+            # --delete skips excluded keys, so purge any stale tmp objects a prior uploader
+            # may have left once the authoritative sync succeeds.
+            aws s3 rm "${CHECKPOINT_S3_URI}" --recursive --exclude "*" \
+                --include "*.orbax-checkpoint-tmp-*/*" --only-show-errors
+            sync_rc=$?
+        fi
+        [[ "$sync_rc" != "0" ]] && echo "ERROR: final checkpoint upload failed with code $sync_rc" >&2
     fi
+    # If training succeeded but the checkpoint never reached S3, FAIL the job.
+    [[ "$trainer_rc" == "0" && "$sync_rc" != "0" ]] && trainer_rc=$sync_rc
+    exit "$trainer_rc"
 }
 trap final_sync EXIT
 

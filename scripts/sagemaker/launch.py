@@ -264,6 +264,14 @@ def main() -> None:
         "RESUME": "1" if cfg["training"].get("resume") else "0",
         "OVERWRITE": "1" if cfg["training"].get("overwrite") else "0",
     }
+    # Resume: a new SageMaker job gets empty local volumes, so the JAX entrypoint must
+    # download the previous job's checkpoint tree from S3 before starting orbax. Pass the
+    # previous job root (output.resume_s3_uri, ending at .../<job_name>/).
+    if cfg["training"].get("resume"):
+        resume_uri = cfg["output"].get("resume_s3_uri")
+        if not resume_uri:
+            raise SystemExit("training.resume=true requires output.resume_s3_uri (previous job checkpoint root).")
+        env["RESUME_S3_URI"] = resume_uri.rstrip("/") + "/"
     if cfg["wandb"]["enabled"]:
         env["WANDB_PROJECT"] = cfg["wandb"]["project"]
         env["WANDB_MODE"] = "online"
@@ -299,16 +307,16 @@ def main() -> None:
 
     # Two independent properties of the entrypoint:
     #   is_jax            -> JAX trainer: one process/node, NO torch_distributed.
-    #   self_manages_ckpt -> the entrypoint runs its OWN `aws s3 sync` (single-node
-    #                        robocasa) so SageMaker-managed checkpoint sync must be OFF.
-    # The multi-node libero entrypoint does NOT self-manage: orbax multi-host needs a
-    # filesystem visible to all nodes, so it writes to the MANAGED /opt/ml/checkpoints
-    # (both nodes' copies sync to the same S3), and managed sync must stay ON.
+    #   self_manages_ckpt -> the entrypoint runs its OWN `aws s3 sync` so SageMaker-managed
+    #                        checkpoint sync must be OFF.
+    # ALL JAX entrypoints self-manage the S3 checkpoint sync (rank-0 `aws s3 sync` from
+    # local EBS). robocasa: single-node. libero-multinode: the trainer gathers the full
+    # (replicated) model to process 0 which writes it to local EBS, then RANK 0 alone syncs
+    # to S3. We deliberately do NOT use managed /opt/ml/checkpoints for multinode: it is a
+    # per-node dir (not a shared FS), so two nodes syncing it raced and corrupted the
+    # checkpoint. Either way managed sync must be OFF.
     _entrypoint = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh")
     is_jax = _entrypoint.endswith("_jax.sh")
-    # All JAX entrypoints self-manage the S3 checkpoint sync (rank-0 `aws s3 sync` from
-    # local EBS). robocasa: single-node. libero-multinode: process-0 writes the full
-    # (replicated) model + rank-0 sync. Either way managed sync must be OFF.
     self_manages_ckpt = is_jax
     env["CHECKPOINT_S3_URI"] = checkpoint_s3_uri
     # Periodic background-sync interval for the JAX entrypoint (seconds). Optional in
@@ -343,9 +351,8 @@ def main() -> None:
         instance_count=cfg["instance"]["count"],
         instance_type="local_gpu" if local else instance_type,
         job_name=job_name,
-        # Managed checkpoint sync OFF only for entrypoints that self-manage it (robocasa
-        # single-node). The multi-node libero path uses managed /opt/ml/checkpoints, so
-        # it stays ON. PyTorch path also keeps it on.
+        # Managed checkpoint sync OFF for entrypoints that self-manage it (all JAX paths,
+        # single- AND multi-node — see self_manages_ckpt above). PyTorch keeps it ON.
         checkpoint_local_path=None if (local or self_manages_ckpt) else cfg["output"]["checkpoint_local_path"],
         checkpoint_s3_uri=None if (local or self_manages_ckpt) else checkpoint_s3_uri,
         output_path=cfg["output"]["s3_prefix"],
