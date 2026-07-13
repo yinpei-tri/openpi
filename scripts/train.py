@@ -279,7 +279,13 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             overwrite=config.overwrite,
             resume=config.resume,
         )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled and not tentative_run)
+    # Multi-node: only the primary process logs to wandb. Otherwise every process starts
+    # its own run and you get N identical curves (metrics are the same replicated value).
+    init_wandb(
+        config,
+        resuming=resuming,
+        enabled=config.wandb_enabled and not tentative_run and jax.process_index() == 0,
+    )
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -291,20 +297,26 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Multi-node sanity: prove the global batch is sharded across ALL devices (16 for
-    # 2x8) and that THIS process only holds its local slice. Printed once, on every
-    # process, so the SageMaker logs from both nodes show the split.
-    _obs_actions = batch
-    _first = next(iter(_obs_actions[0].images.values()))
+    # 2x8) AND that each process/device holds DIFFERENT data. Printed once on every
+    # process, so the SageMaker logs from both nodes show the split + distinct content.
+    _first = next(iter(batch[0].images.values()))
     try:
-        _shards = _first.sharding
         _n_global_shards = len(_first.addressable_shards) if hasattr(_first, "addressable_shards") else -1
+        # Content fingerprint per LOCAL device shard: mean of each addressable slice.
+        # Different values across shards (and across processes) => genuinely different
+        # data on each of the 16 GPUs, not a replicated/duplicated batch.
+        shard_means = []
+        for sh in getattr(_first, "addressable_shards", []):
+            d = np.asarray(sh.data, dtype=np.float32)
+            shard_means.append(round(float(d.mean()), 4))
         logging.info(
             f"[data-dist] proc={jax.process_index()}/{jax.process_count()} "
             f"global_batch_shape={_first.shape} "
             f"local_shard_shape={_first.addressable_data(0).shape if hasattr(_first, 'addressable_data') else 'n/a'} "
-            f"n_addressable_shards={_n_global_shards} devices={jax.device_count()} "
-            f"mesh={mesh.shape}"
+            f"n_addressable_shards={_n_global_shards} devices={jax.device_count()} mesh={mesh.shape}"
         )
+        # Per-device content fingerprints: distinct values = distinct data per GPU.
+        logging.info(f"[data-dist] proc={jax.process_index()} per-shard image means={shard_means}")
     except Exception as _e:  # noqa: BLE001 - debug only
         logging.info(f"[data-dist] shard introspection skipped: {_e}")
 
