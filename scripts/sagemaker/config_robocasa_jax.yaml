@@ -15,7 +15,7 @@ aws:
 job:
   user: yinpeidai
   name_prefix: pi05-robocasa-s1-jax
-  max_run_days: 4
+  max_run_days: 14
   volume_size: 300            # shards ~16GB + anchors + checkpoints + caches
   tags:
     - key: tri.owner.email
@@ -53,24 +53,30 @@ data:
 
 training:
   config: pi05_robocasa_system1
-  exp_name: smoke3k
+  exp_name: full400k
   resume: false
   overwrite: false
   # JAX trainer args: shard over all GPUs, batch, EMA, step budget.
   # On p5 (8x H100) fsdp can be up to 8; batch must be divisible by device_count.
-  # SMOKE: 3k steps, save every 1k, keep every 1k, batch 128 (verified to fit locally).
+  # FULL RUN: 400k steps (~8 days @ ~1.74s/step), save+keep every 40k => 10 permanent
+  #   ckpts (~120GB, fits volume_size 300). batch 128 (verified to fit locally).
+  # LR/EMA overridden HERE (not in config.py) for the long horizon:
+  #   - cosine decay 5e-5 -> 5e-6 over the full 400k, warmup 2k (was flat 5e-5, since the
+  #     code default has peak==decay so decay never engaged). Cleaner final policy.
+  #   - ema-decay 0.9999 (~10k-step window, 2.5% of run) vs 0.999's ~1k window which
+  #     barely averages at this horizon. EMA weights are what we checkpoint/deploy.
   # --project-name sets the wandb project (the JAX trainer uses config.project_name,
   # NOT the wandb.project below / WANDB_PROJECT env, so it must be passed here).
-  extra_args: "--fsdp-devices=8 --batch-size=128 --ema-decay=0.999 --num-train-steps=3000 --save-interval=1000 --keep-period=1000 --project-name=openpi-robocasa-system1"
+  extra_args: "--fsdp-devices=8 --batch-size=128 --ema-decay=0.9999 --num-train-steps=400000 --save-interval=40000 --keep-period=40000 --lr-schedule.warmup-steps=2000 --lr-schedule.peak-lr=5e-5 --lr-schedule.decay-steps=400000 --lr-schedule.decay-lr=5e-6 --project-name=openpi-robocasa-system1"
 
 output:
   s3_prefix: s3://tri-ml-datasets-uw2/yinpeidai/openpi/checkpoints/
   checkpoint_local_path: /opt/ml/checkpoints
   # JAX path only: how often the entrypoint's background `aws s3 sync` uploads the
   # local checkpoint dir to S3 (crash insurance; a final --delete sync runs on exit
-  # regardless). 1800s = 30min for the SMOKE run so the periodic sync fires mid-run and
-  # we can confirm checkpoints reach S3. For the real ~10h/save run, raise to 28800 (8h).
-  ckpt_sync_interval: 1800
+  # regardless). NOTE: this is a WALL-CLOCK interval in SECONDS (entrypoint does
+  # `sleep $CKPT_SYNC_INTERVAL`), NOT a step count. 30000s = ~8.3h for the full run.
+  ckpt_sync_interval: 30000
 
 wandb:
   enabled: true

@@ -109,13 +109,27 @@ def ecr_account(region: str, profile: str) -> str:
     return out
 
 
-def build_and_push_image(cfg: dict) -> str:
+def image_tag(cfg: dict) -> str:
+    """Immutable per-build tag. Defaults to a timestamp so concurrent builds from
+    different machines/experiments never clobber each other's image (ECR `:latest` is
+    a MUTABLE tag: whoever pushes last wins, and a QUEUED SageMaker job pulls whatever
+    `:latest` resolves to at instance-boot — so another project pushing `:latest`
+    between submit and boot silently swaps the container out from under this job).
+    Override with image.tag in the config to pin a specific build."""
+    return str(cfg["image"].get("tag") or datetime.now().strftime("%Y%m%d-%H%M%S"))
+
+
+def build_and_push_image(cfg: dict, tag: str) -> str:
     region = cfg["aws"]["region"]
     profile = cfg["aws"]["profile"]
     repo = cfg["image"]["repo_name"]
 
     account = ecr_account(region, profile)
-    fullname = f"{account}.dkr.ecr.{region}.amazonaws.com/{repo}:latest"
+    # Push BOTH the immutable per-build tag (what the estimator pins to) and :latest
+    # (convenience for --skip-build / manual pulls). The estimator uses the unique tag,
+    # so a later :latest overwrite by another job cannot affect this run.
+    fullname = f"{account}.dkr.ecr.{region}.amazonaws.com/{repo}:{tag}"
+    latest = f"{account}.dkr.ecr.{region}.amazonaws.com/{repo}:latest"
     dockerfile = REPO_ROOT / "scripts" / "sagemaker" / "train.Dockerfile"
 
     login_dlc = (
@@ -139,6 +153,7 @@ def build_and_push_image(cfg: dict) -> str:
         f"--build-arg AWS_REGION={region} --build-arg SM_ENTRYPOINT={sm_entrypoint} -t {repo} ."
     )
     run(f"docker tag {repo} {fullname}")
+    run(f"docker tag {repo} {latest}")
     run(login_self)
     # Create the ECR repo if it doesn't exist (idempotent).
     run(
@@ -148,6 +163,7 @@ def build_and_push_image(cfg: dict) -> str:
         f"--repository-name {repo} --no-cli-pager"
     )
     run(f"docker push {fullname}")
+    run(f"docker push {latest}")
     time.sleep(3)
     return fullname
 
@@ -220,13 +236,18 @@ def main() -> None:
     if cfg["wandb"]["enabled"] and not wandb_key and not local:
         raise SystemExit("Set $WANDB_API_KEY, add it to scripts/sagemaker/secrets.env, or disable wandb.")
 
+    # Immutable per-build tag so a concurrent :latest push (e.g. a LIBERO experiment on
+    # another machine) can't swap this job's container at instance-boot. --skip-build
+    # reuses :latest (must set image.tag to pin a specific prior build instead).
+    tag = image_tag(cfg)
     if dry_run or skip_build:
         account = ecr_account(region, cfg["aws"]["profile"])
-        image_uri = f"{account}.dkr.ecr.{region}.amazonaws.com/{cfg['image']['repo_name']}:latest"
+        pin = cfg["image"].get("tag") or "latest"
+        image_uri = f"{account}.dkr.ecr.{region}.amazonaws.com/{cfg['image']['repo_name']}:{pin}"
         if dry_run:
-            image_uri = f"<dry-run>/{cfg['image']['repo_name']}:latest"
+            image_uri = f"<dry-run>/{cfg['image']['repo_name']}:{pin}"
     else:
-        image_uri = build_and_push_image(cfg)
+        image_uri = build_and_push_image(cfg, tag)
     print(f"Image: {image_uri}")
 
     os.environ["AWS_DEFAULT_REGION"] = region

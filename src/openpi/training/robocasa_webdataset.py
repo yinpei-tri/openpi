@@ -27,16 +27,21 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 import dataclasses
+import functools
 import io
 import json
+import logging
 from pathlib import Path
 import random
 import tarfile
+import time as _time
 from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
 from PIL import Image
+
+logger = logging.getLogger("openpi")
 
 CAM_KEYS = ("scene_left", "scene_right", "wrist")
 
@@ -103,21 +108,59 @@ class WebDatasetConfig:
 
 # ---------------------------------------------------------------------------
 # Shard IO (local + S3), dependency-light.
+#
+# S3 resilience (adopted from vla_foundry_internal's data path): reads go through a
+# SHARED boto3 client configured with adaptive retries + a read timeout, and a small
+# manual retry-with-backoff wraps each object fetch. This survives the transient S3 /
+# FastFile blips (throttling, connection resets) that otherwise crash a multi-day run.
+# We fetch objects DIRECTLY via boto3 (not through the FastFile FUSE mount) when given
+# an s3:// URL — boto3 opens its own connection per call, so there is no FUSE transport
+# to drop (the `ENOTCONN` failure class disappears). Local paths still read from disk.
 # ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=1)
+def _s3_client():
+    """One retry-configured boto3 S3 client per process (matches vla_foundry's config)."""
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "s3",
+        config=Config(retries={"max_attempts": 5, "mode": "adaptive"}, read_timeout=120),
+    )
+
+
+def _s3_get_bytes(bucket: str, key: str, *, attempts: int = 4) -> bytes:
+    """Fetch a full S3 object with retry-with-backoff on top of boto3's own retries.
+
+    boto3's ``max_attempts`` covers establishing the GET; this outer loop additionally
+    retries a failure that surfaces WHILE reading the streaming body (mid-stream
+    connection reset / timeout), which boto3 does not retry. Backoff 0.5s, 1s, 2s, ...
+    """
+    last_err: Exception | None = None
+    for i in range(attempts):
+        try:
+            return _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+        except Exception as e:
+            last_err = e
+            if i < attempts - 1:
+                _time.sleep(0.5 * (2**i))
+    raise OSError(f"S3 get failed after {attempts} attempts: s3://{bucket}/{key}") from last_err
+
+
 def _list_one_shard_dir(shards: str) -> list[str]:
     """Resolve ONE shards spec (local dir/glob or s3:// prefix) to sorted tar URLs."""
     if shards.startswith("s3://"):
-        import boto3
-
         u = urlparse(shards)
         bucket, prefix = u.netloc, u.path.lstrip("/")
-        s3 = boto3.client("s3")
-        paginator = s3.get_paginator("list_objects_v2")
-        keys = []
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                if obj["Key"].endswith(".tar"):
-                    keys.append(f"s3://{bucket}/{obj['Key']}")
+        paginator = _s3_client().get_paginator("list_objects_v2")
+        keys = [
+            f"s3://{bucket}/{obj['Key']}"
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix)
+            for obj in page.get("Contents", [])
+            if obj["Key"].endswith(".tar")
+        ]
         return sorted(keys)
     p = Path(shards)
     if p.is_dir():
@@ -145,14 +188,14 @@ def list_shards(shards: str) -> list[str]:
 
 
 def open_shard(url: str) -> io.BufferedReader | io.BytesIO:
-    """Open a shard URL as a binary stream (local file or full S3 object)."""
-    if url.startswith("s3://"):
-        import boto3
+    """Open a shard URL as a binary stream (local file or full S3 object).
 
+    S3 shards are fetched via the shared retry client (direct boto3 GET, not FUSE), so a
+    transient blip retries instead of killing the run.
+    """
+    if url.startswith("s3://"):
         u = urlparse(url)
-        s3 = boto3.client("s3")
-        body = s3.get_object(Bucket=u.netloc, Key=u.path.lstrip("/"))["Body"].read()
-        return io.BytesIO(body)
+        return io.BytesIO(_s3_get_bytes(u.netloc, u.path.lstrip("/")))
     return open(url, "rb")
 
 
@@ -208,6 +251,17 @@ class RoboCasaWebDataset:
             self._anchor_roots = [a.strip().rstrip("/") for a in cfg.anchors_dir.split(",") if a.strip()]
         else:
             self._anchor_roots = [self._derive_anchor_root(d) for d in self._shard_dirs]
+        # S3 fallback anchor roots: any anchor root already on s3:// PLUS the anchors/
+        # sibling of any s3:// shard dir. Used when a local/FUSE anchor read fails (e.g.
+        # FastFile mount drop -> ENOTCONN) so we can still pull the image directly from
+        # S3 via the retry client instead of crashing. Deduped, order-preserving.
+        s3_fallbacks = [r for r in self._anchor_roots if r.startswith("s3://")]
+        for d in self._shard_dirs:
+            if d.startswith("s3://"):
+                fb = self._derive_anchor_root(d)
+                if fb not in s3_fallbacks:
+                    s3_fallbacks.append(fb)
+        self._anchor_s3_fallbacks = s3_fallbacks
         self._anchor_cache: dict[str, np.ndarray] = {}
 
     @staticmethod
@@ -222,35 +276,44 @@ class RoboCasaWebDataset:
     def _read_anchor(self, key: str, cam: str) -> np.ndarray:
         """Resolve an anchor key (<flat_id>/f<frame:06d>) + cam to a decoded image.
 
-        Reads ``<anchor_root>/<key>.<cam>.jpg`` (local or s3://) with a small LRU. When
-        multiple shard dirs are pooled, the anchor roots are searched in order (first hit
-        wins) — a sample's anchor lives in the store paired with its shard's dir. For S3,
-        stage the anchor store locally first so this is a local read.
+        Reads ``<anchor_root>/<key>.<cam>.jpg`` with a small LRU. Anchor roots are tried
+        in order (first hit wins); s3:// roots use the shared retry client, local roots
+        read from disk. RESILIENCE: if every configured root fails (e.g. a FastFile FUSE
+        mount drops mid-run -> OSError/ENOTCONN on the local path), fall back to a direct
+        S3 GET from ``_anchor_s3_fallbacks`` — the data lives in S3 regardless of the
+        mount, so this recovers instead of crashing the whole run.
         """
         cache_key = f"{key}.{cam}"
         cached = self._anchor_cache.get(cache_key)
         if cached is not None:
             return cached
+        rel = f"{key}.{cam}.jpg"
         data = None
         last_err: Exception | None = None
+        # 1) Configured roots (as-is: s3:// via retry client, local via disk).
         for root in self._anchor_roots:
-            url = f"{root}/{key}.{cam}.jpg"
             try:
-                if url.startswith("s3://"):
-                    from urllib.parse import urlparse as _up
-
-                    import boto3
-
-                    u = _up(url)
-                    data = boto3.client("s3").get_object(Bucket=u.netloc, Key=u.path.lstrip("/"))["Body"].read()
+                if root.startswith("s3://"):
+                    u = urlparse(f"{root}/{rel}")
+                    data = _s3_get_bytes(u.netloc, u.path.lstrip("/"))
                 else:
-                    data = Path(url).read_bytes()
+                    data = Path(f"{root}/{rel}").read_bytes()
                 break
-            except Exception as e:  # noqa: BLE001 - try the next root
+            except Exception as e:
                 last_err = e
+        # 2) S3 fallback (recovers a dead FUSE mount: the object is in S3 regardless).
+        if data is None:
+            for root in self._anchor_s3_fallbacks:
+                try:
+                    u = urlparse(f"{root}/{rel}")
+                    data = _s3_get_bytes(u.netloc, u.path.lstrip("/"))
+                    break
+                except Exception as e:
+                    last_err = e
         if data is None:
             raise FileNotFoundError(
-                f"anchor {key}.{cam}.jpg not found in any anchor root {self._anchor_roots}"
+                f"anchor {rel} not readable from roots {self._anchor_roots} "
+                f"or S3 fallbacks {self._anchor_s3_fallbacks} (last error: {last_err!r})"
             ) from last_err
         img = _decode_jpeg(data)
         if len(self._anchor_cache) >= self.cfg.anchor_cache_size:
@@ -328,10 +391,19 @@ class RoboCasaWebDataset:
             sample["observation/state"] = arrays["lean_state"].astype(np.float32)
 
         if self.cfg.use_anchor_images:
-            # Single anchor key per frame (subgoal-start), path-addressable.
-            anchor_key = meta["anchor_key"]
-            for ck in CAM_KEYS:
-                sample[f"observation/anchor_{ck}"] = self._read_anchor(anchor_key, ck)
+            # Anchor images (subgoal-start frame). Two dataset layouts are supported:
+            #   (new, Option C) anchors BAKED INTO the shard as `anchor_<cam>.jpg` members
+            #     alongside the current-cam images — read sequentially from the tar group,
+            #     no random lookup, no separate anchor store. This is the robust layout.
+            #   (old) anchors as LOOSE per-key files in an `anchors/` sibling dir — fetched
+            #     on demand by `anchor_key` via _read_anchor (path/S3, with retry+fallback).
+            if f"anchor_{CAM_KEYS[0]}.jpg" in raw:
+                for ck in CAM_KEYS:
+                    sample[f"observation/anchor_{ck}"] = _decode_jpeg(raw[f"anchor_{ck}.jpg"])
+            else:
+                anchor_key = meta["anchor_key"]
+                for ck in CAM_KEYS:
+                    sample[f"observation/anchor_{ck}"] = self._read_anchor(anchor_key, ck)
 
         if self.cfg.include_anchor_state:
             # Anchor (subgoal-start) state, concatenated onto the current by the policy.
@@ -394,18 +466,40 @@ class RoboCasaWebDataset:
         cfg = self.cfg
         rng = random.Random(cfg.seed + self._epoch * 7919)
         buffer: list[dict[str, Any]] = []
+        # Skip-and-continue tolerance (vla_foundry pattern): a shard that fails to
+        # open/stream, or a single sample that fails to decode/build, is LOGGED and
+        # SKIPPED rather than crashing a multi-day run. A transient S3/FUSE blip on one
+        # shard costs that shard's samples, not the whole job. Retries happen a layer
+        # down (open_shard / _read_anchor via the retry client + S3 fallback); this is
+        # the last-resort tolerance for anything that still gets through.
         for shard in self._worker_shards():
-            for raw in iter_shard_samples(shard):
-                sample = self._build_sample(raw, rng)
-                if sample is None:
-                    continue
-                buffer.append(sample)
-                # Once the buffer is warm, emit a random element for every new one
-                # added (reservoir-style streaming shuffle: buffer size stays ~constant).
-                if len(buffer) >= cfg.shuffle_buffer:
-                    j = rng.randrange(len(buffer))
-                    buffer[j], buffer[-1] = buffer[-1], buffer[j]
-                    yield buffer.pop()
+            try:
+                shard_iter = iter_shard_samples(shard)
+                while True:
+                    try:
+                        raw = next(shard_iter)
+                    except StopIteration:
+                        break
+                    except Exception as e:
+                        logger.warning("Skipping rest of shard %s after read error: %r", shard, e)
+                        break
+                    try:
+                        sample = self._build_sample(raw, rng)
+                    except Exception as e:
+                        logger.warning("Skipping unbuildable sample in shard %s: %r", shard, e)
+                        continue
+                    if sample is None:
+                        continue
+                    buffer.append(sample)
+                    # Once the buffer is warm, emit a random element for every new one
+                    # added (reservoir-style streaming shuffle: buffer size stays ~constant).
+                    if len(buffer) >= cfg.shuffle_buffer:
+                        j = rng.randrange(len(buffer))
+                        buffer[j], buffer[-1] = buffer[-1], buffer[j]
+                        yield buffer.pop()
+            except Exception as e:
+                logger.warning("Skipping shard %s (failed to open): %r", shard, e)
+                continue
         # Drain the remaining buffer in random order.
         rng.shuffle(buffer)
         yield from buffer

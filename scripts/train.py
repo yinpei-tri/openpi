@@ -171,6 +171,37 @@ def init_train_state(
     return train_state, state_sharding
 
 
+def _fold_progress_ratios(info: dict) -> dict:
+    """Convert the progress head's additive per-class/per-bin counters into ratios.
+
+    The model logs, per window-averaged step, additive scalars:
+      - classification: ``pcls_num/{c}`` (correct) and ``pcls_den/{c}`` (samples) per class
+      - regression:     ``pbin_err/{b}`` (sum |err|) and ``pbin_cnt/{b}`` (samples) per bin
+    Both numerator and denominator were mean-averaged over the log window, so the
+    1/n_batches factor cancels and mean(num)/mean(den) is the exact window-level ratio.
+    We emit ``progress_acc_class/{c}`` and ``progress_mae_bin/{b}`` and drop the raw
+    counters. den==0 (a class/bin unseen in the whole window) -> NaN, which wandb skips.
+    """
+    out = {}
+    pairs = {}  # ratio_key -> [num, den]
+    for k, v in info.items():
+        if k.startswith("pcls_num/"):
+            pairs.setdefault(f"progress_acc_class/{k.split('/', 1)[1]}", [None, None])[0] = v
+        elif k.startswith("pcls_den/"):
+            pairs.setdefault(f"progress_acc_class/{k.split('/', 1)[1]}", [None, None])[1] = v
+        elif k.startswith("pbin_err/"):
+            pairs.setdefault(f"progress_mae_bin/{k.split('/', 1)[1]}", [None, None])[0] = v
+        elif k.startswith("pbin_cnt/"):
+            pairs.setdefault(f"progress_mae_bin/{k.split('/', 1)[1]}", [None, None])[1] = v
+        else:
+            out[k] = v
+    for ratio_key, (num, den) in pairs.items():
+        if num is None or den is None:
+            continue
+        out[ratio_key] = float(num) / float(den) if float(den) > 0 else float("nan")
+    return out
+
+
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
@@ -318,25 +349,71 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     )
 
     infos = []
+    # Timing diagnostics (added to wandb as t/*). We can't split forward vs backward:
+    # they're fused in one jitted value_and_grad and XLA interleaves their ops, and JAX
+    # async-dispatch means per-op timers would only measure dispatch, not compute. What we
+    # CAN measure cheaply and honestly, with ZERO added throughput cost:
+    #   - data_wait_s: wall time blocked in next(data_iter) — worker starvation / S3 IO.
+    #   - step_s: total per-step wall time, averaged over the log window.
+    #   - compute_s: step_s - data_wait_s — the GPU compute+dispatch remainder.
+    #   - data_frac: data_wait_s / step_s — fraction of the step lost to data loading.
+    # Throughput (step_s) over a window is wall-clock-accurate despite async dispatch
+    # because the logging block's jax.device_get(reduced_info) is a natural sync barrier
+    # at every log_interval (it depends on all infos in the window). No per-step
+    # block_until_ready needed, so pipelining/overlap is untouched.
+    data_wait_accum = 0.0
+    window_start = time.perf_counter()
     for step in pbar:
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))  # syncs the window
+            n_win = len(infos)
+            elapsed = time.perf_counter() - window_start
+            # Skip the first logged step: it includes XLA compilation of ptrain_step,
+            # which would dwarf steady-state numbers.
+            if step > start_step and n_win > 0:
+                step_s = elapsed / n_win
+                data_wait_s = data_wait_accum / n_win
+                reduced_info["t/step_s"] = step_s
+                reduced_info["t/data_wait_s"] = data_wait_s
+                reduced_info["t/compute_s"] = max(step_s - data_wait_s, 0.0)
+                reduced_info["t/data_frac"] = data_wait_s / step_s if step_s > 0 else 0.0
+            # Fold the progress-head per-class / per-bin num/den scalars into ratios.
+            # The model emits additive counts (pcls_num/den, pbin_err/cnt) that were
+            # mean-averaged over the window above; the 1/n_batches cancels in the ratio,
+            # so mean(num)/mean(den) is the correct window-level accuracy/MAE. Empty
+            # classes/bins (den==0) are reported as NaN (no samples => undefined), which
+            # wandb simply skips in the plot. Raw counts are dropped from the log.
+            reduced_info = _fold_progress_ratios(reduced_info)
+            # Console line stays compact: skip the 10 per-class / per-bin breakdowns
+            # (they go to wandb). Keep the scalar summaries.
+            info_str = ", ".join(
+                f"{k}={v:.4f}"
+                for k, v in reduced_info.items()
+                if not k.startswith(("progress_acc_class/", "progress_mae_bin/"))
+            )
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
+            data_wait_accum = 0.0
+            window_start = time.perf_counter()
+        _t_data = time.perf_counter()
         batch = next(data_iter)
+        data_wait_accum += time.perf_counter() - _t_data
 
         if tentative_run and step > tentative_run_step:
             logging.info("==========Tentative run completed==========")
             break
 
-        if checkpoint_manager and ((step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1):
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step, save_optimizer=config.save_optimizer)
+        if checkpoint_manager and (
+            (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1
+        ):
+            _checkpoints.save_state(
+                checkpoint_manager, train_state, data_loader, step, save_optimizer=config.save_optimizer
+            )
 
     if checkpoint_manager:
         logging.info("Waiting for checkpoint manager to finish")

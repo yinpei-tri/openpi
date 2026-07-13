@@ -310,6 +310,21 @@ class Pi0(_model.BaseModel):
                 metrics["progress_acc"] = jnp.mean((pred_class == labels).astype(jnp.float32))
                 # Bucket-distance MAE (how far off the argmax is, in class units).
                 metrics["progress_class_mae"] = jnp.mean(jnp.abs(pred_class - labels).astype(jnp.float32))
+                # Per-class recall: for each true class c, correct-count and sample-count.
+                # Emitted as separate additive scalars (NOT a per-batch ratio) so they
+                # average correctly over the wandb log window: train.py forms the ratio
+                # progress_acc_class/{c} = mean(num_c) / mean(den_c) AFTER the window
+                # reduction, so the 1/n_batches cancels and empty classes don't skew it.
+                n_cls = self._progress_num_classes
+                lab_flat = labels.reshape(-1)  # [N]
+                pred_flat = pred_class.reshape(-1)  # [N]
+                lab_oh = jax.nn.one_hot(lab_flat, n_cls, dtype=jnp.float32)  # [N, n_cls]
+                correct = (pred_flat == lab_flat).astype(jnp.float32)  # [N]
+                den_c = lab_oh.sum(axis=0)  # [n_cls] samples of each true class
+                num_c = (lab_oh * correct[:, None]).sum(axis=0)  # [n_cls] correct per class
+                for c in range(n_cls):
+                    metrics[f"pcls_num/{c}"] = num_c[c]
+                    metrics[f"pcls_den/{c}"] = den_c[c]
             elif self._progress_mode == "continuous" and progress_target is not None:
                 # Scalar state-value: Huber regression on frac**k.
                 progress_pred = nnx.sigmoid(logits)  # [*b], in [0,1]
@@ -321,6 +336,23 @@ class Pi0(_model.BaseModel):
                 metrics["progress_mae"] = jnp.mean(jnp.abs(progress_pred - target))
                 metrics["progress_pred_mean"] = jnp.mean(progress_pred)
                 metrics["progress_target_mean"] = jnp.mean(target)
+                # Per-bin MAE: bucket samples by the TRUE progress fraction into 10 bins
+                # [0,0.1),...,[0.9,1.0], and emit summed abs-error + count per bin. As with
+                # the classification per-class recall, these are additive scalars so
+                # train.py forms progress_mae_bin/{b} = mean(err_b)/mean(cnt_b) AFTER the
+                # window reduction (empty bins in a batch contribute 0/0 that cancels).
+                # Bin on the RAW frac (progress_target), not frac**k, so bins are the
+                # intuitive [0,0.1)..[0.9,1.0] on the actual progress.
+                n_bins = 10
+                frac_flat = jnp.clip(progress_target, 0.0, 1.0).reshape(-1)  # [N]
+                abserr_flat = jnp.abs(progress_pred - target).reshape(-1)  # [N]
+                bin_idx = jnp.clip((frac_flat * n_bins).astype(jnp.int32), 0, n_bins - 1)  # [N]
+                bin_oh = jax.nn.one_hot(bin_idx, n_bins, dtype=jnp.float32)  # [N, n_bins]
+                cnt_b = bin_oh.sum(axis=0)  # [n_bins]
+                err_b = (bin_oh * abserr_flat[:, None]).sum(axis=0)  # [n_bins]
+                for b in range(n_bins):
+                    metrics[f"pbin_err/{b}"] = err_b[b]
+                    metrics[f"pbin_cnt/{b}"] = cnt_b[b]
 
         if return_metrics:
             return total_loss, metrics
@@ -352,9 +384,7 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
-        observation = _model.preprocess_observation(
-            None, observation, train=False, image_keys=self._image_keys
-        )
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=self._image_keys)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
@@ -423,9 +453,7 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        (prefix_out, _), _ = self.PaliGemma.llm(
-            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
-        )
+        (prefix_out, _), _ = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
         logits = self._progress_logits(prefix_out, prefix_mask)
         if self._progress_mode == "classes":
             return jax.nn.softmax(logits, axis=-1)  # [b, K]
