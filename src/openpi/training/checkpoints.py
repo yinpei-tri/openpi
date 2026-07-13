@@ -9,6 +9,7 @@ from typing import Protocol
 from etils import epath
 import jax
 import jax.experimental.multihost_utils as multihost_utils
+import numpy as np
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
@@ -34,7 +35,7 @@ def _configure_array_handler_single_host() -> None:
             ocp.type_handlers.ArrayHandler(array_metadata_store=None),
             override=True,
         )
-    except Exception:  # noqa: BLE001 - best-effort; never block training on this
+    except Exception:
         logging.warning("Could not configure single-host orbax ArrayHandler; continuing with defaults.")
 
 
@@ -43,21 +44,25 @@ def initialize_checkpoint_dir(
 ) -> tuple[ocp.CheckpointManager, bool]:
     _configure_array_handler_single_host()
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
-    resuming = False
-    if checkpoint_dir.exists():
-        if overwrite:
-            checkpoint_dir.rmtree()
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
-        elif resume:
-            resuming = True
-        else:
-            raise FileExistsError(
-                f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
-                "to indicate how to handle it."
-            )
+    if checkpoint_dir.exists() and overwrite:
+        checkpoint_dir.rmtree()
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        logging.info(f"Wiped checkpoint directory {checkpoint_dir}")
+    elif checkpoint_dir.exists() and not resume:
+        raise FileExistsError(
+            f"Checkpoint directory {checkpoint_dir} already exists. Use --overwrite or --resume "
+            "to indicate how to handle it."
+        )
+    elif not checkpoint_dir.exists() and not resume:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    # Resume is an explicit contract: every process must have the same complete local
+    # copy of a checkpoint containing both inference params and optimizer train state.
+    # Never turn a missing/partial resume directory into a fresh run silently.
+    resuming = resume
+    if resume:
+        latest_step = _collective_validate_resume_checkpoint(checkpoint_dir)
+        logging.info(f"Resume preflight passed for checkpoint step {latest_step} at {checkpoint_dir}")
 
     # Multi-node checkpointing WITHOUT a shared filesystem: save_state gathers the pytree
     # to plain host numpy (process_allgather) before saving, so orbax sees non-distributed
@@ -82,14 +87,55 @@ def initialize_checkpoint_dir(
         ),
     )
 
-    # Special case: the checkpoint directory exists and the user requests to resume training, but the training run did
-    # not get to the first checkpoint saved. In this case, we don't actually want the train script to try and restore a
-    # checkpoint, since it will fail.
-    if resuming and tuple(mngr.all_steps()) in [(), (0,)]:
-        logging.info("Checkpoint directory exists, but does not contain any checkpoints. Aborting resume.")
-        resuming = False
-
     return mngr, resuming
+
+
+def _inspect_resume_checkpoint(checkpoint_dir: epath.Path) -> tuple[int, list[str]]:
+    """Returns the latest numeric step and structural errors for a local checkpoint."""
+    if not checkpoint_dir.exists():
+        return -1, [f"checkpoint directory does not exist: {checkpoint_dir}"]
+
+    steps = sorted(int(path.name) for path in checkpoint_dir.iterdir() if path.is_dir() and path.name.isdigit())
+    if not steps:
+        return -1, [f"no numeric checkpoint steps found in {checkpoint_dir}"]
+
+    latest_step = steps[-1]
+    step_dir = checkpoint_dir / str(latest_step)
+    required = [step_dir / "_CHECKPOINT_METADATA"]
+    for item in ("params", "train_state"):
+        item_dir = step_dir / item
+        required.extend(
+            [
+                item_dir / "_METADATA",
+                item_dir / "manifest.ocdbt",
+                item_dir / "ocdbt.process_0" / "manifest.ocdbt",
+            ]
+        )
+    errors = [f"missing required checkpoint object: {path}" for path in required if not path.is_file()]
+    return latest_step, errors
+
+
+def _collective_validate_resume_checkpoint(checkpoint_dir: epath.Path) -> int:
+    """Fails all JAX processes if any local resume copy is missing or inconsistent."""
+    latest_step, errors = _inspect_resume_checkpoint(checkpoint_dir)
+    for error in errors:
+        logging.error(error)
+
+    local_status = np.asarray([not errors, latest_step], dtype=np.int32)
+    if jax.process_count() > 1:
+        statuses = np.asarray(multihost_utils.process_allgather(local_status, tiled=True)).reshape(-1, 2)
+    else:
+        statuses = local_status.reshape(1, 2)
+
+    if not np.all(statuses[:, 0]):
+        raise RuntimeError(
+            "Resume checkpoint preflight failed on at least one process. Each host must "
+            "download a complete params/ + train_state/ checkpoint before JAX restore."
+        )
+    steps = statuses[:, 1]
+    if not np.all(steps == steps[0]):
+        raise RuntimeError(f"Resume checkpoint step differs across processes: {steps.tolist()}")
+    return int(steps[0])
 
 
 def save_state(
@@ -176,7 +222,28 @@ def restore_state(
                 "uninitialized. Re-run the source job with --save-optimizer, or start a fresh "
                 "run (load params via the weight_loader instead of --resume)."
             ) from e
-    return _merge_params(restored["train_state"], restored["params"])
+    restored_state = _merge_params(restored["train_state"], restored["params"])
+    template_paths = [
+        jax.tree_util.keystr(path)
+        for path, value in jax.tree_util.tree_flatten_with_path(restored_state)[0]
+        if isinstance(value, jax.ShapeDtypeStruct)
+    ]
+    local_ok = np.asarray([not template_paths], dtype=np.int32)
+    if jax.process_count() > 1:
+        all_ok = np.asarray(multihost_utils.process_allgather(local_ok, tiled=True))
+    else:
+        all_ok = local_ok
+    if template_paths or not np.all(all_ok):
+        raise RuntimeError(
+            "Resume restore left unmaterialized ShapeDtypeStruct leaves on at least one "
+            f"process. Local template paths: {template_paths[:8]}"
+        )
+
+    jax.block_until_ready(restored_state)
+    if jax.process_count() > 1:
+        multihost_utils.sync_global_devices("openpi_resume_restore_complete")
+    logging.info(f"Restored full train state at step {int(restored_state.step)} on all processes")
+    return restored_state
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:

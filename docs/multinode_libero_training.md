@@ -81,6 +81,16 @@ Map-style datasets do NOT split by process, so `data_loader.py` still rejects th
 - Checkpoint sync lines appear on **rank 0 only** (`algo-1`); the other host logs
   "Not rank 0: skipping S3 checkpoint sync."
 
+## Resume contract
+
+Set `training.resume=true` and point `output.resume_s3_uri` at the previous job root
+(`s3://.../<previous-job-name>/`, above the config/experiment directories). A resumable
+checkpoint must contain both `params/` (EMA inference weights) and `train_state/` (live
+weights, optimizer slots, and step). The entrypoint and trainer validate the latest step
+on every host before restore; a missing or inconsistent local copy fails the job instead
+of silently starting over. W&B initialization happens only after the restored state is
+materialized and synchronized, and telemetry failures do not abort training.
+
 ## Known friction point (untested boundary)
 
 The cross-host mesh formation (coordinator handshake over EFA, port `SM_MASTER_PORT`) is

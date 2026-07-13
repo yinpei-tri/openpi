@@ -65,6 +65,22 @@ if [[ "${RESUME:-0}" == "1" ]]; then
         echo "ERROR: no checkpoint steps found at ${RESUME_S3_URI}${CONFIG}/${EXP}/ — cannot resume." >&2
         exit 1
     fi
+    LATEST_STEP=$(find "$CKPT_DIR/$CONFIG/$EXP" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+        | awk '/^[0-9]+$/' | sort -n | tail -1)
+    for REQUIRED in \
+        "$CKPT_DIR/$CONFIG/$EXP/$LATEST_STEP/_CHECKPOINT_METADATA" \
+        "$CKPT_DIR/$CONFIG/$EXP/$LATEST_STEP/params/_METADATA" \
+        "$CKPT_DIR/$CONFIG/$EXP/$LATEST_STEP/params/manifest.ocdbt" \
+        "$CKPT_DIR/$CONFIG/$EXP/$LATEST_STEP/params/ocdbt.process_0/manifest.ocdbt" \
+        "$CKPT_DIR/$CONFIG/$EXP/$LATEST_STEP/train_state/_METADATA" \
+        "$CKPT_DIR/$CONFIG/$EXP/$LATEST_STEP/train_state/manifest.ocdbt" \
+        "$CKPT_DIR/$CONFIG/$EXP/$LATEST_STEP/train_state/ocdbt.process_0/manifest.ocdbt"; do
+        if [[ ! -f "$REQUIRED" ]]; then
+            echo "ERROR: resume checkpoint is incomplete; missing $REQUIRED" >&2
+            exit 1
+        fi
+    done
+    echo "Resume preflight: complete params + train_state found at step $LATEST_STEP"
 fi
 
 SYNC_INTERVAL="${CKPT_SYNC_INTERVAL:-1800}"
@@ -138,7 +154,8 @@ echo "extra_args=${EXTRA_ARGS[*]:-}"
 echo "===================================================="
 
 # NOT exec — keep the shell alive so the EXIT trap (final_sync) runs. Propagate exit code.
-python scripts/train.py \
+# Unbuffered output preserves the first Python traceback if one distributed process fails.
+python -u scripts/train.py \
     "$CONFIG" \
     --exp-name="$EXP" \
     --assets-base-dir="$ASSETS_DIR" \

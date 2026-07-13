@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import functools
 import logging
@@ -11,6 +12,7 @@ from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
 import jax.experimental
+import jax.experimental.multihost_utils as multihost_utils
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -23,11 +25,11 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.distributed as _distributed
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
-import openpi.training.distributed as _distributed
 
 
 def robocasa_exp_tag(config: _config.TrainConfig) -> str:
@@ -86,32 +88,49 @@ def init_logging():
     logger.handlers[0].setFormatter(formatter)
 
 
-def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True):
+def init_wandb(
+    config: _config.TrainConfig, *, resuming: bool, log_code: bool = False, enabled: bool = True
+) -> bool:
     if not enabled:
-        wandb.init(mode="disabled")
+        return False
+
+    # W&B is process-0-only, non-essential telemetry. Never let it tear down one member of
+    # a distributed job while the other processes continue into collectives.
+    try:
+        ckpt_dir = config.checkpoint_dir
+        if not ckpt_dir.exists():
+            raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+        if resuming:
+            run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+            # resume="allow" (not "must"): resume the run if it exists on the server, else
+            # start a fresh run with this id. "must" hard-fails when the prior run was
+            # never registered (e.g. the source job was stopped early).
+            wandb.init(id=run_id, resume="allow", project=config.project_name)
+        else:
+            wandb.init(
+                name=config.exp_name,
+                config=dataclasses.asdict(config),
+                project=config.project_name,
+            )
+            (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+
+        if log_code:
+            wandb.run.log_code(epath.Path(__file__).parent.parent)
+    except Exception:
+        logging.exception("wandb.init failed; continuing with W&B logging disabled")
+        with contextlib.suppress(Exception):
+            wandb.finish(exit_code=1, quiet=True)
+        return False
+    return True
+
+
+def log_wandb(data: dict[str, Any], *, step: int, enabled: bool) -> None:
+    if not enabled:
         return
-
-    ckpt_dir = config.checkpoint_dir
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        # resume="allow" (not "must"): resume the run if it exists on the server, else
-        # start a fresh run with this id. "must" crashes when the prior run was never
-        # registered (e.g. the source job was stopped early). On multi-node this crash
-        # happens on process 0 ONLY, desyncing the job -> the surviving process hangs at
-        # the shutdown barrier (DEADLINE_EXCEEDED, 1/2 tasks). "allow" makes resume robust.
-        wandb.init(id=run_id, resume="allow", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
-
-    if log_code:
-        wandb.run.log_code(epath.Path(__file__).parent.parent)
+    try:
+        wandb.log(data, step=step)
+    except Exception:
+        logging.exception("wandb.log failed; continuing training")
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -284,14 +303,6 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             overwrite=config.overwrite,
             resume=config.resume,
         )
-    # Multi-node: only the primary process logs to wandb. Otherwise every process starts
-    # its own run and you get N identical curves (metrics are the same replicated value).
-    init_wandb(
-        config,
-        resuming=resuming,
-        enabled=config.wandb_enabled and not tentative_run and jax.process_index() == 0,
-    )
-
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
@@ -325,19 +336,32 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     except Exception as _e:  # noqa: BLE001 - debug only
         logging.info(f"[data-dist] shard introspection skipped: {_e}")
 
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
-
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+
+    # Only process 0 logs. Initialize telemetry after the distributed checkpoint protocol
+    # has completed, then synchronize so every process enters training in the same phase.
+    wandb_active = init_wandb(
+        config,
+        resuming=resuming,
+        enabled=config.wandb_enabled and not tentative_run and jax.process_index() == 0,
+    )
+    if jax.process_count() > 1:
+        multihost_utils.sync_global_devices("openpi_wandb_init_complete")
+
+    if wandb_active:
+        try:
+            images_to_log = [
+                wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+                for i in range(min(5, len(next(iter(batch[0].images.values())))))
+            ]
+            log_wandb({"camera_views": images_to_log}, step=0, enabled=True)
+        except Exception:
+            logging.exception("Could not construct W&B camera preview; continuing training")
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -366,7 +390,7 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            log_wandb(reduced_info, step=step, enabled=wandb_active)
             infos = []
         batch = next(data_iter)
 
