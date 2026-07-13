@@ -71,17 +71,22 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Multi-node: scope the save to process 0 ONLY (active_processes={0}). The model is
-    # replicated across nodes (FSDP shards on the fsdp axis; the node axis is a
-    # data-parallel replica), so process 0 holds the whole model and — with
-    # use_replica_parallel=False above — writes a COMPLETE checkpoint to its own local
-    # disk with no cross-node coordination or shared filesystem. save()/restore() are
-    # still CALLED on all processes (orbax syncs the active subset internally). On a
-    # single process this is a no-op. WARNING: only correct while params are replicated
-    # across nodes — do NOT use with params sharded across nodes.
-    mp_options = None
+    # Multi-node checkpointing WITHOUT a shared filesystem (each SageMaker node has its
+    # own local EBS). primary_host=None => EVERY host is "primary" and writes its OWN
+    # complete checkpoint to its OWN local dir independently — no host waits for another
+    # host's base dir (that cross-host wait was the original 600s timeout), and barriers
+    # still run across ALL processes via the network coordination service (active
+    # processes stays None, so no "subset barrier" error). Combined with
+    # use_replica_parallel=False (above), each host writes the FULL model, so node 0's
+    # local dir is a complete checkpoint. The entrypoint then rank-0-only S3-syncs node
+    # 0's copy (node 1's identical copy is discarded). Valid because the model is
+    # REPLICATED across nodes (FSDP shards within a node; the node axis is a DP replica).
+    # Single-node: process_count==1, primary_host=None is equivalent to the default.
+    # Only override multiprocessing_options for multi-node; single-node keeps orbax's
+    # default (passing None explicitly breaks orbax, which expects a default object).
+    mgr_opts_kwargs = {}
     if jax.process_count() > 1:
-        mp_options = ocp.options.MultiprocessingOptions(primary_host=0, active_processes={0})
+        mgr_opts_kwargs["multiprocessing_options"] = ocp.options.MultiprocessingOptions(primary_host=None)
 
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
@@ -95,7 +100,7 @@ def initialize_checkpoint_dir(
             keep_period=keep_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
-            multiprocessing_options=mp_options,
+            **mgr_opts_kwargs,
         ),
     )
 
