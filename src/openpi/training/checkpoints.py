@@ -8,6 +8,7 @@ from typing import Protocol
 
 from etils import epath
 import jax
+import jax.experimental.multihost_utils as multihost_utils
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
 
@@ -18,32 +19,19 @@ import openpi.training.utils as training_utils
 
 
 def _configure_array_handler_single_host() -> None:
-    """Configure orbax's jax.Array handler for SINGLE-HOST checkpoint writes.
+    """Disable orbax's per-process ArrayMetadata store (belt-and-suspenders).
 
-    Two settings, both needed so process 0 alone writes a COMPLETE checkpoint to its own
-    local disk (no shared filesystem, no cross-node coordination):
-
-    - ``array_metadata_store=None``: disables the per-process ArrayMetadata store. That
-      store makes the primary host create an ``array_metadatas/`` base dir and other
-      hosts WAIT for it on the SAME path — impossible across SageMaker's per-node local
-      disks (times out; also caused the finalize JSONDecodeError on the S3-synced mount).
-      Optional subchunk metadata; safe to drop.
-
-    - ``use_replica_parallel=False``: by default orbax splits a replicated array's WRITE
-      across replica hosts to go faster (process 0 writes ~5 GB, process 1 the other
-      ~7 GB). On per-node filesystems those halves land in different places and the
-      final dir gets only one -> incomplete, unloadable checkpoint. With this off, the
-      single writing host emits ALL bytes, so process 0's dir is a complete checkpoint.
-
-    Valid because the model is REPLICATED across nodes here (FSDP shards on the fsdp axis
-    only; the batch/node axis is a data-parallel replica), so process 0 holds the whole
-    model. NOT valid if params are ever sharded across nodes (e.g. fsdp == total devices
-    spanning nodes). Must be called before the CheckpointManager is built.
+    save_state gathers the pytree to host numpy before saving, so orbax writes a single
+    self-contained ocdbt.process_0/ and there is no multi-host coordination anyway. But
+    disabling the ArrayMetadata store is harmless insurance against the "primary creates
+    array_metadatas/ base dir, others wait on the same path" cross-host wait (which would
+    hang / crash finalize on SageMaker's per-node local disks). Must be called before the
+    CheckpointManager is built.
     """
     try:
         ocp.type_handlers.register_type_handler(
             jax.Array,
-            ocp.type_handlers.ArrayHandler(array_metadata_store=None, use_replica_parallel=False),
+            ocp.type_handlers.ArrayHandler(array_metadata_store=None),
             override=True,
         )
     except Exception:  # noqa: BLE001 - best-effort; never block training on this
@@ -71,23 +59,14 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # Multi-node checkpointing WITHOUT a shared filesystem (each SageMaker node has its
-    # own local EBS). primary_host=None => EVERY host is "primary" and writes its OWN
-    # complete checkpoint to its OWN local dir independently — no host waits for another
-    # host's base dir (that cross-host wait was the original 600s timeout), and barriers
-    # still run across ALL processes via the network coordination service (active
-    # processes stays None, so no "subset barrier" error). Combined with
-    # use_replica_parallel=False (above), each host writes the FULL model, so node 0's
-    # local dir is a complete checkpoint. The entrypoint then rank-0-only S3-syncs node
-    # 0's copy (node 1's identical copy is discarded). Valid because the model is
-    # REPLICATED across nodes (FSDP shards within a node; the node axis is a DP replica).
-    # Single-node: process_count==1, primary_host=None is equivalent to the default.
-    # Only override multiprocessing_options for multi-node; single-node keeps orbax's
-    # default (passing None explicitly breaks orbax, which expects a default object).
-    mgr_opts_kwargs = {}
-    if jax.process_count() > 1:
-        mgr_opts_kwargs["multiprocessing_options"] = ocp.options.MultiprocessingOptions(primary_host=None)
-
+    # Multi-node checkpointing WITHOUT a shared filesystem: save_state gathers the pytree
+    # to plain host numpy (process_allgather) before saving, so orbax sees non-distributed
+    # arrays and writes a SINGLE self-contained ocdbt.process_0/ from the primary host —
+    # no ocdbt.process_1/, no cross-host base-dir wait, no manifest referencing another
+    # node's shard. The entrypoint then rank-0-only S3-syncs that complete local dir.
+    # Default multiprocessing_options (primary_host=0) is correct for this — process 0 is
+    # the writer, save()/restore() are called on all processes and sync via the network
+    # coordination service (barriers over all processes, no subset). Single-node unchanged.
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
@@ -100,7 +79,6 @@ def initialize_checkpoint_dir(
             keep_period=keep_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
-            **mgr_opts_kwargs,
         ),
     )
 
@@ -132,6 +110,20 @@ def save_state(
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
         train_state, params = _split_params(state)
+
+    # MULTI-NODE: gather the sharded pytree to plain host numpy on every process before
+    # saving. This is the crux of correct multi-node checkpointing WITHOUT a shared
+    # filesystem: process_allgather turns each device-sharded jax.Array into a full numpy
+    # array present on all hosts, so orbax sees NON-distributed arrays and writes a single
+    # self-contained ``ocdbt.process_0/`` from the primary host — no ``ocdbt.process_1/``,
+    # no cross-node coordination, no manifest referencing another node's shard. The
+    # rank-0-only S3 sync then uploads a complete checkpoint. Valid for any mesh (the
+    # gather reconstructs the full array regardless of how it was sharded). No-op cost on
+    # single-node (allgather over 1 process is a device->host copy we'd do anyway).
+    if jax.process_count() > 1:
+        train_state = multihost_utils.process_allgather(train_state, tiled=True)
+        params = multihost_utils.process_allgather(params, tiled=True)
+
     # main's refactor: when not saving the optimizer, simply omit train_state from
     # the saved items (rather than zeroing opt_state) — avoids the TrainState
     # typecheck issue the old opt_state={} path hit, so no extra guard needed.
