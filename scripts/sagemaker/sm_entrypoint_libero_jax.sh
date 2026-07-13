@@ -32,24 +32,46 @@ fi
 # --- multi-node coordinator port (jax.distributed reads hosts from resourceconfig.json) ---
 export SM_MASTER_PORT="${SM_MASTER_PORT:-12355}"
 RC="/opt/ml/input/config/resourceconfig.json"
+IS_RANK0=1
 if [[ -f "$RC" ]]; then
     NUM_HOSTS=$(python3 -c "import json;print(len(json.load(open('$RC'))['hosts']))" 2>/dev/null || echo 1)
+    FIRST_HOST=$(python3 -c "import json;print(sorted(json.load(open('$RC'))['hosts'])[0])" 2>/dev/null || echo "")
     CUR_HOST=$(python3 -c "import json;print(json.load(open('$RC'))['current_host'])" 2>/dev/null || echo "")
-    echo "resourceconfig: hosts=$NUM_HOSTS current=$CUR_HOST"
+    echo "resourceconfig: hosts=$NUM_HOSTS current=$CUR_HOST rank0=$FIRST_HOST"
+    [[ -n "$FIRST_HOST" && "$CUR_HOST" != "$FIRST_HOST" ]] && IS_RANK0=0
 fi
 
-# MULTI-NODE checkpointing: orbax multi-host saves assume a filesystem visible to ALL
-# processes (primary host creates the checkpoint base dir, non-primary hosts wait for
-# it to appear on the SAME path; each host writes its own param shards there). There is
-# NO shared POSIX FS across SageMaker nodes, so we use SageMaker's MANAGED
-# /opt/ml/checkpoints — both nodes' copies sync bidirectionally to the same S3 location,
-# acting as the common store. (Per-node local EBS + rank-0-only sync does NOT work
-# multi-node: process 1's shards live on node 2's disk and rank-0 can't upload them, and
-# orbax's cross-host base-dir wait times out.) The array_metadata store is disabled in
-# checkpoints.py so the eventually-consistent mount doesn't crash finalize / the
-# base-dir coordination. launch.py leaves managed checkpoint sync ON for this entrypoint.
-CKPT_DIR="/opt/ml/checkpoints"
+# MULTI-NODE checkpointing: the trainer scopes the orbax save to PROCESS 0 ONLY
+# (active_processes={0}) and writes the FULL model (use_replica_parallel=False), which is
+# valid because the model is REPLICATED across nodes (FSDP shards within a node; the node
+# axis is a data-parallel replica). So process 0 (== rank-0 host) writes a COMPLETE
+# checkpoint to its OWN local EBS — no shared filesystem, no cross-node coordination.
+# We then S3-sync it OURSELVES from rank 0 only (managed /opt/ml/checkpoints is a
+# per-node dir + racy dual sync that corrupted the checkpoint before). Non-rank-0 nodes
+# have no checkpoint to upload.
+CKPT_DIR="/opt/ml/local_checkpoints"
 mkdir -p "$CKPT_DIR" /opt/ml/output/wandb
+[[ "$IS_RANK0" == "0" ]] && echo "Not rank 0: skipping S3 checkpoint sync (process 0 owns the full checkpoint)."
+
+SYNC_PID=""
+if [[ "$IS_RANK0" == "1" && -n "${CHECKPOINT_S3_URI:-}" ]]; then
+    echo "Periodic checkpoint upload: $CKPT_DIR -> ${CHECKPOINT_S3_URI} (every ${CKPT_SYNC_INTERVAL:-1800}s)"
+    (
+        while true; do
+            sleep "${CKPT_SYNC_INTERVAL:-1800}"
+            aws s3 sync "$CKPT_DIR" "${CHECKPOINT_S3_URI}" --exclude "*.orbax-checkpoint-tmp-*/*" --only-show-errors || true
+        done
+    ) &
+    SYNC_PID=$!
+fi
+final_sync() {
+    [[ -n "$SYNC_PID" ]] && kill "$SYNC_PID" 2>/dev/null || true
+    if [[ "$IS_RANK0" == "1" && -n "${CHECKPOINT_S3_URI:-}" ]]; then
+        echo "Final checkpoint upload: $CKPT_DIR -> ${CHECKPOINT_S3_URI}"
+        aws s3 sync "$CKPT_DIR" "${CHECKPOINT_S3_URI}" --delete --only-show-errors || true
+    fi
+}
+trap final_sync EXIT
 
 EXTRA_ARGS=()
 [[ "${OVERWRITE:-0}" == "1" ]] && EXTRA_ARGS+=("--overwrite")
@@ -61,15 +83,19 @@ EXTRA_ARGS=()
 
 NGPU="$(nvidia-smi -L | wc -l)"
 echo "=== SageMaker openpi LIBERO multi-node JAX launch ==="
-echo "config=$CONFIG  exp=$EXP  gpus/node=$NGPU"
+echo "config=$CONFIG  exp=$EXP  gpus/node=$NGPU  rank0=$IS_RANK0"
 echo "base_ckpt=${OPENPI_WEIGHT_LOADER_PARAMS_PATH:-<config default>}"
-echo "checkpoints=$CKPT_DIR (SageMaker-managed sync to checkpoint_s3_uri)"
+echo "checkpoints=$CKPT_DIR (process-0 full write; rank-0 self-sync to ${CHECKPOINT_S3_URI:-<none>})"
 echo "extra_args=${EXTRA_ARGS[*]:-}"
 echo "===================================================="
 
-exec python scripts/train.py \
+# NOT exec — keep the shell alive so the EXIT trap (final_sync) runs. Propagate exit code.
+python scripts/train.py \
     "$CONFIG" \
     --exp-name="$EXP" \
     --assets-base-dir="$ASSETS_DIR" \
     --checkpoint-base-dir="$CKPT_DIR" \
     "${EXTRA_ARGS[@]}"
+TRAIN_RC=$?
+echo "Trainer exited with code $TRAIN_RC"
+exit $TRAIN_RC

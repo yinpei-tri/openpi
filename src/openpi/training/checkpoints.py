@@ -17,33 +17,43 @@ import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
 
-def _disable_array_metadata_store() -> None:
-    """Disable orbax's per-process ArrayMetadata store (orbax >=0.11).
+def _configure_array_handler_single_host() -> None:
+    """Configure orbax's jax.Array handler for SINGLE-HOST checkpoint writes.
 
-    That store makes the primary host create an ``array_metadatas/`` base dir and
-    non-primary hosts WAIT for it to appear on the same path. On SageMaker there is no
-    shared POSIX FS across nodes, so process 1 waits 600s for a dir process 0 created on
-    a different node's disk, times out, and aborts the save (also causes the
-    finalize JSONDecodeError on the eventually-consistent /opt/ml/checkpoints mount).
-    The store only carries optional subchunk metadata (older orbax had none), so
-    disabling it is safe and removes the cross-host base-dir coordination. Each host
-    still writes its own param shards; the shared /opt/ml/checkpoints (S3-synced) is the
-    common store. Must be called before the CheckpointManager is built.
+    Two settings, both needed so process 0 alone writes a COMPLETE checkpoint to its own
+    local disk (no shared filesystem, no cross-node coordination):
+
+    - ``array_metadata_store=None``: disables the per-process ArrayMetadata store. That
+      store makes the primary host create an ``array_metadatas/`` base dir and other
+      hosts WAIT for it on the SAME path — impossible across SageMaker's per-node local
+      disks (times out; also caused the finalize JSONDecodeError on the S3-synced mount).
+      Optional subchunk metadata; safe to drop.
+
+    - ``use_replica_parallel=False``: by default orbax splits a replicated array's WRITE
+      across replica hosts to go faster (process 0 writes ~5 GB, process 1 the other
+      ~7 GB). On per-node filesystems those halves land in different places and the
+      final dir gets only one -> incomplete, unloadable checkpoint. With this off, the
+      single writing host emits ALL bytes, so process 0's dir is a complete checkpoint.
+
+    Valid because the model is REPLICATED across nodes here (FSDP shards on the fsdp axis
+    only; the batch/node axis is a data-parallel replica), so process 0 holds the whole
+    model. NOT valid if params are ever sharded across nodes (e.g. fsdp == total devices
+    spanning nodes). Must be called before the CheckpointManager is built.
     """
     try:
         ocp.type_handlers.register_type_handler(
             jax.Array,
-            ocp.type_handlers.ArrayHandler(array_metadata_store=None),
+            ocp.type_handlers.ArrayHandler(array_metadata_store=None, use_replica_parallel=False),
             override=True,
         )
     except Exception:  # noqa: BLE001 - best-effort; never block training on this
-        logging.warning("Could not disable orbax ArrayMetadata store; continuing with defaults.")
+        logging.warning("Could not configure single-host orbax ArrayHandler; continuing with defaults.")
 
 
 def initialize_checkpoint_dir(
     checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
 ) -> tuple[ocp.CheckpointManager, bool]:
-    _disable_array_metadata_store()
+    _configure_array_handler_single_host()
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
     if checkpoint_dir.exists():
@@ -61,6 +71,18 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    # Multi-node: scope the save to process 0 ONLY (active_processes={0}). The model is
+    # replicated across nodes (FSDP shards on the fsdp axis; the node axis is a
+    # data-parallel replica), so process 0 holds the whole model and — with
+    # use_replica_parallel=False above — writes a COMPLETE checkpoint to its own local
+    # disk with no cross-node coordination or shared filesystem. save()/restore() are
+    # still CALLED on all processes (orbax syncs the active subset internally). On a
+    # single process this is a no-op. WARNING: only correct while params are replicated
+    # across nodes — do NOT use with params sharded across nodes.
+    mp_options = None
+    if jax.process_count() > 1:
+        mp_options = ocp.options.MultiprocessingOptions(primary_host=0, active_processes={0})
+
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
@@ -73,6 +95,7 @@ def initialize_checkpoint_dir(
             keep_period=keep_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
+            multiprocessing_options=mp_options,
         ),
     )
 

@@ -306,7 +306,10 @@ def main() -> None:
     # (both nodes' copies sync to the same S3), and managed sync must stay ON.
     _entrypoint = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh")
     is_jax = _entrypoint.endswith("_jax.sh")
-    self_manages_ckpt = _entrypoint == "sm_entrypoint_jax.sh"  # robocasa single-node only
+    # All JAX entrypoints self-manage the S3 checkpoint sync (rank-0 `aws s3 sync` from
+    # local EBS). robocasa: single-node. libero-multinode: process-0 writes the full
+    # (replicated) model + rank-0 sync. Either way managed sync must be OFF.
+    self_manages_ckpt = is_jax
     env["CHECKPOINT_S3_URI"] = checkpoint_s3_uri
     # Periodic background-sync interval for the JAX entrypoint (seconds). Optional in
     # the config; the entrypoint defaults to 1800 if unset.
