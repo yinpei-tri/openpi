@@ -175,11 +175,17 @@ class LiberoWebDataset:
         return self._proc_idx, self._proc_cnt
 
     def _worker_shards(self) -> list[str]:
-        """Shards for THIS (jax-process, torch-worker), shuffled per epoch.
+        """Shards for THIS (jax-process, torch-worker), reshuffled per epoch.
 
-        Split order: shuffle all shards deterministically (same seed on every process so
-        the global order agrees), then take this process's stride, then this worker's
-        stride within the process. Guarantees disjoint coverage across all feeders.
+        Ordering is CRITICAL for multi-node correctness. Process ownership must be
+        assigned BEFORE the per-epoch reshuffle, using an epoch-INDEPENDENT seed:
+        epochs advance independently per host (__iter__ bumps self._epoch when a host
+        finishes a pass), so if we shuffled by seed+epoch and THEN sliced by process, a
+        host at epoch 1 and a host at epoch 0 would shuffle differently and their
+        shards[proc::cnt] slices would OVERLAP -> duplicate training data. So:
+          1. shuffle by a fixed seed (same on every process, every epoch) and slice by
+             process -> each process owns a PERMANENT disjoint set, invariant to skew.
+          2. reshuffle that fixed slice by seed+epoch for order diversity across passes.
         """
         proc_idx, proc_cnt = self._process_info()
         try:
@@ -191,9 +197,12 @@ class LiberoWebDataset:
         worker_id = winfo.id if winfo is not None else 0
         num_workers = winfo.num_workers if winfo is not None else 1
 
+        # self._shards is a deterministic sorted list (list_shards sorts), so a fixed-seed
+        # shuffle produces the SAME order on every process regardless of epoch.
         shards = list(self._shards)
-        random.Random(self.cfg.seed + self._epoch).shuffle(shards)  # SAME order on all procs
-        shards = shards[proc_idx::proc_cnt]  # this node's disjoint slice
+        random.Random(self.cfg.seed).shuffle(shards)  # epoch-INDEPENDENT ownership assignment
+        shards = shards[proc_idx::proc_cnt]  # this process's PERMANENT disjoint slice
+        random.Random(self.cfg.seed + self._epoch).shuffle(shards)  # per-epoch order within the slice
         if num_workers > 1:
             shards = shards[worker_id::num_workers]  # this worker's slice within the node
 
