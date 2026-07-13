@@ -96,7 +96,12 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
     if resuming:
         run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
+        # resume="allow" (not "must"): resume the run if it exists on the server, else
+        # start a fresh run with this id. "must" crashes when the prior run was never
+        # registered (e.g. the source job was stopped early). On multi-node this crash
+        # happens on process 0 ONLY, desyncing the job -> the surviving process hangs at
+        # the shutdown barrier (DEADLINE_EXCEEDED, 1/2 tasks). "allow" makes resume robust.
+        wandb.init(id=run_id, resume="allow", project=config.project_name)
     else:
         wandb.init(
             name=config.exp_name,
