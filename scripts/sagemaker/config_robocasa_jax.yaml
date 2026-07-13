@@ -13,8 +13,8 @@ aws:
   role_arn: arn:aws:iam::124224456861:role/service-role/SageMaker-SageMakerAllAccess
 
 job:
-  user: yinpeidai
-  name_prefix: pi05-robocasa-s1-jax
+  user: yinpei
+  name_prefix: pi05-robocasa
   max_run_days: 14
   volume_size: 300            # shards ~16GB + anchors + checkpoints + caches
   tags:

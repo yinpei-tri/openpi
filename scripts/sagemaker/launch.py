@@ -177,9 +177,17 @@ def sanitize(name: str) -> str:
     return name.strip("-") or "job"
 
 
-def make_job_name(prefix: str, user: str) -> str:
-    base = sanitize(f"{user}-{prefix}" if prefix else user)
-    stamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+def make_job_name(prefix: str, user: str, exp_name: str = "") -> str:
+    """SageMaker job name — kept semantic so it's readable in CloudWatch.
+
+    Format: ``{user}-{prefix}-{exp_name}-{MM-DD-HH-MM-SS}`` (year dropped to save chars;
+    MM-DD-HH-MM-SS is unique enough within a project). Injecting ``exp_name`` (e.g.
+    "full400k") is what makes one run distinguishable from another at a glance — set a
+    short, descriptive ``name_prefix`` (e.g. "pi05-robocasa") and a short ``exp_name``.
+    """
+    parts = [p for p in (user, prefix, exp_name) if p]
+    base = sanitize("-".join(parts))
+    stamp = datetime.now().strftime("%m-%d-%H-%M-%S")
     return f"{base}-{stamp}"[:63].rstrip("-")
 
 
@@ -285,7 +293,7 @@ def main() -> None:
     for k, v in secrets.items():
         env.setdefault(k, v)
 
-    job_name = make_job_name(cfg["job"]["name_prefix"], cfg["job"]["user"])
+    job_name = make_job_name(cfg["job"]["name_prefix"], cfg["job"]["user"], cfg["training"].get("exp_name", ""))
     max_run_seconds = int(cfg["job"]["max_run_days"]) * 24 * 60 * 60
 
     # Build the inputs dict — one TrainingInput per channel so we can pin
