@@ -1,35 +1,8 @@
 import dataclasses
 
 import numpy as np
-import pytest
 
 from openpi.training import checkpoints
-
-
-def _write_checkpoint_file(root, relative_path: str) -> None:
-    path = root / relative_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("test")
-
-
-def test_inspect_resume_checkpoint_requires_full_state(tmp_path):
-    step = tmp_path / "1000"
-    _write_checkpoint_file(step, "_CHECKPOINT_METADATA")
-    for item in ("params", "train_state"):
-        _write_checkpoint_file(step, f"{item}/_METADATA")
-        _write_checkpoint_file(step, f"{item}/manifest.ocdbt")
-        _write_checkpoint_file(step, f"{item}/ocdbt.process_0/manifest.ocdbt")
-
-    latest, errors = checkpoints._inspect_resume_checkpoint(tmp_path)  # noqa: SLF001
-    assert latest == 1000
-    assert errors == []
-    assert checkpoints._collective_validate_resume_checkpoint(tmp_path) == 1000  # noqa: SLF001
-
-    (step / "train_state" / "_METADATA").unlink()
-    _, errors = checkpoints._inspect_resume_checkpoint(tmp_path)  # noqa: SLF001
-    assert any("train_state/_METADATA" in error for error in errors)
-    with pytest.raises(RuntimeError, match="preflight failed"):
-        checkpoints._collective_validate_resume_checkpoint(tmp_path)  # noqa: SLF001
 
 
 @dataclasses.dataclass

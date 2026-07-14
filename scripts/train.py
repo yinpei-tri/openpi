@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import functools
 import logging
@@ -23,11 +24,11 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.distributed as _distributed
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
-import openpi.training.distributed as _distributed
 
 
 def robocasa_exp_tag(config: _config.TrainConfig) -> str:
@@ -91,22 +92,41 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.init(mode="disabled")
         return
 
-    ckpt_dir = config.checkpoint_dir
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+    # W&B is process-0-only, non-essential telemetry. NEVER let a transient W&B failure
+    # (auth/network/stale run id) raise on process 0 and kill the distributed job while
+    # the other processes proceed into collectives. On any error, fall back to disabled
+    # logging and continue training. NOTE: this stays a purely LOCAL, process-0 concern —
+    # no cross-process barrier here (a barrier around wandb is exactly what deadlocked the
+    # multi-node run before). The other processes independently call wandb.init(disabled).
+    try:
+        ckpt_dir = config.checkpoint_dir
+        if not ckpt_dir.exists():
+            raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+        if resuming:
+            run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+            wandb.init(id=run_id, resume="must", project=config.project_name)
+        else:
+            wandb.init(
+                name=config.exp_name,
+                config=dataclasses.asdict(config),
+                project=config.project_name,
+            )
+            (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
-    if log_code:
-        wandb.run.log_code(epath.Path(__file__).parent.parent)
+        if log_code:
+            wandb.run.log_code(epath.Path(__file__).parent.parent)
+    except Exception:  # noqa: BLE001 - telemetry must never crash/desync training
+        logging.exception("wandb.init failed; continuing with W&B logging DISABLED (training unaffected).")
+        with contextlib.suppress(Exception):
+            wandb.init(mode="disabled")
+
+
+def log_wandb(data: dict, *, step: int) -> None:
+    """wandb.log that never raises — telemetry must not crash/desync training."""
+    try:
+        wandb.log(data, step=step)
+    except Exception:  # noqa: BLE001 - telemetry must never crash training
+        logging.exception("wandb.log failed; continuing training")
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -320,12 +340,17 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     except Exception as _e:  # noqa: BLE001 - debug only
         logging.info(f"[data-dist] shard introspection skipped: {_e}")
 
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    # Log images from first batch to sanity check. Guarded: image construction / wandb.log
+    # must never crash the (multi-node) job. Runs on all processes — a no-op where wandb is
+    # disabled — so there is no asymmetric collective / barrier.
+    try:
+        images_to_log = [
+            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        ]
+        log_wandb({"camera_views": images_to_log}, step=0)
+    except Exception:  # noqa: BLE001 - telemetry must never crash training
+        logging.exception("W&B camera preview failed; continuing training")
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -361,7 +386,7 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            log_wandb(reduced_info, step=step)
             infos = []
         batch = next(data_iter)
 

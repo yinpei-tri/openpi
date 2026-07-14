@@ -120,9 +120,14 @@ def save_state(
     # rank-0-only S3 sync then uploads a complete checkpoint. Valid for any mesh (the
     # gather reconstructs the full array regardless of how it was sharded). No-op cost on
     # single-node (allgather over 1 process is a device->host copy we'd do anyway).
+    # Only gather what we actually SAVE: when save_optimizer=False we skip the train_state
+    # gather (it would all-gather ~20GB+ of optimizer + running params to host RAM on every
+    # node just to discard it — wasted bandwidth + a needless cross-node collective). params
+    # here is the EMA (inference) weights.
     if jax.process_count() > 1:
-        train_state = multihost_utils.process_allgather(train_state, tiled=True)
         params = multihost_utils.process_allgather(params, tiled=True)
+        if save_optimizer:
+            train_state = multihost_utils.process_allgather(train_state, tiled=True)
 
     # main's refactor: when not saving the optimizer, simply omit train_state from
     # the saved items (rather than zeroing opt_state) — avoids the TrainState

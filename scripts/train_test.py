@@ -13,24 +13,34 @@ from . import train
 
 
 def test_wandb_init_failure_is_nonfatal(tmp_path, monkeypatch):
+    # A transient wandb.init failure on the (process-0) logger must NOT raise — it would
+    # kill one process of a distributed job and hang the rest at the shutdown barrier.
+    # init_wandb catches it and falls back to a disabled run.
     (tmp_path / "wandb_id.txt").write_text("missing-run")
     config = types.SimpleNamespace(checkpoint_dir=tmp_path, project_name="test")
 
-    def fail_init(**_kwargs):
+    calls = []
+
+    def fake_init(**kwargs):
+        # First (real) init raises; the disabled fallback (mode="disabled") succeeds.
+        if kwargs.get("mode") == "disabled":
+            calls.append("disabled")
+            return
         raise RuntimeError("wandb unavailable")
 
-    monkeypatch.setattr(train.wandb, "init", fail_init)
-    monkeypatch.setattr(train.wandb, "finish", lambda **_kwargs: None)
-
-    assert not train.init_wandb(config, resuming=True)
-
-    missing_config = types.SimpleNamespace(checkpoint_dir=tmp_path / "missing", project_name="test")
-    assert not train.init_wandb(missing_config, resuming=True)
+    monkeypatch.setattr(train.wandb, "init", fake_init)
+    # Must not raise, and must fall back to a disabled init.
+    train.init_wandb(config, resuming=True, enabled=True)
+    assert calls == ["disabled"]
 
 
 def test_wandb_log_failure_is_nonfatal(monkeypatch):
-    monkeypatch.setattr(train.wandb, "log", lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError()))
-    train.log_wandb({"loss": 1.0}, step=1, enabled=True)
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("wandb.log down")
+
+    monkeypatch.setattr(train.wandb, "log", boom)
+    # Must not raise.
+    train.log_wandb({"loss": 1.0}, step=1)
 
 
 @pytest.mark.parametrize("config_name", ["debug"])
