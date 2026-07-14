@@ -32,12 +32,38 @@ ROBOCASA_DIR="/opt/ml/input/data/robocasa"
 BASE_CKPT_DIR="/opt/ml/input/data/base_ckpt"
 ASSETS_DIR="/opt/ml/code/assets"
 
-if [[ ! -d "$ROBOCASA_DIR/shards" ]]; then
-    echo "ERROR: $ROBOCASA_DIR/shards missing. Upload the dataset channel." >&2
-    exit 1
+# Data source: two modes.
+#   (download) If ROBOCASA_DATA_S3_URI is set, `aws s3 sync` the whole dataset to a local
+#     EBS dir ONCE up front and read from local disk for the rest of the run. This fully
+#     avoids the FastFile FUSE mount (no ENOTCONN mid-run mount-drop, fastest reads) — the
+#     right choice for a long on-demand run. volume_size must fit the dataset + checkpoints.
+#   (mount) Otherwise, read from the FastFile-mounted channel at /opt/ml/input/data/robocasa.
+if [[ -n "${ROBOCASA_DATA_S3_URI:-}" ]]; then
+    LOCAL_DATA="/opt/ml/local_data"
+    mkdir -p "$LOCAL_DATA"
+    # High-concurrency sync (bandwidth-bound on ~12k big shards, not latency-bound).
+    aws configure set default.s3.max_concurrent_requests 100
+    aws configure set default.s3.max_queue_size 10000
+    echo "=== Downloading dataset to local EBS: ${ROBOCASA_DATA_S3_URI} -> $LOCAL_DATA ==="
+    _dl_start=$(date +%s)
+    aws s3 sync "${ROBOCASA_DATA_S3_URI}" "$LOCAL_DATA" --only-show-errors
+    echo "=== Download finished in $(( ($(date +%s) - _dl_start) / 60 )) min ==="
+    df -h "$LOCAL_DATA" | tail -1
+    if [[ ! -d "$LOCAL_DATA/shards" ]]; then
+        echo "ERROR: $LOCAL_DATA/shards missing after sync from ${ROBOCASA_DATA_S3_URI}." >&2
+        exit 1
+    fi
+    n_tar=$(find "$LOCAL_DATA/shards" -name '*.tar' | wc -l)
+    echo "Local shards: $n_tar"
+    export ROBOCASA_SHARDS_DIR="$LOCAL_DATA/shards"
+else
+    if [[ ! -d "$ROBOCASA_DIR/shards" ]]; then
+        echo "ERROR: $ROBOCASA_DIR/shards missing. Upload the dataset channel (or set ROBOCASA_DATA_S3_URI to download)." >&2
+        exit 1
+    fi
+    # Point the RoboCasa config at the FastFile-mounted shards (loader derives anchors/ sibling).
+    export ROBOCASA_SHARDS_DIR="$ROBOCASA_DIR/shards"
 fi
-# Point the RoboCasa config at the mounted shards (loader derives anchors/ sibling).
-export ROBOCASA_SHARDS_DIR="$ROBOCASA_DIR/shards"
 
 if [[ ! -f "$ASSETS_DIR/$CONFIG/robocasa_system1/norm_stats.json" ]]; then
     echo "ERROR: norm_stats.json missing under $ASSETS_DIR/$CONFIG/robocasa_system1/. Rebuild the image." >&2

@@ -14,6 +14,7 @@ image with three input channels (libero, base_ckpt, assets) — see config.yaml.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import time
@@ -210,6 +211,165 @@ def load_secrets(path: str = "secrets.env") -> dict[str, str]:
 
 
 # -----------------------------------------------------------------------------
+# Per-job manifest (submitted_jobs/) — the durable record of every submission
+# -----------------------------------------------------------------------------
+def _git_commit() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT, text=True).strip()
+    except Exception:
+        return "unknown"
+
+
+def _extract_arg(arg_str: str, flag: str) -> str | None:
+    """Pull a `--flag=value` or `--flag value` out of a trainer extra_args string."""
+    toks = arg_str.split()
+    for i, t in enumerate(toks):
+        if t == flag and i + 1 < len(toks):
+            return toks[i + 1]
+        if t.startswith(flag + "="):
+            return t.split("=", 1)[1]
+    return None
+
+
+def _sync_norm_stats_from_channel(cfg: dict, *, dry_run: bool) -> None:
+    """Install norm_stats.json from the robocasa data channel's S3 root into the baked
+    assets dir, so the image ALWAYS ships the stats matched to the data this job trains
+    on. Eliminates the manual, error-prone per-run swap. No-op if the channel/stats
+    aren't found (leaves whatever is on disk). RoboCasa (system1) only.
+
+    Layout: <channel s3 root>/norm_stats.json  ->  assets/<config>/robocasa_system1/norm_stats.json
+    (the config's DataConfig asset_id is 'robocasa_system1').
+    """
+    ch = cfg.get("data", {}).get("channels", {}).get("robocasa")
+    if not ch or "robocasa" not in cfg["training"]["config"]:
+        return
+    src = ch["s3_uri"].rstrip("/") + "/norm_stats.json"
+    dst = REPO_ROOT / "assets" / cfg["training"]["config"] / "robocasa_system1" / "norm_stats.json"
+    if dry_run:
+        print(f"[norm_stats] would install {src} -> {dst.relative_to(REPO_ROOT)}")
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    region = cfg["aws"]["region"]
+    profile = cfg["aws"]["profile"]
+    try:
+        run(f"aws s3 cp {src} {dst} --region {region} --profile {profile} --only-show-errors")
+        print(f"[norm_stats] installed {src} -> {dst.relative_to(REPO_ROOT)}")
+    except Exception as e:
+        raise SystemExit(
+            f"[norm_stats] FAILED to fetch {src} (needed to bake matched norm_stats): {e}. "
+            "Ensure the dataset root has norm_stats.json, or install it manually."
+        ) from e
+
+
+def _norm_stats_fingerprint(config_name: str) -> dict:
+    """Summarize the norm_stats.json that WILL be baked (already installed on disk by
+    _sync_norm_stats_from_channel): sha256 + per-key dims + a couple of summary values.
+    Lets you verify at a glance which normalization a job used, and detect drift."""
+    import hashlib
+
+    path = REPO_ROOT / "assets" / config_name / "robocasa_system1" / "norm_stats.json"
+    if not path.exists():
+        return {"present": False}
+    raw = path.read_bytes()
+    fp = {"present": True, "sha256": hashlib.sha256(raw).hexdigest()[:16], "bytes": len(raw)}
+    try:
+        ns = json.loads(raw).get("norm_stats", {})
+        for k, v in ns.items():
+            m = v.get("mean") or []
+            fp[k] = {"dim": len(m), "mean0": round(m[0], 5) if m else None}
+    except Exception:
+        pass
+    return fp
+
+
+def _write_job_manifest(
+    *, job_name, queue_name, image_uri, env, inputs, cfg, config_name, exp_name, checkpoint_s3_uri, output_s3_uri, max_run_seconds
+) -> None:
+    """Write a self-contained record of this submission to scripts/sagemaker/submitted_jobs/
+    (both .json for tooling and .md for reading). Captures everything you'd otherwise have to
+    reconstruct later: job id, wandb project, data channels + URIs, image tag, config +
+    key trainer args, checkpoint S3 location, queue/priority, and the git commit."""
+    out_dir = REPO_ROOT / "scripts" / "sagemaker" / "submitted_jobs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    channels = {
+        name: {"s3_uri": ti.config["DataSource"]["S3DataSource"]["S3Uri"], "input_mode": ti.config["InputMode"]}
+        for name, ti in inputs.items()
+    }
+    ckpt_dir = f"{checkpoint_s3_uri}{config_name}/{exp_name}/"
+    rec = {
+        "job_name": job_name,
+        "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "git_commit": _git_commit(),
+        "queue": queue_name,
+        "priority": cfg["queue"]["priority"],
+        "instance": {"type": cfg["instance"]["type"], "count": cfg["instance"]["count"], "volume_size_gb": cfg["job"]["volume_size"]},
+        "max_run_days": cfg["job"]["max_run_days"],
+        "image_uri": image_uri,
+        "train_config": config_name,
+        "exp_name": exp_name,
+        "comment": cfg["training"].get("comment", ""),
+        "train_args": cfg["training"].get("extra_args", ""),
+        # How the container reads training data:
+        #   "download-ebs" : entrypoint aws-s3-syncs the dataset to local EBS, reads local disk
+        #                    (set via data.download_s3_uri; robust, no FUSE, fastest reads)
+        #   "fastfile"     : reads the FastFile FUSE-mounted channel (streamed, no download)
+        "data_loading": "download-ebs" if env.get("ROBOCASA_DATA_S3_URI") else "fastfile",
+        "download_to_local": env.get("ROBOCASA_DATA_S3_URI", ""),
+        # The JAX trainer logs to config.project_name, set by --project-name in extra_args
+        # (NOT the yaml wandb.project, which only feeds the unused WANDB_PROJECT env). Report
+        # the EFFECTIVE project the run actually appears under; fall back to the yaml value.
+        "wandb_project": (
+            _extract_arg(cfg["training"].get("extra_args", ""), "--project-name")
+            or (cfg["wandb"]["project"] if cfg["wandb"]["enabled"] else "(disabled)")
+        ),
+        # The wandb RUN id is generated inside the container at init and written to
+        # <ckpt_dir>/wandb_id.txt — recorded here as a pointer (not known at submit time).
+        "wandb_id_file": f"{ckpt_dir}wandb_id.txt",
+        "data_channels": channels,
+        # Fingerprint (sha256 + dims + mean[0]) of the norm_stats baked into THIS job's
+        # image, so you can verify/trace exactly which normalization was used.
+        "norm_stats": _norm_stats_fingerprint(config_name),
+        "checkpoint_s3_dir": ckpt_dir,
+        "output_artifacts": f"{output_s3_uri}/{job_name}/output.tar.gz",
+        "ckpt_download_cmd": f"aws s3 sync {ckpt_dir} ./checkpoints/{config_name}/{exp_name}/ --profile {cfg['aws']['profile']}",
+    }
+    (out_dir / f"{job_name}.json").write_text(json.dumps(rec, indent=2) + "\n")
+
+    # Also preserve the EXACT norm_stats.json bytes baked into this job (not just the
+    # fingerprint), so the run is fully reproducible from the record alone.
+    ns_src = REPO_ROOT / "assets" / config_name / "robocasa_system1" / "norm_stats.json"
+    if ns_src.exists():
+        (out_dir / f"{job_name}.norm_stats.json").write_text(ns_src.read_text())
+
+    md = [
+        f"# {job_name}",
+        "",
+        *([f"> {rec['comment']}", ""] if rec["comment"] else []),
+        f"- **submitted:** {rec['submitted_at']}  (git `{rec['git_commit']}`)",
+        f"- **queue:** {queue_name}  (priority {rec['priority']})",
+        f"- **instance:** {rec['instance']['count']}x {rec['instance']['type']}, EBS {rec['instance']['volume_size_gb']}GB, max {rec['max_run_days']}d",
+        f"- **image:** `{image_uri}`",
+        f"- **config:** {config_name}  |  **exp_name:** {exp_name}",
+        f"- **train_args:** `{rec['train_args']}`",
+        f"- **data_loading:** {rec['data_loading']}"
+        + (f" (from {rec['download_to_local']})" if rec["download_to_local"] else " (FastFile FUSE mount)"),
+        f"- **wandb:** project `{rec['wandb_project']}`  (run id -> `{rec['wandb_id_file']}`)",
+        "- **data channels:**",
+        *[f"    - {n}: {c['s3_uri']} ({c['input_mode']})" for n, c in channels.items()],
+        f"- **norm_stats:** sha256 `{rec['norm_stats'].get('sha256', 'n/a')}` "
+        f"(state dim {rec['norm_stats'].get('state', {}).get('dim', '?')}, "
+        f"actions dim {rec['norm_stats'].get('actions', {}).get('dim', '?')}; "
+        f"full copy: `{job_name}.norm_stats.json`)",
+        f"- **checkpoints:** {ckpt_dir}",
+        f"- **download ckpts:** `{rec['ckpt_download_cmd']}`",
+        "",
+    ]
+    (out_dir / f"{job_name}.md").write_text("\n".join(md))
+    print(f"Job record written: scripts/sagemaker/submitted_jobs/{job_name}.{{json,md}}")
+
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def main() -> None:
@@ -243,6 +403,12 @@ def main() -> None:
     wandb_key = os.environ.get("WANDB_API_KEY") or secrets.get("WANDB_API_KEY")
     if cfg["wandb"]["enabled"] and not wandb_key and not local:
         raise SystemExit("Set $WANDB_API_KEY, add it to scripts/sagemaker/secrets.env, or disable wandb.")
+
+    # Auto-install norm_stats from the dataset's S3 root into the baked assets so it is
+    # ALWAYS matched to the robocasa data channel — no manual per-run edit, no "wrong
+    # stats baked" footgun. Runs only when we actually build (skip-build reuses whatever
+    # is already in the image). Dry-run just reports what it would fetch.
+    _sync_norm_stats_from_channel(cfg, dry_run=dry_run or skip_build)
 
     # Immutable per-build tag so a concurrent :latest push (e.g. a LIBERO experiment on
     # another machine) can't swap this job's container at instance-boot. --skip-build
@@ -282,6 +448,13 @@ def main() -> None:
         "RESUME": "1" if cfg["training"].get("resume") else "0",
         "OVERWRITE": "1" if cfg["training"].get("overwrite") else "0",
     }
+    # Download-to-local data mode (JAX RoboCasa): if data.download_s3_uri is set, the
+    # entrypoint `aws s3 sync`s that s3:// dataset root to local EBS once and reads from
+    # local disk (no FastFile FUSE mount -> no ENOTCONN mid-run, fastest reads). Requires
+    # volume_size to fit the dataset + checkpoints. Unset -> read from the FastFile mount.
+    if cfg["data"].get("download_s3_uri"):
+        env["ROBOCASA_DATA_S3_URI"] = cfg["data"]["download_s3_uri"]
+
     if cfg["wandb"]["enabled"]:
         env["WANDB_PROJECT"] = cfg["wandb"]["project"]
         env["WANDB_MODE"] = "online"
@@ -396,6 +569,23 @@ def main() -> None:
         timeout={"attemptDurationSeconds": max_run_seconds},
     )
     print(f"Queued {job_name} -> {queue_name}")
+
+    # Persist a per-job record so we never lose track of which job used which data /
+    # image / config / where its checkpoints + wandb live. One file per job under
+    # scripts/sagemaker/submitted_jobs/ — no in-place file mutation to reconstruct later.
+    _write_job_manifest(
+        job_name=job_name,
+        queue_name=queue_name,
+        image_uri=image_uri,
+        env=env,
+        inputs=inputs,
+        cfg=cfg,
+        config_name=config_name,
+        exp_name=exp_name,
+        checkpoint_s3_uri=checkpoint_s3_uri,
+        output_s3_uri=output_s3_uri,
+        max_run_seconds=max_run_seconds,
+    )
 
 
 if __name__ == "__main__":
