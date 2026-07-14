@@ -1,8 +1,10 @@
 from collections.abc import Iterator, Sequence
 import dataclasses
+import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -366,12 +368,50 @@ class _TorchIterableTransformed(torch.utils.data.IterableDataset):
         if hasattr(self._inner, "set_epoch"):
             self._inner.set_epoch(epoch)
 
+    def set_resume_shards_consumed(self, n: int) -> None:
+        if hasattr(self._inner, "set_resume_shards_consumed"):
+            self._inner.set_resume_shards_consumed(n)
+
     def __iter__(self):
         for sample in self._inner:
             yield self._transform(sample)
 
     def __len__(self) -> int:
         return len(self._inner)
+
+
+def robocasa_samples_per_shard(config: _config.TrainConfig) -> int | None:
+    """Read ``samples_per_shard`` from the RoboCasa dataset's meta.json (the shards dir's
+    parent), for converting a resumed step -> shards-consumed. Returns None if not a
+    RoboCasa webdataset config or meta.json is unreadable (data-resume then no-ops).
+
+    Layout: ``<root>/{shards/, meta.json}`` — meta is the parent of the shards dir.
+    Works for local paths and s3:// (reads the object via boto3).
+    """
+    data_config = config.data.create(config.assets_dirs, config.model)
+    shards = data_config.robocasa_webdataset_shards
+    if not shards:
+        return None
+    # Use the FIRST shard dir if a comma-separated pool was given.
+    first = shards.split(",")[0].strip().rstrip("/")
+    try:
+        if first.startswith("s3://"):
+            from urllib.parse import urlparse
+
+            import boto3
+
+            root = first.rsplit("/", 1)[0]  # strip trailing "shards"
+            u = urlparse(f"{root}/meta.json")
+            body = boto3.client("s3").get_object(Bucket=u.netloc, Key=u.path.lstrip("/"))["Body"].read()
+            meta = json.loads(body)
+        else:
+            meta_path = pathlib.Path(first).parent / "meta.json"
+            meta = json.loads(meta_path.read_text())
+        n = int(meta.get("samples_per_shard", 0))
+        return n or None
+    except Exception as e:
+        logging.warning(f"Could not read samples_per_shard from meta.json ({first}): {e!r}")
+        return None
 
 
 def create_robocasa_webdataset_data_loader(
@@ -540,6 +580,12 @@ class TorchDataLoader:
     def torch_loader(self) -> torch.utils.data.DataLoader:
         return self._data_loader
 
+    def set_resume_shards_consumed(self, n: int) -> None:
+        """Forward the data-resume shard count to the underlying (iterable) dataset."""
+        ds = self._data_loader.dataset
+        if hasattr(ds, "set_resume_shards_consumed"):
+            ds.set_resume_shards_consumed(n)
+
     def __iter__(self):
         num_items = 0
         while True:
@@ -625,6 +671,12 @@ class DataLoaderImpl(DataLoader):
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
+
+    def set_resume_shards_consumed(self, n: int) -> None:
+        """Data-resume: forward the shard-consumed count to the underlying loader (no-op
+        for loaders/datasets that don't support it, e.g. LeRobot/RLDS)."""
+        if hasattr(self._data_loader, "set_resume_shards_consumed"):
+            self._data_loader.set_resume_shards_consumed(n)
 
     def __iter__(self):
         for batch in self._data_loader:

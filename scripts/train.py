@@ -341,6 +341,24 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     start_step = int(train_state.step)
     tentative_run_step = start_step + 10
 
+    # Data-resume: on a real resume (not the tentative run), skip the shards already
+    # consumed before start_step so a preempted/spot run doesn't replay the first shards
+    # (which would over-sample early data and under-sample the tail on a 1-2 epoch run).
+    # shards_consumed ~= start_step * global_batch_size / samples_per_shard. The loader
+    # (RoboCasa WebDataset) applies a per-worker skip derived from this; other loaders
+    # (LeRobot/RLDS) no-op. Only meaningful when resuming with a positive step.
+    if resuming and start_step > 0:
+        samples_per_shard = _data_loader.robocasa_samples_per_shard(config)
+        if samples_per_shard and hasattr(data_loader, "set_resume_shards_consumed"):
+            shards_consumed = (start_step * config.batch_size) // samples_per_shard
+            data_loader.set_resume_shards_consumed(shards_consumed)
+            logging.info(
+                f"Data-resume: start_step={start_step}, batch={config.batch_size}, "
+                f"samples/shard={samples_per_shard} -> skipping ~{shards_consumed} global shards"
+            )
+            data_iter = iter(data_loader)  # rebuild so the skip takes effect
+            batch = next(data_iter)
+
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,

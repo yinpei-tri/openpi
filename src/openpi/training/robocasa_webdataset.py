@@ -104,6 +104,12 @@ class WebDatasetConfig:
     # cheap belt-and-suspenders on top of OS page cache, not the primary mechanism).
     anchor_cache_size: int = 256
     seed: int = 0
+    # Data-resume: number of GLOBAL shards already consumed before the resumed step
+    # (0 = fresh start). Set at loader build from the checkpoint step so a spot-preempted
+    # run doesn't replay the first shards. The per-worker skip and the starting epoch are
+    # derived from this in _worker_shards / by set_resume_state. Approximate at the sample
+    # level (the reservoir buffer's in-flight samples are dropped), but shard-accurate.
+    resume_shards_consumed: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +245,13 @@ class RoboCasaWebDataset:
         if not self._shards:
             raise ValueError(f"No .tar shards found at {cfg.shards}")
         self._epoch = 0
+        # Data-resume state (derived from cfg.resume_shards_consumed in _init_resume_state):
+        #   _resume_epoch      = the epoch the resumed step falls in (skip applies only here)
+        #   _resume_epoch_skip = GLOBAL shards to skip within that epoch (before per-worker split)
+        self._resume_epoch = 0
+        self._resume_epoch_skip = 0
+        self._resume_skip_logged = False
+        self._init_resume_state()
         # shards may be a comma-separated list of dirs (pooled dataset); split for the
         # per-dir manifest count + anchor-root derivation.
         self._shard_dirs = [s.strip() for s in cfg.shards.split(",") if s.strip()]
@@ -324,6 +337,36 @@ class RoboCasaWebDataset:
     def set_epoch(self, epoch: int) -> None:
         self._epoch = epoch
 
+    def set_resume_shards_consumed(self, n: int) -> None:
+        """Set the GLOBAL shards-consumed count for data resume, then recompute the
+        starting epoch + intra-epoch skip. Called from the trainer once the resumed step
+        is known (the loader is built before the checkpoint step is restored)."""
+        self.cfg = dataclasses.replace(self.cfg, resume_shards_consumed=int(n))
+        self._resume_epoch = 0
+        self._resume_epoch_skip = 0
+        self._resume_skip_logged = False
+        self._epoch = 0
+        self._init_resume_state()
+
+    def _init_resume_state(self) -> None:
+        """Translate cfg.resume_shards_consumed (GLOBAL shards consumed pre-checkpoint)
+        into a starting epoch + an intra-epoch global skip, and START the loader at that
+        epoch so the resumed pass uses the correct seed+epoch shard shuffle.
+
+        n_total = len(self._shards). consumed shards wrap across epochs:
+          resume_epoch      = consumed // n_total
+          resume_epoch_skip = consumed %  n_total   (shards to drop within the resumed epoch)
+        """
+        consumed = int(self.cfg.resume_shards_consumed)
+        if consumed <= 0:
+            return
+        n_total = len(self._shards)
+        self._resume_epoch = consumed // n_total
+        self._resume_epoch_skip = consumed % n_total
+        # Start at the resumed epoch so _worker_shards' seed+epoch shuffle matches the
+        # ordering that produced those consumed shards.
+        self._epoch = self._resume_epoch
+
     def _read_manifest_count(self) -> int:
         # Sum the local manifest(s) across all shard dirs. S3 length is approximate /
         # optional (skipped). Returns 0 if no local manifest is found.
@@ -343,17 +386,47 @@ class RoboCasaWebDataset:
         return self._len
 
     def _worker_shards(self) -> list[str]:
-        """Split shards across torch DataLoader workers + shuffle shard order per epoch."""
+        """Split shards across torch DataLoader workers + shuffle shard order per epoch.
+
+        Data-resume: on the FIRST epoch after a resume (self._epoch == self._resume_epoch),
+        drop the shards this worker already consumed before the checkpoint. Ownership is
+        seed-deterministic, so we can reconstruct exactly which shards each worker had and
+        skip its consumed prefix — no persisted per-worker counter needed. Subsequent
+        epochs (wrap-around) apply no skip.
+        """
         try:
             import torch.utils.data as tud
 
             info = tud.get_worker_info()
         except Exception:
             info = None
+        num_workers = info.num_workers if (info is not None and info.num_workers > 1) else 1
+        worker_id = info.id if (info is not None and info.num_workers > 1) else 0
+
         shards = list(self._shards)
         random.Random(self.cfg.seed + self._epoch).shuffle(shards)
-        if info is not None and info.num_workers > 1:
-            shards = shards[info.id :: info.num_workers]
+        if num_workers > 1:
+            shards = shards[worker_id::num_workers]
+
+        # Per-worker resume skip, applied only on the resumed epoch.
+        if self.cfg.resume_shards_consumed > 0 and self._epoch == self._resume_epoch:
+            # GLOBAL shards consumed this epoch are split evenly across workers; each
+            # worker skips its share of its own (already worker-strided) slice.
+            per_worker_skip = self._resume_epoch_skip // max(num_workers, 1)
+            if per_worker_skip > 0:
+                skipped = min(per_worker_skip, len(shards))
+                if worker_id == 0 and not self._resume_skip_logged:
+                    self._resume_skip_logged = True
+                    logger.info(
+                        "Data-resume: epoch=%d, skipping ~%d shards/worker (global consumed=%d) "
+                        "-> worker slice %d -> %d shards",
+                        self._epoch,
+                        skipped,
+                        self.cfg.resume_shards_consumed,
+                        len(shards),
+                        len(shards) - skipped,
+                    )
+                shards = shards[skipped:]
         return shards
 
     def _build_sample(self, raw: dict[str, bytes], rng: random.Random) -> dict[str, Any] | None:
@@ -464,7 +537,14 @@ class RoboCasaWebDataset:
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         cfg = self.cfg
-        rng = random.Random(cfg.seed + self._epoch * 7919)
+        # Snapshot the epoch for THIS pass. _worker_shards + the reservoir rng both key off
+        # it, so it must stay fixed for the whole pass; we bump self._epoch only after the
+        # pass drains. This is what makes the resume shard-skip ONE-SHOT: pass 0 runs at
+        # epoch == _resume_epoch (skip applies), pass 1 at _resume_epoch+1 (skip disabled),
+        # etc. Without this bump the JAX trainer (which never calls set_epoch) would pin
+        # _epoch forever and re-skip the same shards every pass.
+        epoch = self._epoch
+        rng = random.Random(cfg.seed + epoch * 7919)
         buffer: list[dict[str, Any]] = []
         # Skip-and-continue tolerance (vla_foundry pattern): a shard that fails to
         # open/stream, or a single sample that fails to decode/build, is LOGGED and
@@ -503,3 +583,6 @@ class RoboCasaWebDataset:
         # Drain the remaining buffer in random order.
         rng.shuffle(buffer)
         yield from buffer
+        # Advance the epoch so the NEXT pass reshuffles differently AND the resume
+        # shard-skip becomes a no-op after the resumed epoch (see __iter__ snapshot note).
+        self._epoch = epoch + 1

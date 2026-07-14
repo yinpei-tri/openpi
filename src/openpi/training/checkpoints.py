@@ -108,8 +108,13 @@ def restore_state(
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
-        # Try restoring with full train_state (including optimizer). If the checkpoint
-        # was saved without optimizer state, fall back to restoring only params.
+        # Resume MUST restore the full train_state (step + optimizer + running params).
+        # The old code silently fell back to a params-only restore on ANY exception and
+        # returned the unpopulated ShapeDtypeStruct template as train_state — which
+        # meant a --resume silently continued from step 0 with an uninitialized optimizer
+        # (Adam moments = template, not the saved moments). That is a data/optimizer-loss
+        # footgun, especially on preemptible spot instances where resume is routine. Fail
+        # loudly instead: a resume checkpoint must have been saved with save_optimizer=True.
         try:
             restored = checkpoint_manager.restore(
                 step,
@@ -118,15 +123,14 @@ def restore_state(
                     "params": {"params": params},
                 },
             )
-        except Exception:
-            logging.warning("Could not restore optimizer state from checkpoint, restoring params only")
-            restored = checkpoint_manager.restore(
-                step,
-                items={
-                    "params": {"params": params},
-                },
-            )
-            restored["train_state"] = train_state
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to restore full train_state (step + optimizer) for --resume. The checkpoint "
+                "was likely saved without optimizer state (save_optimizer=False), which cannot be "
+                "resumed (step/optimizer/running-params would stay uninitialized). Re-run the source "
+                "job with save_optimizer=True, or start a fresh run (load params via the weight_loader "
+                "instead of --resume)."
+            ) from e
     return _merge_params(restored["train_state"], restored["params"])
 
 
