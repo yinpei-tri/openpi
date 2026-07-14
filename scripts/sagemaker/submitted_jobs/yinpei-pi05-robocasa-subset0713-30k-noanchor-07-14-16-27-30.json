@@ -1,0 +1,48 @@
+{
+  "job_name": "yinpei-pi05-robocasa-subset0713-30k-noanchor-07-14-16-27-30",
+  "submitted_at": "2026-07-14 16:27:32",
+  "git_commit": "ebbfbe3",
+  "queue": "fss-vla-p5-48xlarge-us-west-2",
+  "priority": 200,
+  "instance": {
+    "type": "p5",
+    "count": 1,
+    "volume_size_gb": 300
+  },
+  "max_run_days": 3,
+  "image_uri": "124224456861.dkr.ecr.us-west-2.amazonaws.com/yinpeidai-openpi-train-jax:20260714-162707",
+  "train_config": "pi05_robocasa_system1",
+  "exp_name": "subset0713_30k_noanchor",
+  "comment": "no anchor images + no role embedding + no anchor state; classes progress head (w0.5, hidden1024) on fully-shuffled subset_0713; ablation vs subset0713_30k",
+  "train_args": "--fsdp-devices=8 --batch-size=128 --ema-decay=0.9999 --num-train-steps=30000 --save-interval=10000 --keep-period=10000 --lr-schedule.warmup-steps=1000 --lr-schedule.peak-lr=1e-4 --lr-schedule.decay-steps=30000 --lr-schedule.decay-lr=1e-5 --model.no-use-anchor-images --data.no-use-anchor-images --data.no-include-anchor-state --project-name=openpi-robocasa-system1",
+  "data_loading": "fastfile",
+  "download_to_local": "",
+  "wandb_project": "openpi-robocasa-system1",
+  "wandb_id_file": "s3://tri-ml-datasets-uw2/yinpeidai/openpi/checkpoints/yinpei-pi05-robocasa-subset0713-30k-noanchor-07-14-16-27-30/pi05_robocasa_system1/subset0713_30k_noanchor/wandb_id.txt",
+  "data_channels": {
+    "robocasa": {
+      "s3_uri": "s3://tri-ml-datasets-uw2/yinpeidai/robocasa_final_training_shard/system1_subset_0713/",
+      "input_mode": "FastFile"
+    },
+    "base_ckpt": {
+      "s3_uri": "s3://tri-ml-datasets-uw2/yinpeidai/openpi/released_ckpt/openpi-assets/checkpoints/pi05_base/",
+      "input_mode": "FastFile"
+    }
+  },
+  "norm_stats": {
+    "present": true,
+    "sha256": "e319bb2cc799965e",
+    "bytes": 4459,
+    "state": {
+      "dim": 28,
+      "mean0": 0.26551
+    },
+    "actions": {
+      "dim": 11,
+      "mean0": 0.05312
+    }
+  },
+  "checkpoint_s3_dir": "s3://tri-ml-datasets-uw2/yinpeidai/openpi/checkpoints/yinpei-pi05-robocasa-subset0713-30k-noanchor-07-14-16-27-30/pi05_robocasa_system1/subset0713_30k_noanchor/",
+  "output_artifacts": "s3://tri-ml-datasets-uw2/yinpeidai/openpi/checkpoints/yinpei-pi05-robocasa-subset0713-30k-noanchor-07-14-16-27-30/output.tar.gz",
+  "ckpt_download_cmd": "aws s3 sync s3://tri-ml-datasets-uw2/yinpeidai/openpi/checkpoints/yinpei-pi05-robocasa-subset0713-30k-noanchor-07-14-16-27-30/pi05_robocasa_system1/subset0713_30k_noanchor/ ./checkpoints/pi05_robocasa_system1/subset0713_30k_noanchor/ --profile sagemaker"
+}
