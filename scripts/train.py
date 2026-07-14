@@ -341,7 +341,9 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        train_state = _checkpoints.restore_state(
+            checkpoint_manager, train_state, data_loader, sharding=train_state_sharding
+        )
 
     # Only process 0 logs. Initialize telemetry after the distributed checkpoint protocol
     # has completed, then synchronize so every process enters training in the same phase.

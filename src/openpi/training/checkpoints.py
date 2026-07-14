@@ -187,10 +187,36 @@ def save_state(
     checkpoint_manager.save(step, items)
 
 
+def _reshard_host_tree_to_devices(state, sharding):
+    """Rebuild each leaf as a globally-sharded jax.Array from a full host array.
+
+    Our multi-node checkpoint design gathers the pytree to plain host numpy before saving
+    (single self-contained ocdbt.process_0). On restore, orbax hands each process back the
+    FULL host array for every leaf. Feeding those numpy arrays into the jitted train step —
+    whose in_shardings carry the non-trivial FSDP sharding — raises "Passing non-trivial
+    shardings for numpy inputs is not allowed". Rebuild each leaf as a global jax.Array:
+    make_array_from_callback invokes the callback only for THIS process's addressable index
+    slices, reading them out of the full host copy, so there is no cross-host transfer.
+    """
+    if sharding is None:
+        return state
+
+    def put(x, s):
+        if s is None:
+            return x
+        if isinstance(x, jax.Array) and getattr(x, "sharding", None) == s:
+            return x  # already a correctly-sharded device array (single-process fast path)
+        host = np.asarray(x)
+        return jax.make_array_from_callback(host.shape, s, lambda index, host=host: host[index])
+
+    return jax.tree.map(put, state, sharding)
+
+
 def restore_state(
     checkpoint_manager: ocp.CheckpointManager,
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
+    sharding: training_utils.TrainState | None = None,
     step: int | None = None,
 ) -> training_utils.TrainState:
     del data_loader
@@ -238,6 +264,13 @@ def restore_state(
             "Resume restore left unmaterialized ShapeDtypeStruct leaves on at least one "
             f"process. Local template paths: {template_paths[:8]}"
         )
+
+    # Multi-node: our save gathers to host numpy, so restore returns FULL host arrays on
+    # every process. The jitted train step's in_shardings carry the non-trivial FSDP
+    # sharding, and JAX rejects numpy inputs for a non-trivially-sharded arg ("Passing
+    # non-trivial shardings for numpy inputs is not allowed"). Rebuild each leaf as a
+    # globally-sharded jax.Array matching train_state_sharding before returning.
+    restored_state = _reshard_host_tree_to_devices(restored_state, sharding)
 
     jax.block_until_ready(restored_state)
     if jax.process_count() > 1:
