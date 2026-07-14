@@ -153,6 +153,12 @@ echo "checkpoints=$CKPT_DIR (process-0 full write; rank-0 self-sync to ${CHECKPO
 echo "extra_args=${EXTRA_ARGS[*]:-}"
 echo "===================================================="
 
+# AWS Batch / SageMaker inject WANDB_RUN_ID / WANDB_NAME / WANDB_RUN_GROUP (the ugly
+# "AWSBatch...-ip-..." string) into the container env. wandb env vars take precedence over
+# some wandb.init args, so unset them here and let the trainer set its OWN id/name
+# (exp_name). Keep WANDB_PROJECT / WANDB_MODE / WANDB_API_KEY, which launch.py sets.
+unset WANDB_RUN_ID WANDB_NAME WANDB_RUN_GROUP WANDB_RESUME
+
 # NOT exec — keep the shell alive so the EXIT trap (final_sync) runs. Propagate exit code.
 # Unbuffered output preserves the first Python traceback if one distributed process fails.
 python -u scripts/train.py \

@@ -104,10 +104,17 @@ def init_wandb(
             run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
             # resume="allow" (not "must"): resume the run if it exists on the server, else
             # start a fresh run with this id. "must" hard-fails when the prior run was
-            # never registered (e.g. the source job was stopped early).
-            wandb.init(id=run_id, resume="allow", project=config.project_name)
+            # never registered (e.g. the source job was stopped early). Pass name= too so
+            # the run shows our exp_name, not the AWS Batch job string, on the resume path.
+            wandb.init(id=run_id, name=config.exp_name, resume="allow", project=config.project_name)
         else:
+            # Force our OWN run id + name. On SageMaker/AWS Batch the runtime injects
+            # WANDB_RUN_ID / WANDB_NAME env vars (the ugly "AWSBatch...-ip-..." string);
+            # passing id/name explicitly to wandb.init overrides that env so the run is
+            # named after exp_name and the id we persist is one WE control.
+            run_id = wandb.util.generate_id()
             wandb.init(
+                id=run_id,
                 name=config.exp_name,
                 config=dataclasses.asdict(config),
                 project=config.project_name,
