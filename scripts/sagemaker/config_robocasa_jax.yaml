@@ -26,7 +26,7 @@ job:
 queue:
   name: vla
   priority: 10
-  share_identifier: default
+  share_identifier: dyp
 
 instance:
   type: p5                    # H100 — the point of going to SageMaker (fast vs local A6000)
