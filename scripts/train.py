@@ -184,6 +184,7 @@ def _fold_progress_ratios(info: dict) -> dict:
     """
     out = {}
     pairs = {}  # ratio_key -> [num, den]
+    confusion = {}  # binary-mode tp/fp/fn/tn counts
     for k, v in info.items():
         if k.startswith("pcls_num/"):
             pairs.setdefault(f"progress_acc_class/{k.split('/', 1)[1]}", [None, None])[0] = v
@@ -193,12 +194,28 @@ def _fold_progress_ratios(info: dict) -> dict:
             pairs.setdefault(f"progress_mae_bin/{k.split('/', 1)[1]}", [None, None])[0] = v
         elif k.startswith("pbin_cnt/"):
             pairs.setdefault(f"progress_mae_bin/{k.split('/', 1)[1]}", [None, None])[1] = v
+        elif k in ("pbin_tp", "pbin_fp", "pbin_fn", "pbin_tn"):
+            confusion[k] = float(v)
         else:
             out[k] = v
     for ratio_key, (num, den) in pairs.items():
         if num is None or den is None:
             continue
         out[ratio_key] = float(num) / float(den) if float(den) > 0 else float("nan")
+    # Binary "finished" head: derive precision/recall/F1/accuracy + the positive rates
+    # from the additive confusion counts. Accuracy is misleading at ~4:1 imbalance, so
+    # precision/recall/F1 are the metrics to watch; pred_pos_rate flags collapse.
+    if len(confusion) == 4:
+        tp, fp, fn, tn = (confusion["pbin_tp"], confusion["pbin_fp"], confusion["pbin_fn"], confusion["pbin_tn"])
+        total = tp + fp + fn + tn
+        prec = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+        rec = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+        out["progress_precision"] = prec
+        out["progress_recall"] = rec
+        out["progress_f1"] = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else float("nan")
+        out["progress_acc"] = (tp + tn) / total if total > 0 else float("nan")
+        out["progress_pred_pos_rate"] = (tp + fp) / total if total > 0 else float("nan")
+        out["progress_true_pos_rate"] = (tp + fn) / total if total > 0 else float("nan")
     return out
 
 

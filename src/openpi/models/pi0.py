@@ -126,6 +126,8 @@ class Pi0(_model.BaseModel):
         self._progress_k = config.progress_k
         self._progress_mode = config.progress_mode
         self._progress_num_classes = config.progress_num_classes
+        self._progress_binary_pos_classes = config.progress_binary_pos_classes
+        self._progress_pos_weight = config.progress_pos_weight
         if config.use_anchor_images:
             # Learned role embedding {current, anchor} added to each image group's tokens
             # so the model can distinguish before vs now (the prefix is a bidirectional
@@ -334,6 +336,35 @@ class Pi0(_model.BaseModel):
                 for c in range(n_cls):
                     metrics[f"pcls_num/{c}"] = num_c[c]
                     metrics[f"pcls_den/{c}"] = den_c[c]
+            elif self._progress_mode == "binary" and progress_class_target is not None:
+                # "Is the subgoal finished?" — single logit, pos_weight-weighted BCE.
+                # Positive = the top `progress_binary_pos_classes` deciles of the discrete
+                # progress class (default classes {K-2,K-1} = frac>=0.8, incl. the settle-pad
+                # complete frames whose class is clipped to K-1). This is the only boundary
+                # System2 acts on, so we spend all head capacity here rather than on the
+                # ambiguous middle deciles that saturate a K-way head at ~65%.
+                logit = logits  # [*b] (num_outputs=1 -> squeezed by the head)
+                pos_thresh = self._progress_num_classes - self._progress_binary_pos_classes
+                labels = (progress_class_target.astype(jnp.int32) >= pos_thresh).astype(logit.dtype)  # [*b]
+                # Weighted BCE-with-logits: weight the FINISHED (positive) term by pos_weight
+                # to counter the ~4:1 imbalance. Stable form: max(z,0) - z*y + log1p(exp(-|z|)),
+                # then scale by a per-sample weight (pos_weight for y=1, else 1).
+                z = logit
+                bce = jnp.maximum(z, 0) - z * labels + jnp.log1p(jnp.exp(-jnp.abs(z)))  # [*b]
+                sample_w = jnp.where(labels > 0.5, self._progress_pos_weight, 1.0)  # [*b]
+                progress_loss = sample_w * bce  # [*b]
+                total_loss = flow_loss + self._progress_loss_weight * progress_loss[..., None]
+                metrics["progress_loss"] = jnp.mean(progress_loss)
+                metrics["progress_loss_weighted"] = self._progress_loss_weight * jnp.mean(progress_loss)
+                # Confusion counts (additive, window-safe like pcls_num/den): accuracy is
+                # useless at 4:1, so we log precision/recall/F1 from tp/fp/fn/tn AFTER the
+                # window in train.py. pred = sigmoid(logit) > 0.5.
+                pred_pos = (nnx.sigmoid(logit) > 0.5).astype(jnp.float32).reshape(-1)  # [N]
+                y = labels.reshape(-1)  # [N]
+                metrics["pbin_tp"] = jnp.sum(pred_pos * y)
+                metrics["pbin_fp"] = jnp.sum(pred_pos * (1.0 - y))
+                metrics["pbin_fn"] = jnp.sum((1.0 - pred_pos) * y)
+                metrics["pbin_tn"] = jnp.sum((1.0 - pred_pos) * (1.0 - y))
             elif self._progress_mode == "continuous" and progress_target is not None:
                 # Scalar state-value: Huber regression on frac**k.
                 progress_pred = nnx.sigmoid(logits)  # [*b], in [0,1]
@@ -466,4 +497,6 @@ class Pi0(_model.BaseModel):
         logits = self._progress_logits(prefix_out, prefix_mask)
         if self._progress_mode == "classes":
             return jax.nn.softmax(logits, axis=-1)  # [b, K]
+        # binary + continuous both read a single sigmoid. binary => P(subgoal finished);
+        # continuous => the [0,1] state-value. System2 thresholds the binary output.
         return nnx.sigmoid(logits)  # [b]

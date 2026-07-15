@@ -60,9 +60,22 @@ class Pi0Config(_model.BaseModelConfig):
     # - "classes": a `progress_num_classes`-way classifier, cross-entropy on the discrete
     #   progress class 0..K-1 (reads Observation.progress_class). System2 reads the
     #   argmax / softmax bucket.
+    # - "binary": a single "is the subgoal finished?" logit. The positive class is the
+    #   top `progress_binary_pos_classes` deciles of progress_class (default 2 => classes
+    #   K-2,K-1, i.e. frac>=0.8, incl. settle-pad-complete frames); everything else is
+    #   negative. Trained with pos_weight-weighted BCE to counter the class imbalance.
+    #   System2 reads sigmoid(logit) = P(finished) and thresholds (default 0.5).
     progress_mode: str = "continuous"
-    # Number of buckets when progress_mode == "classes" (system1_full uses 10).
+    # Number of buckets when progress_mode == "classes" (system1_full uses 10). Also the
+    # bucket count binary mode derives its positive label from.
     progress_num_classes: int = 10
+    # binary mode: how many top deciles of progress_class count as "finished" (positive).
+    # 2 => classes {K-2, K-1} (frac>=0.8) are positive => ~4:1 neg:pos imbalance under
+    # uniform-in-span sampling => pair with progress_pos_weight~=4-5.
+    progress_binary_pos_classes: int = 2
+    # binary mode: BCE positive-class weight (multiplies the loss of the FINISHED samples)
+    # to counter imbalance. Set ~= N_neg/N_pos (~4-5 for pos_classes=2). CLI-overridable.
+    progress_pos_weight: float = 5.0
     # Readout over the prefix: "shallow_transformer" | "mean_pool" | "prefix_token".
     progress_readout: str = "shallow_transformer"
     # If True, the head reads stop_grad(prefix) so the progress loss never alters the
@@ -144,7 +157,7 @@ class Pi0Config(_model.BaseModelConfig):
                 ),
                 progress_class=(
                     jax.ShapeDtypeStruct([batch_size], jnp.int32)
-                    if (self.use_progress_head and self.progress_mode == "classes")
+                    if (self.use_progress_head and self.progress_mode in ("classes", "binary"))
                     else None
                 ),
             )
