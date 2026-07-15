@@ -22,7 +22,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.5.1 /uv /uvx /bin/
 WORKDIR /opt/ml/code
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git git-lfs build-essential libgl1 libglib2.0-0 awscli \
+    git git-lfs build-essential clang libgl1 libglib2.0-0 awscli \
  && rm -rf /var/lib/apt/lists/*
 
 ENV UV_LINK_MODE=copy
@@ -85,8 +85,10 @@ ARG SM_ENTRYPOINT=sm_entrypoint.sh
 ENV SAGEMAKER_SUBMIT_DIRECTORY=/opt/ml/code
 ENV SAGEMAKER_PROGRAM=${SM_ENTRYPOINT}
 
-COPY scripts/sagemaker/sm_entrypoint.sh scripts/sagemaker/sm_entrypoint_jax.sh /opt/ml/code/
-RUN chmod +x /opt/ml/code/sm_entrypoint.sh /opt/ml/code/sm_entrypoint_jax.sh
+COPY scripts/sagemaker/sm_entrypoint.sh scripts/sagemaker/sm_entrypoint_jax.sh \
+     scripts/sagemaker/sm_entrypoint_robocasa_multinode_jax.sh /opt/ml/code/
+RUN chmod +x /opt/ml/code/sm_entrypoint.sh /opt/ml/code/sm_entrypoint_jax.sh \
+     /opt/ml/code/sm_entrypoint_robocasa_multinode_jax.sh
 
 # Stash the chosen entrypoint at a fixed path so the ENTRYPOINT exec form (which
 # can't expand a build ARG) can call it.

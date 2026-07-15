@@ -1,0 +1,85 @@
+# SageMaker launch config for MULTI-NODE System1 RoboCasa JAX training (scripts/train.py).
+# Use with: python scripts/sagemaker/launch.py --config scripts/sagemaker/config_robocasa_multinode.yaml
+#   (override on the CLI as usual, e.g. --training.exp_name=run2 --instance.count=2)
+#
+# Multi-node sibling of config_robocasa_jax.yaml (single-node). Differences:
+#   - instance.count = 2         -> two p5 nodes (16 H100s), ONE JAX process per node.
+#   - image.sm_entrypoint = sm_entrypoint_robocasa_multinode_jax.sh (rank-0-only S3 sync;
+#     forms the cross-node mesh via jax.distributed.initialize; NO torchrun).
+#   - batch-size = 256           -> 128/node. Mesh (2, 8): data-parallel across the 2 nodes,
+#     FSDP-8 within each node (param all-gather stays on NVLink; only the gradient
+#     all-reduce crosses the inter-node link).
+# Everything else (data channels, base_ckpt, norm_stats, EMA-only checkpoint) matches the
+# single-node config. Multi-node RESUME is NOT supported (EMA-only, fresh start only).
+
+aws:
+  region: us-west-2
+  profile: sagemaker
+  role_arn: arn:aws:iam::124224456861:role/service-role/SageMaker-SageMakerAllAccess
+
+job:
+  user: yinpei
+  name_prefix: pi05-robocasa-mn
+  max_run_days: 14
+  volume_size: 300            # per-node EBS: shards + anchors + checkpoints + caches
+  tags:
+    - key: tri.owner.email
+      value: yinpei.dai@tri.global
+    - key: tri.project
+      value: MM:PJ-0077
+
+queue:
+  name: vla
+  priority: 10
+  share_identifier: dyp
+
+instance:
+  type: p5                    # H100
+  count: 2                    # <-- multi-node: 2 nodes x 8 GPUs = 16-device global mesh
+
+image:
+  base: 763104351884.dkr.ecr.{region}.amazonaws.com/pytorch-training:2.8.0-gpu-py312-cu129-ubuntu22.04-sagemaker
+  repo_name: yinpeidai-openpi-train-jax
+  # Multi-node JAX entrypoint: one process/node, jax.distributed.initialize, rank-0 S3 sync.
+  sm_entrypoint: sm_entrypoint_robocasa_multinode_jax.sh
+
+# Channels mounted at /opt/ml/input/data/<channel>/ on EACH node (FastFile = stream).
+#   robocasa/{shards,anchors,meta.json}  -> the WebDataset dataset (split per-process in the loader)
+#   base_ckpt/                           -> JAX pi05_base orbax `params` dir
+# Norm stats (~3 KB) are baked into the image at /opt/ml/code/assets/<config>/.
+data:
+  channels:
+    robocasa:
+      s3_uri: s3://tri-ml-datasets-uw2/yinpeidai/robocasa_final_training_shard/system1_full_0711/
+      input_mode: FastFile
+    base_ckpt:
+      s3_uri: s3://tri-ml-datasets-uw2/yinpeidai/openpi/released_ckpt/openpi-assets/checkpoints/pi05_base/
+      input_mode: FastFile
+
+training:
+  config: pi05_robocasa_system1
+  exp_name: full400k_mn
+  resume: false               # multi-node resume is NOT supported (EMA-only, fresh start)
+  overwrite: false
+  # Multi-node JAX trainer args. batch-size is the GLOBAL batch (256 = 128/node); it must
+  # be divisible by the GLOBAL device count (16). --fsdp-devices=8 shards WITHIN a node
+  # (mesh (2, 8)) — do NOT set 16 (that would all-gather params over the slow inter-node
+  # link every layer). LR/EMA as in the single-node full run; --project-name sets the
+  # wandb project (only process 0 logs).
+  # shuffle-buffer is PER-WORKER: effective pool = buffer x num_workers(8) x nodes(2). 5000
+  # => 80k global samples, ample decorrelation. Lower than the 16000 single-node default
+  # because multi-node already spans 2x the shard diversity (disjoint per-node slices), and
+  # 16000 x 8 workers/node would pin ~128k decoded samples in host RAM per node + slow the
+  # cold start (each worker fills its buffer from S3 before step 0).
+  extra_args: "--fsdp-devices=8 --batch-size=256 --ema-decay=0.9999 --num-train-steps=400000 --save-interval=40000 --keep-period=40000 --lr-schedule.warmup-steps=2000 --lr-schedule.peak-lr=5e-5 --lr-schedule.decay-steps=400000 --lr-schedule.decay-lr=5e-6 --data.shuffle-buffer=5000 --project-name=openpi-robocasa-system1"
+
+output:
+  s3_prefix: s3://tri-ml-datasets-uw2/yinpeidai/openpi/checkpoints/
+  checkpoint_local_path: /opt/ml/checkpoints
+  # Wall-clock seconds between the rank-0 entrypoint's background `aws s3 sync` uploads
+  # (crash insurance; a final --delete sync runs on exit regardless). 30000s = ~8.3h.
+  ckpt_sync_interval: 30000
+
+wandb:
+  enabled: true
+  project: openpi-robocasa-system1-sagemaker
