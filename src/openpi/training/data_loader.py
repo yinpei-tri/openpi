@@ -537,12 +537,23 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
+        # Multi-node: each JAX process feeds its LOCAL batch shard; make_array_from_
+        # process_local_data (in __iter__) assembles the global sharded array. This is
+        # only sound when each process reads a DISJOINT data shard — iterable WebDataset
+        # loaders split shards by jax.process_index() (see robocasa/libero webdataset
+        # `_worker_shards`). Map-style datasets do NOT split by process, so reject them
+        # (they would replicate the same samples across every process). Single-node
+        # (process_count()==1): neither branch triggers — behavior unchanged.
+        is_iterable = isinstance(dataset, torch.utils.data.IterableDataset)
+        if jax.process_count() > 1 and not is_iterable:
+            raise NotImplementedError(
+                "Multi-process (multi-node) data loading is only supported for iterable "
+                "WebDataset loaders that split shards by jax.process_index(); map-style "
+                "datasets would replicate data across processes."
+            )
 
         # Iterable (streaming) datasets have no meaningful/known length; skip the
         # size guard for them. Map-style datasets keep the check.
-        is_iterable = isinstance(dataset, torch.utils.data.IterableDataset)
         if not is_iterable and len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
