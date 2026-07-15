@@ -988,6 +988,10 @@ _CONFIGS = [
             # jitter is applied to all keys regardless).
             geometric_aug_cameras=("scene_left", "scene_right", "anchor_scene_left", "anchor_scene_right"),
             use_anchor_images=True,
+            # Also log flow_loss_real over the 11 real lean-action dims (excludes the
+            # progress-as-action dim + zero-pad), so action-quality flow loss is directly
+            # comparable across progress-head vs progress-as-action runs.
+            flow_loss_real_dim=11,
             use_progress_head=True,
             # 10-way progress CLASSIFIER (cross-entropy on subgoal_progress_class 0..9),
             # not the continuous state-value. progress_readout / progress_loss_weight (0.5)

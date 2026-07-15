@@ -118,6 +118,7 @@ class Pi0(_model.BaseModel):
             tuple(config.geometric_aug_cameras) if config.geometric_aug_cameras is not None else None
         )
         self._use_anchor_images = config.use_anchor_images
+        self._flow_loss_real_dim = config.flow_loss_real_dim
         self._use_progress_head = config.use_progress_head
         self._progress_readout = config.progress_readout
         self._progress_stop_gradient = config.progress_stop_gradient
@@ -281,11 +282,19 @@ class Pi0(_model.BaseModel):
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
         # Flow-matching loss per (batch, horizon-step).
-        flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # [*b, ah]
+        sq_err = jnp.square(v_t - u_t)  # [*b, ah, action_dim]
+        flow_loss = jnp.mean(sq_err, axis=-1)  # [*b, ah]
 
         # Per-component metrics for logging (means over the batch). Always includes the
         # flow loss; progress entries are added when the head is active.
         metrics: dict[str, at.Array] = {"flow_loss": jnp.mean(flow_loss)}
+
+        # Optional: flow loss over ONLY the first `flow_loss_real_dim` action dims (the
+        # real robot action), excluding augmented dims (progress-as-action) + zero-pad.
+        # `flow_loss` above averages over all `action_dim` dims, so it isn't comparable
+        # across methods that pad/augment differently; `flow_loss_real` is. Logging-only.
+        if self._flow_loss_real_dim is not None:
+            metrics["flow_loss_real"] = jnp.mean(sq_err[..., : self._flow_loss_real_dim])
 
         # System1 progress head: aux state-value regression on frac**k.
         # progress_loss is per-sample [*b]; broadcast over the horizon axis and add.

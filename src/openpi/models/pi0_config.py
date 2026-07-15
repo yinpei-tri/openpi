@@ -45,6 +45,13 @@ class Pi0Config(_model.BaseModelConfig):
     # Add anchor (before) image groups + a learned anchor/current role embedding.
     use_anchor_images: bool = False
 
+    # If set, ALSO log `flow_loss_real` = the flow-matching loss over ONLY the first
+    # `flow_loss_real_dim` action dims (the real robot action), excluding any augmented
+    # dims (e.g. the progress-as-action dim) and the zero-pad. This makes the action-
+    # quality flow loss directly comparable across methods (progress-head vs
+    # progress-as-action). None => not logged. For RoboCasa lean actions, set to 11.
+    flow_loss_real_dim: int | None = None
+
     # Progress head (subgoal-completion prediction).
     use_progress_head: bool = False
     # Prediction target/loss:
