@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import functools
 import logging
@@ -23,46 +24,95 @@ import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
+import openpi.training.distributed as _distributed
 import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
+# Canonical RoboCasa System1 DEFAULTS — the resolved knob values on the base config
+# `pi05_robocasa_system1`. robocasa_exp_tag emits a token ONLY when a run deviates from
+# these, so a pure-default run keeps a bare exp_name and ablations get a short "diff" tag.
+# Keep in sync with pi05_robocasa_system1 in config.py (data + model blocks).
+_ROBOCASA_TAG_DEFAULTS = {
+    # data knobs
+    "prompt_source": "subgoal",
+    "subgoal_action_pad": "subgoal",
+    "repad_actions": False,
+    "include_task_goal": True,
+    "include_anchor_state": True,
+    "include_conditioning": True,
+    "include_gripper_flag": True,
+    "progress_as_action": False,
+    # model knobs
+    "use_anchor_images": True,
+    "use_progress_head": True,
+    "progress_mode": "classes",
+    "progress_readout": "shallow_transformer",
+    "progress_stop_gradient": False,
+    "progress_loss_weight": 0.5,
+    "progress_hidden": 1024,
+}
+
 
 def robocasa_exp_tag(config: _config.TrainConfig) -> str:
-    """Settings tag appended to exp_name for RoboCasa System1 runs.
+    """DIFF-from-default settings tag appended to exp_name for RoboCasa System1 runs.
 
-    Ablations are driven by CLI overrides on a single config, so the only thing that
-    distinguishes one run's checkpoint dir / wandb name from another is exp_name.
-    Append a DETERMINISTIC tag derived from the ablation knobs so runs never collide
-    and are self-describing. Deterministic => same settings reproduce the same path,
-    so --resume still works. Returns "" for non-RoboCasa configs.
+    Ablations are CLI overrides on one config, so exp_name is the only thing that
+    distinguishes one run's checkpoint dir / wandb name from another. We append a
+    DETERMINISTIC tag listing ONLY the knobs that DIFFER from `_ROBOCASA_TAG_DEFAULTS`
+    (the base `pi05_robocasa_system1` values) — so a pure-default run keeps a bare
+    exp_name and an ablation gets a short, self-describing suffix (e.g. `prog-continuous_w1_h512`).
+    Deterministic => same settings reproduce the same path, so --resume still works.
+    Returns "" for non-RoboCasa configs and for pure-default RoboCasa runs.
     """
     data = config.data  # the RoboCasaDataConfig factory (has the knobs directly)
     # RoboCasa runs are identified by the system1_full knob `prompt_source`.
     if not hasattr(data, "prompt_source") or not hasattr(data, "shards"):
         return ""  # not a RoboCasa run
     m = config.model
-    parts = [
-        f"src-{data.prompt_source}",
-        f"pad-{getattr(data, 'subgoal_action_pad', 'subgoal')}",
-        ("repad" if getattr(data, "repad_actions", False) else "bakedpad"),
-        ("anchor" if getattr(m, "use_anchor_images", False) else "noanchor"),
-        # Prompt-content flags default ON, so render BOTH states explicitly — an absent
-        # tag would be ambiguous once the default is on.
-        ("taskgoal" if getattr(data, "include_task_goal", False) else "notaskgoal"),
-        ("anchorstate" if getattr(data, "include_anchor_state", False) else "noanchorstate"),
-        ("cond" if getattr(data, "include_conditioning", False) else "nocond"),
-        ("grip" if getattr(data, "include_gripper_flag", False) else "nogrip"),
-    ]
-    if getattr(m, "use_progress_head", False):
-        # mode (classes/continuous) + readout + insulation (stop-grad) + loss weight,
-        # so ablations over any of these get distinct checkpoint/wandb names.
-        sg = "sg" if getattr(m, "progress_stop_gradient", True) else "nosg"
-        mode = getattr(m, "progress_mode", "continuous")
-        parts.append(f"prog-{mode}-{m.progress_readout}-{sg}-w{getattr(m, 'progress_loss_weight', 1.0):g}")
+    d = _ROBOCASA_TAG_DEFAULTS
+
+    def val(obj, name):
+        return getattr(obj, name, d[name])
+
+    parts: list[str] = []
+    # Data knobs: emit only on deviation from default.
+    if val(data, "prompt_source") != d["prompt_source"]:
+        parts.append(f"src-{val(data, 'prompt_source')}")
+    if val(data, "subgoal_action_pad") != d["subgoal_action_pad"]:
+        parts.append(f"pad-{val(data, 'subgoal_action_pad')}")
+    if val(data, "repad_actions") != d["repad_actions"]:
+        parts.append("repad")
+    if val(m, "use_anchor_images") != d["use_anchor_images"]:
+        parts.append("noanchor")  # default is anchor ON, so a deviation is always "off"
+    if val(data, "include_task_goal") != d["include_task_goal"]:
+        parts.append("notaskgoal")
+    if val(data, "include_anchor_state") != d["include_anchor_state"]:
+        parts.append("noanchorstate")
+    if val(data, "include_conditioning") != d["include_conditioning"]:
+        parts.append("nocond")
+    if val(data, "include_gripper_flag") != d["include_gripper_flag"]:
+        parts.append("nogrip")
+    if val(data, "progress_as_action") != d["progress_as_action"]:
+        parts.append("progact")
+
+    # Progress head knobs: emit only on deviation. If the head is OFF (a deviation), emit
+    # `noprog` and skip the head sub-knobs (they're irrelevant then).
+    if val(m, "use_progress_head") != d["use_progress_head"]:
+        if not val(m, "use_progress_head"):
+            parts.append("noprog")
     else:
-        parts.append("noprog")
+        if val(m, "progress_mode") != d["progress_mode"]:
+            parts.append(f"prog-{val(m, 'progress_mode')}")
+        if val(m, "progress_readout") != d["progress_readout"]:
+            parts.append(f"readout-{val(m, 'progress_readout')}")
+        if val(m, "progress_stop_gradient") != d["progress_stop_gradient"]:
+            parts.append("sg")  # default is nosg (gradients flow); deviation = stop-grad ON
+        if val(m, "progress_loss_weight") != d["progress_loss_weight"]:
+            parts.append(f"w{val(m, 'progress_loss_weight'):g}")
+        if val(m, "progress_hidden") != d["progress_hidden"]:
+            parts.append(f"h{val(m, 'progress_hidden')}")
     return "_".join(parts)
 
 
@@ -90,22 +140,42 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
         wandb.init(mode="disabled")
         return
 
-    ckpt_dir = config.checkpoint_dir
-    if not ckpt_dir.exists():
-        raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=config.project_name)
-    else:
-        wandb.init(
-            name=config.exp_name,
-            config=dataclasses.asdict(config),
-            project=config.project_name,
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+    # W&B is process-0-only, non-essential telemetry. NEVER let a transient W&B failure
+    # (auth/network/stale run id) raise on process 0 and kill a distributed job while the
+    # other processes proceed into collectives. On any error, fall back to disabled logging
+    # and continue training. This stays a purely LOCAL, process-0 concern — NO cross-process
+    # barrier here (a barrier around wandb is exactly what deadlocked the multi-node run
+    # before). The other processes independently call wandb.init(disabled). Single-node:
+    # same behavior as before, just guarded.
+    try:
+        ckpt_dir = config.checkpoint_dir
+        if not ckpt_dir.exists():
+            raise FileNotFoundError(f"Checkpoint directory {ckpt_dir} does not exist.")
+        if resuming:
+            run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+            wandb.init(id=run_id, resume="must", project=config.project_name)
+        else:
+            wandb.init(
+                name=config.exp_name,
+                config=dataclasses.asdict(config),
+                project=config.project_name,
+            )
+            (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
 
-    if log_code:
-        wandb.run.log_code(epath.Path(__file__).parent.parent)
+        if log_code:
+            wandb.run.log_code(epath.Path(__file__).parent.parent)
+    except Exception:
+        logging.exception("wandb.init failed; continuing with W&B logging DISABLED (training unaffected).")
+        with contextlib.suppress(Exception):
+            wandb.init(mode="disabled")
+
+
+def log_wandb(data: dict, *, step: int) -> None:
+    """wandb.log that never raises — telemetry must not crash/desync training."""
+    try:
+        wandb.log(data, step=step)
+    except Exception:
+        logging.exception("wandb.log failed; continuing training")
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -290,7 +360,10 @@ def train_step(
 
 def main(config: _config.TrainConfig, tentative_run: bool = False):
     init_logging()
-    logging.info(f"Running on: {platform.node()}")
+    logging.info(
+        f"Running on: {platform.node()} | jax process {jax.process_index()}/{jax.process_count()} "
+        f"| local devices {jax.local_device_count()} | global devices {jax.device_count()}"
+    )
 
     # For RoboCasa System1, ablations are CLI overrides on one config, so append a
     # deterministic settings tag to exp_name -> distinct, self-describing checkpoint
@@ -323,7 +396,14 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             overwrite=config.overwrite,
             resume=config.resume,
         )
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled and not tentative_run)
+    # Multi-node: only the PRIMARY process (index 0) logs to wandb. Otherwise every
+    # process starts its own run and you get N identical curves (the metrics are the same
+    # replicated value — see below). Single-node: process_index()==0, so unchanged.
+    init_wandb(
+        config,
+        resuming=resuming,
+        enabled=config.wandb_enabled and not tentative_run and jax.process_index() == 0,
+    )
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -334,12 +414,39 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
-    # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
-    ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    # Multi-node sanity: prove the global batch is sharded across ALL devices AND that each
+    # process/device holds DIFFERENT data. Printed once on every process, so the SageMaker
+    # logs from every node show the split + distinct content. Debug-only; guarded so it can
+    # never crash the job. No-op / harmless single-node (one process, one set of shards).
+    _first = next(iter(batch[0].images.values()))
+    try:
+        _n_shards = len(_first.addressable_shards) if hasattr(_first, "addressable_shards") else -1
+        # Per-device content fingerprint: mean of each addressable slice. Distinct values
+        # across shards (and across processes) => genuinely different data on each GPU, not
+        # a replicated/duplicated batch (which would mean the shard split lost process id).
+        shard_means = [
+            round(float(np.asarray(sh.data, dtype=np.float32).mean()), 4)
+            for sh in getattr(_first, "addressable_shards", [])
+        ]
+        logging.info(
+            f"[data-dist] proc={jax.process_index()}/{jax.process_count()} global_batch_shape={_first.shape} "
+            f"n_addressable_shards={_n_shards} devices={jax.device_count()} mesh={mesh.shape}"
+        )
+        logging.info(f"[data-dist] proc={jax.process_index()} per-shard image means={shard_means}")
+    except Exception as _e:
+        logging.info(f"[data-dist] shard introspection skipped: {_e}")
+
+    # Log images from first batch to sanity check. Guarded: image construction / wandb.log
+    # must never crash the (multi-node) job. Runs on all processes — a no-op where wandb is
+    # disabled (non-primary) — so there is no asymmetric collective / barrier.
+    try:
+        images_to_log = [
+            wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+            for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        ]
+        log_wandb({"camera_views": images_to_log}, step=0)
+    except Exception:
+        logging.exception("W&B camera preview failed; continuing training")
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -422,6 +529,13 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             # so mean(num)/mean(den) is the correct window-level accuracy/MAE. Empty
             # classes/bins (den==0) are reported as NaN (no samples => undefined), which
             # wandb simply skips in the plot. Raw counts are dropped from the log.
+            #
+            # MULTI-NODE: every scalar in `info` is ALREADY globally reduced — ptrain_step
+            # is jitted with out_shardings=replicated, so XLA's collectives reduce every
+            # jnp.mean/jnp.sum inside the step (loss, grad_norm, progress counts) over the
+            # WHOLE global batch (all nodes' devices) and replicate the result to process 0.
+            # So this fold computes precision/recall/F1/MAE over the full global batch with
+            # no extra gather; process 0 just logs the already-global value.
             reduced_info = _fold_progress_ratios(reduced_info)
             # Console line stays compact: skip the 10 per-class / per-bin breakdowns
             # (they go to wandb). Keep the scalar summaries.
@@ -431,7 +545,7 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
                 if not k.startswith(("progress_acc_class/", "progress_mae_bin/"))
             )
             pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
+            log_wandb(reduced_info, step=step)
             infos = []
             data_wait_accum = 0.0
             window_start = time.perf_counter()
@@ -456,6 +570,17 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
 
 
 if __name__ == "__main__":
+    # Configure logging BEFORE maybe_init_distributed so its coordinator/rank INFO lines
+    # (the ones you need to diagnose a cross-host init hang) actually reach the console —
+    # otherwise they hit root's default WARNING level and are dropped. main() calls
+    # init_logging() again, which is idempotent (just re-sets the formatter).
+    init_logging()
+    # Multi-node: initialize the JAX distributed runtime ONCE, at process start, BEFORE
+    # any JAX device op (including the tentative run below, which brings up the XLA backend
+    # via jax.device_count / jit). Calling it inside main() would be too late — the
+    # tentative run already initialized XLA in this same process, so the real run's
+    # initialize() would raise "must be called before any JAX calls". No-op single-node.
+    _distributed.maybe_init_distributed()
     config = _config.cli()
     main(config, tentative_run=True)
     time.sleep(20)
