@@ -154,6 +154,17 @@ def restore_state(
 ) -> training_utils.TrainState:
     del data_loader
 
+    # NOTE: on restore, orbax logs an INFO line like
+    #   "No metadata found for any process_index, checkpoint_dir=.../params. ...
+    #    If the checkpoint does not contain jax.Array then it is expected. ... if no
+    #    error is raised then it is a bug."
+    # This is EXPECTED and benign here, not a bug. We save with the per-process
+    # ArrayMetadata store disabled (see _configure_array_handler_single_host): the pytree
+    # is gathered to host numpy and written as a single self-contained ocdbt.process_0/,
+    # so no `array_metadatas/` dir is produced. orbax simply doesn't find that optional
+    # metadata and falls back to reading arrays whole (the always-correct path). As long
+    # as the restore completes without raising (it does — the arrays live in ocdbt.*),
+    # the weights are fully intact.
     with at.disable_typechecking():
         # Split params that can be used for inference into a separate item.
         train_state, params = _split_params(state)
