@@ -4,6 +4,13 @@ Subgoal-conditioned **pi0.5** + a **progress head**, trained on RoboCasa WebData
 shards. This doc covers the data, the configs, and how to run training in each
 environment: bare-metal, local Docker, an 8×A100 box (S3 data), and SageMaker.
 
+> **Multi-node training:** the SageMaker section below is **single-node** (one 8×GPU node).
+> For **multi-node** (2 nodes / 16 GPUs, global batch 256) — how to launch it, how the JAX
+> process/data/checkpoint plumbing works, and the single-vs-multi-node comparison table —
+> see **[docs/robocasa_multinode_training.md](robocasa_multinode_training.md)**. Single-node
+> runs are unaffected by the multi-node code (every multi-node path is gated on
+> `jax.process_count() > 1`).
+
 ## TL;DR — run on the 8×A100 box, streaming data from S3
 
 ```bash
