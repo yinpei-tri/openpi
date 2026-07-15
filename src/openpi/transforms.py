@@ -192,6 +192,46 @@ class ResizeImages(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class AppendProgressAction(DataTransformFn):
+    """Append a per-step progress value as an extra action dim (progress-as-action).
+
+    Runs AFTER Normalize: the real action dims are normalized with their own norm_stats
+    (unchanged), and ``progress_action`` (already in [-1,1], shape [action_horizon]) is
+    concatenated as the trailing action dim -> the flow-matching head predicts progress
+    alongside the motion. PadStatesAndActions then pads to the model action_dim. No-op if
+    ``progress_action`` isn't present (e.g. inference before it's provided)."""
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "actions" in data and "progress_action" in data:
+            act = np.asarray(data["actions"])  # [h, real_dim] (normalized)
+            prog = np.asarray(data["progress_action"], dtype=act.dtype).reshape(act.shape[0], 1)
+            data["actions"] = np.concatenate([act, prog], axis=-1)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class SplitProgressAction(DataTransformFn):
+    """Inverse of AppendProgressAction, for the OUTPUT (inference) path.
+
+    The model emits action_dim (e.g. 32) dims: the first ``real_dim`` (11) are the real
+    action, dim ``real_dim`` is the appended progress. Runs FIRST on the output side
+    (before Unnormalize), so it: (1) pops the progress dim out to ``progress`` un-normalized
+    to [0,1] (it was trained as 2*p-1), and (2) truncates ``actions`` to the ``real_dim``
+    real dims so Unnormalize (11-d stats) + RobocasaOutputs see only the real action.
+    No-op if the action already has <= real_dim dims (progress-as-action off)."""
+
+    real_dim: int = 11
+
+    def __call__(self, data: DataDict) -> DataDict:
+        act = np.asarray(data["actions"])
+        if act.shape[-1] > self.real_dim:
+            prog_norm = act[..., self.real_dim]  # [h]
+            data["progress"] = np.clip((prog_norm + 1.0) / 2.0, 0.0, 1.0)
+            data["actions"] = act[..., : self.real_dim]
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class SubsampleActions(DataTransformFn):
     stride: int
 

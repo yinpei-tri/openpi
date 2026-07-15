@@ -362,7 +362,9 @@ class RobocasaInputs(transforms.DataTransformFn):
             if self.include_gripper_flag and data.get("gripper_flag") not in (None, ""):
                 inputs["gripper_flag"] = data["gripper_flag"]
         # Progress labels + span metadata are training-only targets (pass through).
-        for k in ("progress_frac", "progress_class", "subgoal_start", "subgoal_end", "frame_index"):
+        # progress_action (per-step [-1,1] progress vector) is appended to the action
+        # chunk AFTER Normalize by AppendProgressAction (a model_transform).
+        for k in ("progress_frac", "progress_class", "subgoal_start", "subgoal_end", "frame_index", "progress_action"):
             if k in data:
                 inputs[k] = data[k]
 

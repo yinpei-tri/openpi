@@ -444,6 +444,10 @@ class RoboCasaDataConfig(DataConfigFactory):
     # shrink it (ROBOCASA_SHUFFLE_BUFFER=4000) for a fast first batch without editing code.
     shuffle_buffer: int = dataclasses.field(default_factory=_robocasa_shuffle_buffer)
     shuffle_initial: int = 1000
+    # Progress-as-action: append a per-step subgoal-progress dim to the action chunk (the
+    # flow-matching head predicts progress) instead of using a separate progress head. When
+    # True, also set model.use_progress_head=False. See WebDatasetConfig.progress_as_action.
+    progress_as_action: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -463,6 +467,7 @@ class RoboCasaDataConfig(DataConfigFactory):
             repad_actions=self.repad_actions,
             shuffle_buffer=self.shuffle_buffer,
             shuffle_initial=self.shuffle_initial,
+            progress_as_action=self.progress_as_action,
         )
         # NOTE: no DeltaActions/AbsoluteActions. RoboCasa actions are ALREADY delta
         # commands (eef deltas + base velocity — the sim's control interface), so we
@@ -499,6 +504,20 @@ class RoboCasaDataConfig(DataConfigFactory):
             preserve_newlines=True,
             use_gripper_flag=self.include_gripper_flag,
         )(model_config)
+        if self.progress_as_action:
+            # INPUT: concat the progress dim onto the (normalized) action FIRST, THEN pad to
+            # the model action_dim (32 for pi0.5). model_transforms already ends with
+            # PadStatesAndActions, so prepend AppendProgressAction so the order is
+            # Normalize(11) -> append progress(12) -> PadStatesAndActions(12->32).
+            # OUTPUT: SplitProgressAction runs FIRST (before Unnormalize) to pop the progress
+            # dim out to `progress` [0,1] and truncate actions back to the real 11 dims, so
+            # Unnormalize(11-d stats) + RobocasaOutputs see only the real action.
+            lean_dim = robocasa_policy.LEAN_ACTION_DIM
+            model_transforms = dataclasses.replace(
+                model_transforms,
+                inputs=[_transforms.AppendProgressAction(), *model_transforms.inputs],
+                outputs=[_transforms.SplitProgressAction(real_dim=lean_dim), *model_transforms.outputs],
+            )
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             data_transforms=data_transforms,

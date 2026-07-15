@@ -96,6 +96,13 @@ class WebDatasetConfig:
     # 10-way progress classification target (subgoal-level). The class label
     # (subgoal_progress_class 0..9) is passed through for the classification head.
     progress_num_classes: int = 10
+    # Progress-as-action: emit a per-step subgoal-progress target vector `progress_action`
+    # of shape [action_horizon], to be appended as an extra action dim (after Normalize)
+    # so the flow-matching action head predicts progress instead of a separate head.
+    #   step i (in-subgoal) = min(1, progress_frac + i/span_len)  [step 0 == the data's
+    #   progress_frac exactly]; padding steps (past subgoal end) = 1.0 (subgoal complete).
+    #   normalized to [-1,1] via 2*p - 1. Off by default.
+    progress_as_action: bool = False
     # Reservoir shuffle (on top of the producer's GLOBAL shard shuffle + per-epoch
     # shard-order shuffle — belt-and-suspenders for batch decorrelation).
     shuffle_buffer: int = 16000
@@ -512,6 +519,24 @@ class RoboCasaWebDataset:
         sample["subgoal_start"] = np.int32(sp[0])
         sample["subgoal_end"] = np.int32(sp[1])
         sample["frame_index"] = np.int32(meta.get("frame_index", 0))
+        # Progress-as-action target: per-step subgoal progress over the action horizon.
+        # step 0 == this frame's progress_frac (exact); future step i advances by
+        # i/span_len (clamped to 1); steps past the subgoal end (from the subgoal pad
+        # mask) are 1.0 (complete). Normalized to [-1,1] (2*p-1). Appended as an extra
+        # action dim AFTER Normalize (the real 11-d action normalizes with its own stats;
+        # this dim is already in range, so it must not go through Normalize).
+        if self.cfg.progress_as_action:
+            horizon = self.cfg.action_horizon
+            frac0 = float(sample["progress_frac"])
+            span_len = int(sp[1]) - int(sp[0])
+            steps = np.arange(horizon, dtype=np.float32)
+            prog = np.minimum(1.0, frac0 + steps / span_len) if span_len > 0 else np.full(horizon, frac0, np.float32)
+            # Zero out (set to complete) past the last in-subgoal step, per the pad mask.
+            mask = arrays.get("action_pad_mask_subgoal")
+            if mask is not None and not mask.all():
+                last = int(np.where(mask)[0][-1])
+                prog[last + 1 :] = 1.0
+            sample["progress_action"] = (2.0 * prog - 1.0).astype(np.float32)  # [-1,1], shape [horizon]
         return sample
 
     def _build_actions(self, arrays: np.lib.npyio.NpzFile) -> np.ndarray:
