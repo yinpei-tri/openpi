@@ -45,9 +45,11 @@ import openpi.training.weight_loaders as _weight_loaders
 # DEVIATION tokens (order below), each shown only when the knob != its default:
 _ROBOCASA_PROMPT_DEVIATIONS = [
     # (attr, default, token-when-different). All default TRUE (prompt-content on).
-    # Conditioning: `nocond` drops the whole line; `noexec` drops only "Executed Step".
+    # Conditioning: `nocond` drops the whole line; `noexec`/`noestl` drop only the Executed
+    # Step / Estimated Length field (both suppressed when nocond is set — see below).
     ("include_conditioning", True, "nocond"),
     ("include_executed_step", True, "noexec"),
+    ("include_est_length", True, "noestl"),
     # State has TWO orthogonal toggles: `nostate` drops the ENTIRE state block (Initial +
     # Current); `noanchorstate` drops only the anchor/Initial half (Current State stays).
     ("include_state", True, "nostate"),
@@ -104,9 +106,9 @@ def robocasa_exp_tag(config: _config.TrainConfig) -> str:
 
     # 3) Prompt-content deviations (shown only when the knob != default).
     for attr, default, token in _ROBOCASA_PROMPT_DEVIATIONS:
-        # `noexec` (drop only Executed Step) is redundant when `nocond` (drop the whole
-        # conditioning line) is already set — suppress it so the tag never shows both.
-        if attr == "include_executed_step" and not getattr(data, "include_conditioning", True):
+        # `noexec`/`noestl` (drop a single conditioning field) are redundant when `nocond`
+        # (drop the whole line) is already set — suppress them so the tag never shows both.
+        if attr in ("include_executed_step", "include_est_length") and not getattr(data, "include_conditioning", True):
             continue
         obj = m if attr == "use_anchor_images" else data
         if getattr(obj, attr, default) != default:

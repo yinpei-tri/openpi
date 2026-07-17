@@ -443,6 +443,9 @@ class RoboCasaDataConfig(DataConfigFactory):
     # Finer-grained: keep the conditioning line but drop ONLY "Executed Step: …" (tag token
     # `noexec`). ON by default. No effect if include_conditioning is False.
     include_executed_step: bool = True
+    # Finer-grained: keep the conditioning line but drop ONLY "Estimated Length: …" (tag
+    # token `noestl`). ON by default. No effect if include_conditioning is False.
+    include_est_length: bool = True
     # Append "Current Gripper: Open|Close;" after the state block. ON by default.
     include_gripper_flag: bool = True
     # Recompute lean state from the shard's RAW state via robocasa_policy (the same path
@@ -499,6 +502,7 @@ class RoboCasaDataConfig(DataConfigFactory):
                     include_anchor_state=self.include_anchor_state,
                     include_conditioning=self.include_conditioning,
                     include_executed_step=self.include_executed_step,
+                    include_est_length=self.include_est_length,
                     include_gripper_flag=self.include_gripper_flag,
                 )
             ],

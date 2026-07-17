@@ -19,6 +19,7 @@ SG_RICH = "grasp the white mug by its handle and lift it off the rack"
 SG_COARSE = "prepare the mug"
 COND = {"quality": "good", "est_length": "42", "executed_step": "7"}
 COND_NOEXEC = {"quality": "good", "est_length": "42"}  # noexec: drop only Executed Step
+COND_NOESTL = {"quality": "good", "executed_step": "7"}  # noestl: drop only Estimated Length
 GRIP = "Open"
 
 # 14-d current + 14-d anchor lean state (numbers arbitrary — just to show the layout).
@@ -62,6 +63,7 @@ SETTINGS = [
     ("..._notask", {"include_task_goal": False}),
     ("..._nocond                (drop the whole conditioning line)", {"conditioning": None}),
     ("..._noexec                (drop only Executed Step)", {"conditioning": COND_NOEXEC}),
+    ("..._noestl                (drop only Estimated Length)", {"conditioning": COND_NOESTL}),
     ("..._noanchorstate          (drop anchor half; single State:)", {"state": CUR, "state_split": None}),
     ("..._nostate                (drop the ENTIRE state block)", {"include_state": False}),
     ("..._nogrip", {"grip": None}),
