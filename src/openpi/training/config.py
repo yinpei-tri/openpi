@@ -146,6 +146,9 @@ class ModelTransformFactory(GroupFactory):
     preserve_newlines: bool = False
     # RoboCasa System1: append "Current Gripper: <flag>;" after the state block.
     use_gripper_flag: bool = False
+    # RoboCasa System1 `nostate` ablation: if False, drop the discretized state block from
+    # the prompt entirely (keep Task: text + gripper + Action:). Default True.
+    include_state: bool = True
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -174,6 +177,7 @@ class ModelTransformFactory(GroupFactory):
                             task_state_sep=self.task_state_sep,
                             preserve_newlines=self.preserve_newlines,
                             use_gripper_flag=self.use_gripper_flag,
+                            include_state=self.include_state,
                         ),
                         # pi0.5 discretizes the state into the prompt text, so it does not
                         # need (and should not get) a zero-padded continuous state vector.
@@ -421,13 +425,24 @@ class RoboCasaDataConfig(DataConfigFactory):
     # Prepend the whole-task goal to the subgoal prompt for disambiguating context
     # ("<task>; Current Subgoal: <subgoal>"). ON by default.
     include_task_goal: bool = True
+    # Emit the proprioceptive state block in the prompt at all. ON by default (pi0.5 ingests
+    # state via the discretized prompt ints). When OFF, drop the ENTIRE state block — neither
+    # "Initial State: …" nor "Current State: …" appears (tag token: `nostate`). This is
+    # distinct from include_anchor_state (which only drops the anchor half). PLACEHOLDER: the
+    # knob + tag are wired, but the tokenizer drop-path is not fully plumbed yet — implement
+    # when actually running the no-state ablation.
+    include_state: bool = True
     # Append the anchor (subgoal-start) lean state to the current state so pi0.5's
     # discretized prompt ints carry the proprioceptive before/after delta (rendered as
-    # "Initial State: …; Current State: …"). ON by default.
+    # "Initial State: …; Current State: …"). ON by default. Only the ANCHOR half — the
+    # Current State stays (tag token: `noanchorstate`). No effect if include_state is off.
     include_anchor_state: bool = True
     # Emit the offline-RL conditioning line ("Quality: …; Estimated Length: …; Executed
-    # Step: …") in the prompt. ON by default.
+    # Step: …") in the prompt. ON by default (tag token `nocond` drops the whole line).
     include_conditioning: bool = True
+    # Finer-grained: keep the conditioning line but drop ONLY "Executed Step: …" (tag token
+    # `noexec`). ON by default. No effect if include_conditioning is False.
+    include_executed_step: bool = True
     # Append "Current Gripper: Open|Close;" after the state block. ON by default.
     include_gripper_flag: bool = True
     # Recompute lean state from the shard's RAW state via robocasa_policy (the same path
@@ -483,6 +498,7 @@ class RoboCasaDataConfig(DataConfigFactory):
                     include_task_goal=self.include_task_goal,
                     include_anchor_state=self.include_anchor_state,
                     include_conditioning=self.include_conditioning,
+                    include_executed_step=self.include_executed_step,
                     include_gripper_flag=self.include_gripper_flag,
                 )
             ],
@@ -503,6 +519,8 @@ class RoboCasaDataConfig(DataConfigFactory):
             # The conditioning line + gripper add structural newlines to preserve.
             preserve_newlines=True,
             use_gripper_flag=self.include_gripper_flag,
+            # `nostate`: drop the whole discretized state block from the prompt.
+            include_state=self.include_state,
         )(model_config)
         if self.progress_as_action:
             # INPUT: concat the progress dim onto the (normalized) action FIRST, THEN pad to

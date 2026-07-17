@@ -301,6 +301,11 @@ class TokenizePrompt(DataTransformFn):
     # If True, append "Current Gripper: <flag>;" after the state block, reading the flag
     # from data["gripper_flag"] (RoboCasa System1). No-op if the field is absent/empty.
     use_gripper_flag: bool = False
+    # If False, DROP the discretized state block from the prompt entirely (no "State:" /
+    # "Initial State:" / "Current State:" ints) while keeping the pi05 discrete format
+    # (Task: text + gripper + Action:). RoboCasa System1 `nostate` ablation. Default True
+    # (state rendered as usual). No effect when discrete_state_input is False (pi0 path).
+    include_state: bool = True
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -330,6 +335,7 @@ class TokenizePrompt(DataTransformFn):
             preserve_newlines=self.preserve_newlines,
             task_state_sep=self.task_state_sep,
             gripper_flag=gripper_flag,
+            include_state=self.include_state,
         )
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
