@@ -994,17 +994,17 @@ _CONFIGS = [
             flow_loss_real_dim=11,
             use_progress_head=True,
             # 10-way progress CLASSIFIER (cross-entropy on subgoal_progress_class 0..9),
-            # not the continuous state-value. progress_readout / progress_loss_weight (0.5)
-            # / stop_gradient (False) inherit the Pi0Config defaults; override via CLI.
+            # not the continuous state-value. Override --model.progress-mode=continuous for
+            # the regression head, or --data.progress-as-action (+ --model.no-use-progress-head)
+            # for progress-as-action. progress_readout / stop_gradient (False) inherit defaults.
             progress_mode="classes",
             progress_num_classes=10,
-            # Readout head: width 1024 / depth 2 (~25M). Wider than the 512 default for
-            # more decoding capacity, but only 2 layers — depth is what drives head
-            # activation/backprop memory (S^2 attention over the ~850-token prefix x
-            # num_layers), so 4 layers cost too much (dropped max batch 192->128 and
-            # OOM'd at 160). Width is the cheaper capacity lever here. Revisit depth only
-            # if progress_acc / progress_class_mae plateau.
-            progress_hidden=1024,
+            # FROZEN hyperparameters (not swept; not in the exp-name tag): loss weight 1.0,
+            # head width 512, gradients flow (no stop-grad, the Pi0Config default). Weight
+            # 1.0 makes progress a first-class co-training signal; 512 is the cheap-but-ample
+            # head width settled on after the earlier 1024 runs.
+            progress_loss_weight=1.0,
+            progress_hidden=512,
             progress_num_layers=2,
         ),
         data=RoboCasaDataConfig(
@@ -1016,9 +1016,11 @@ _CONFIGS = [
         ),
         batch_size=64,
         num_workers=8,
-        # Fixed LR 5e-5 (peak == decay, short warmup).
+        # FROZEN LR schedule: warmup 1k -> flat 5e-5 (peak == end, no decay). A flat LR has
+        # no schedule position to restore, so an EMA-only checkpoint can be continued at any
+        # step without train_state -- matching the no-resume/EMA-only workflow.
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500, peak_lr=5e-5, decay_steps=20_000, decay_lr=5e-5
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=20_000, decay_lr=5e-5
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,

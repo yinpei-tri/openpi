@@ -30,89 +30,78 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
-# Canonical RoboCasa System1 DEFAULTS — the resolved knob values on the base config
-# `pi05_robocasa_system1`. robocasa_exp_tag emits a token ONLY when a run deviates from
-# these, so a pure-default run keeps a bare exp_name and ablations get a short "diff" tag.
-# Keep in sync with pi05_robocasa_system1 in config.py (data + model blocks).
-_ROBOCASA_TAG_DEFAULTS = {
-    # data knobs
-    "prompt_source": "subgoal",
-    "subgoal_action_pad": "subgoal",
-    "repad_actions": False,
-    "include_task_goal": True,
-    "include_anchor_state": True,
-    "include_conditioning": True,
-    "include_gripper_flag": True,
-    "progress_as_action": False,
-    # model knobs
-    "use_anchor_images": True,
-    "use_progress_head": True,
-    "progress_mode": "classes",
-    "progress_readout": "shallow_transformer",
-    "progress_stop_gradient": False,
-    "progress_loss_weight": 0.5,
-    "progress_hidden": 1024,
+# --- RoboCasa System1 experiment-name settings tag -----------------------------------
+# The trainer appends `__<tag>` to exp_name so each run's checkpoint dir / wandb name is
+# unique + self-describing. The tag has ALWAYS-shown axes (the experiment variables) and
+# DEVIATION tokens (prompt-content knobs, shown only when they differ from the defaults).
+# Hyperparameters we've frozen (progress_loss_weight=1, progress_hidden=512, no stop-grad,
+# LR warmup1k->flat 5e-5, subgoal action-pad, base_pose on, ...) are NOT in the tag.
+#
+# ALWAYS shown (order: prog, gran, verb):
+#   prog{act|reg|cls}   progress predictor  (progact = progress-as-action head-off;
+#                       progreg = continuous regression head; progcls = 10-way classes head)
+#   gran{fine|crse|both}  subgoal granularity   (placeholder: only `fine` is in the data now)
+#   verb{simp|rich|both}  subgoal verbosity     (placeholder: only `simp` is in the data now)
+# DEVIATION tokens (order below), each shown only when the knob != its default:
+_ROBOCASA_PROMPT_DEVIATIONS = [
+    # (attr, default, token-when-different). All default TRUE (prompt-content on).
+    ("include_conditioning", True, "nocond"),
+    ("include_anchor_state", True, "nostate"),
+    ("include_task_goal", True, "notask"),
+    ("use_anchor_images", True, "noanchor"),  # read from model (data mirrors it)
+    ("include_gripper_flag", True, "nogrip"),
+]
+
+# Placeholder gran/verb derivation from the current single 3-way `prompt_source`. The data
+# only carries the terse fine-step subgoal today, so `subgoal` -> (fine, simp) is the only
+# combo that actually occurs; the others are mapped for when the data grows (then this is
+# replaced by real `gran`/`verb` data knobs). Unknown values fall back to (fine, simp).
+_PROMPT_SOURCE_TO_GRAN_VERB = {
+    "subgoal": ("fine", "simp"),
+    "subgoal_detail": ("fine", "rich"),
+    "milestone": ("crse", "simp"),
 }
 
 
 def robocasa_exp_tag(config: _config.TrainConfig) -> str:
-    """DIFF-from-default settings tag appended to exp_name for RoboCasa System1 runs.
+    """Settings tag appended to exp_name for RoboCasa System1 runs.
 
-    Ablations are CLI overrides on one config, so exp_name is the only thing that
-    distinguishes one run's checkpoint dir / wandb name from another. We append a
-    DETERMINISTIC tag listing ONLY the knobs that DIFFER from `_ROBOCASA_TAG_DEFAULTS`
-    (the base `pi05_robocasa_system1` values) — so a pure-default run keeps a bare
-    exp_name and an ablation gets a short, self-describing suffix (e.g. `prog-continuous_w1_h512`).
-    Deterministic => same settings reproduce the same path, so --resume still works.
-    Returns "" for non-RoboCasa configs and for pure-default RoboCasa runs.
+    Format: ``prog<x>_gran<y>_verb<z>[_<deviations>]`` — the three always-shown axes
+    (progress predictor, subgoal granularity, subgoal verbosity) plus a deviation token for
+    each prompt-content knob that differs from its default. Deterministic => same settings
+    reproduce the same path, so --resume still works. Returns "" for non-RoboCasa configs.
+
+    Example: ``progreg_granfine_verbsimp`` (regression, fine+simple subgoal, full prompt);
+    ``progcls_granfine_verbsimp_notask_nostate`` (classes, subgoal-only prompt, no state).
     """
     data = config.data  # the RoboCasaDataConfig factory (has the knobs directly)
     # RoboCasa runs are identified by the system1_full knob `prompt_source`.
     if not hasattr(data, "prompt_source") or not hasattr(data, "shards"):
         return ""  # not a RoboCasa run
     m = config.model
-    d = _ROBOCASA_TAG_DEFAULTS
 
-    def val(obj, name):
-        return getattr(obj, name, d[name])
-
-    parts: list[str] = []
-    # Data knobs: emit only on deviation from default.
-    if val(data, "prompt_source") != d["prompt_source"]:
-        parts.append(f"src-{val(data, 'prompt_source')}")
-    if val(data, "subgoal_action_pad") != d["subgoal_action_pad"]:
-        parts.append(f"pad-{val(data, 'subgoal_action_pad')}")
-    if val(data, "repad_actions") != d["repad_actions"]:
-        parts.append("repad")
-    if val(m, "use_anchor_images") != d["use_anchor_images"]:
-        parts.append("noanchor")  # default is anchor ON, so a deviation is always "off"
-    if val(data, "include_task_goal") != d["include_task_goal"]:
-        parts.append("notaskgoal")
-    if val(data, "include_anchor_state") != d["include_anchor_state"]:
-        parts.append("noanchorstate")
-    if val(data, "include_conditioning") != d["include_conditioning"]:
-        parts.append("nocond")
-    if val(data, "include_gripper_flag") != d["include_gripper_flag"]:
-        parts.append("nogrip")
-    if val(data, "progress_as_action") != d["progress_as_action"]:
-        parts.append("progact")
-
-    # Progress head knobs: emit only on deviation. If the head is OFF (a deviation), emit
-    # `noprog` and skip the head sub-knobs (they're irrelevant then).
-    if val(m, "use_progress_head") != d["use_progress_head"]:
-        if not val(m, "use_progress_head"):
-            parts.append("noprog")
+    # 1) Progress predictor (always shown, exactly one).
+    if getattr(data, "progress_as_action", False):
+        predictor = "act"  # progress is a 12th action dim; head is off
+    elif not getattr(m, "use_progress_head", True):
+        predictor = "none"  # no progress signal at all (edge case)
+    elif getattr(m, "progress_mode", "classes") == "continuous":
+        predictor = "reg"
     else:
-        if val(m, "progress_mode") != d["progress_mode"]:
-            parts.append(f"prog-{val(m, 'progress_mode')}")
-        if val(m, "progress_readout") != d["progress_readout"]:
-            parts.append(f"readout-{val(m, 'progress_readout')}")
-        if val(m, "progress_stop_gradient") != d["progress_stop_gradient"]:
-            parts.append("sg")  # default is nosg (gradients flow); deviation = stop-grad ON
-        if val(m, "progress_loss_weight") != d["progress_loss_weight"]:
-            parts.append(f"w{val(m, 'progress_loss_weight'):g}")
-        if val(m, "progress_hidden") != d["progress_hidden"]:
-            parts.append(f"h{val(m, 'progress_hidden')}")
+        predictor = "cls"  # classes (default); binary retired
+    parts = [f"prog{predictor}"]
+
+    # 2) Subgoal granularity + verbosity (always shown). Placeholder: derived from the
+    #    single prompt_source knob until the data supports the full gran x verb grid.
+    gran, verb = _PROMPT_SOURCE_TO_GRAN_VERB.get(getattr(data, "prompt_source", "subgoal"), ("fine", "simp"))
+    parts.append(f"gran{gran}")
+    parts.append(f"verb{verb}")
+
+    # 3) Prompt-content deviations (shown only when the knob != default).
+    for attr, default, token in _ROBOCASA_PROMPT_DEVIATIONS:
+        obj = m if attr == "use_anchor_images" else data
+        if getattr(obj, attr, default) != default:
+            parts.append(token)
     return "_".join(parts)
 
 
