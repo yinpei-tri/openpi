@@ -31,7 +31,7 @@ job:
 queue:
   name: vla
   priority: 10
-  share_identifier: dyp
+  share_identifier: default
 
 instance:
   type: p5                    # H100

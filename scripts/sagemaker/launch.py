@@ -471,6 +471,14 @@ def main() -> None:
         queue_name = f"fss-{cfg['queue']['name']}-{QUEUE_SUFFIX[region][instance_type]}"
     print(f"Queue: {queue_name}")
 
+    # SPOT vs RESERVED/on-demand queues need DIFFERENT env (see the env dict below):
+    # the reserved queues (e.g. fss-vla-*) require SM_USE_RESERVED_CAPACITY=1 to admit the
+    # job, but on a SPOT queue (fss-*-spot-*) that same flag makes the scheduler STOP the
+    # job (it's asking for reserved capacity on a spot pool). So gate the flag on the queue
+    # type. Detect spot by the "-spot-" segment in the resolved queue name.
+    is_spot_queue = "-spot-" in queue_name
+    print(f"Queue type: {'SPOT' if is_spot_queue else 'reserved/on-demand'}")
+
     # --- entrypoint / topology / resume safety gate --------------------------------------
     entrypoint_name = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh")
     count = int(cfg["instance"]["count"])
@@ -525,7 +533,6 @@ def main() -> None:
 
     # All trainer config flows through env vars consumed by sm_entrypoint.sh.
     env = {
-        "SM_USE_RESERVED_CAPACITY": "1",
         "PYTHONPATH": "/opt/ml/code/src:/opt/ml/code/packages/openpi-client/src",
         "NCCL_DEBUG": "INFO",
         "FI_EFA_FORK_SAFE": "1",
@@ -536,6 +543,12 @@ def main() -> None:
         "RESUME": "1" if cfg["training"].get("resume") else "0",
         "OVERWRITE": "1" if cfg["training"].get("overwrite") else "0",
     }
+    # SM_USE_RESERVED_CAPACITY: required on RESERVED/on-demand queues (fss-vla-*) to admit
+    # the job; but on a SPOT queue it causes the scheduler to STOP the job (reserved-capacity
+    # request against a spot pool). So set it ONLY for non-spot queues, and leave it UNSET on
+    # spot. (This is why an earlier 2-node spot submit never scheduled.)
+    if not is_spot_queue:
+        env["SM_USE_RESERVED_CAPACITY"] = "1"
     # Download-to-local data mode (JAX RoboCasa): if data.download_s3_uri is set, the
     # entrypoint `aws s3 sync`s that s3:// dataset root to local EBS once and reads from
     # local disk (no FastFile FUSE mount -> no ENOTCONN mid-run, fastest reads). Requires
