@@ -40,7 +40,9 @@ class PaligemmaTokenizer:
             # This is the Pi05 format, where the state is part of the discrete language input.
             # ``task_state_sep`` is the separator before ``State:`` (stock ", "; RoboCasa
             # System1 uses "\n" so the state block starts on its own line).
-            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            # Clip to [0, 255]: values <= -1 would give -1 after the `- 1`, and values >= 1
+            # would give 256 — both out of the valid state-int range. Clamp both ends.
+            discretized_state = np.clip(np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1, 0, 255)
             # Optional "Current Gripper: Open|Close;" tag appended after the state block
             # (RoboCasa System1: the discretized gripper width is coarse, so the explicit
             # open/close flag is a cleaner conditioning signal).
@@ -110,7 +112,8 @@ class FASTTokenizer:
         cleaned_text = prompt.lower().strip().replace("_", " ")
 
         # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
-        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        # Clip to [0, 255]: values <= -1 -> -1 and values >= 1 -> 256 are out of range.
+        discretized_state = np.clip(np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1, 0, 255)
 
         # Convention: prefix includes prompt and string-representation of state, followed by ';'
         state_str = " ".join(map(str, discretized_state))
@@ -223,7 +226,8 @@ class BinningTokenizer:
         cleaned_text = prompt.lower().strip().replace("_", " ")
 
         # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
-        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        # Clip to [0, 255]: values <= -1 -> -1 and values >= 1 -> 256 are out of range.
+        discretized_state = np.clip(np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1, 0, 255)
 
         # Convention: prefix includes prompt and string-representation of state, followed by ';'
         state_str = " ".join(map(str, discretized_state))
@@ -346,7 +350,8 @@ class FSQTokenizer:
         cleaned_text = prompt.lower().strip().replace("_", " ")
 
         # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
-        discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+        # Clip to [0, 255]: values <= -1 -> -1 and values >= 1 -> 256 are out of range.
+        discretized_state = np.clip(np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1, 0, 255)
 
         # Convention: prefix includes prompt and string-representation of state, followed by ';'
         state_str = " ".join(map(str, discretized_state))
