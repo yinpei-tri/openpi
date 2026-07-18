@@ -610,8 +610,16 @@ class RoboCasaWebDataset:
             # Zero out (set to complete) past the last in-subgoal step, per the pad mask.
             mask = arrays.get("action_pad_mask_subgoal")
             if mask is not None and not mask.all():
-                last = int(np.where(mask)[0][-1])
-                prog[last + 1 :] = 1.0
+                in_subgoal = np.where(mask)[0]
+                if in_subgoal.size == 0:
+                    # Intentional full-stop sample: the subgoal is already complete, so NO
+                    # step lies within it (all-False mask). The whole chunk is "done" -> the
+                    # per-step progress target is 1.0 everywhere. (Guard against the empty
+                    # np.where(...)[0][-1] that would otherwise raise IndexError and silently
+                    # drop these deliberately-added stop examples via skip-and-continue.)
+                    prog[:] = 1.0
+                else:
+                    prog[int(in_subgoal[-1]) + 1 :] = 1.0
             sample["progress_action"] = (2.0 * prog - 1.0).astype(np.float32)  # [-1,1], shape [horizon]
         return sample
 
@@ -628,7 +636,13 @@ class RoboCasaWebDataset:
             mask = arrays["action_pad_mask_subgoal"]
             if mask.all():
                 return real  # subgoal spans the whole horizon; nothing to pad
-            last = int(np.where(mask)[0][-1])
+            in_subgoal = np.where(mask)[0]
+            if in_subgoal.size == 0:
+                # Intentional full-stop sample: subgoal already complete, no in-subgoal step
+                # to re-derive the hold from. The producer's baked subgoal-pad chunk already
+                # IS the full stop pose -> use it directly (and avoid the empty-np.where crash).
+                return arrays["lean_action_subgoal_pad"].astype(np.float32)
+            last = int(in_subgoal[-1])
             hold = real[last, LEAN_ACTION_HOLD_IDX]
             real[last + 1 :] = 0.0
             real[last + 1 :, LEAN_ACTION_HOLD_IDX] = hold
