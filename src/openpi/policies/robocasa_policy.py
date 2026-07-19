@@ -381,4 +381,11 @@ class RobocasaOutputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         lean = np.asarray(data["actions"][:, :LEAN_ACTION_DIM])
-        return {"actions": sim_action_from_lean(lean)}
+        out = {"actions": sim_action_from_lean(lean)}
+        # Preserve any progress readout the policy produced: `progress` (progress-as-action,
+        # popped by SplitProgressAction upstream) or `progress_head` (classes/continuous head,
+        # added by Policy.infer). Without this pass-through they'd be dropped here.
+        for k in ("progress", "progress_head"):
+            if k in data:
+                out[k] = data[k]
+        return out

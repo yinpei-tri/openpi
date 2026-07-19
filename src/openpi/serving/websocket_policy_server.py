@@ -58,7 +58,11 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                # Run the (synchronous, potentially multi-second — first call JIT-compiles)
+                # inference in a thread so the asyncio event loop stays free to answer the
+                # client's keepalive pings. Otherwise a slow first infer blocks the loop past
+                # the client ping timeout and the connection is dropped mid-compile.
+                action = await asyncio.to_thread(self._policy.infer, obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {
@@ -75,12 +79,21 @@ class WebsocketPolicyServer:
                 logger.info(f"Connection from {websocket.remote_address} closed")
                 break
             except Exception:
-                await websocket.send(traceback.format_exc())
-                await websocket.close(
-                    code=websockets.frames.CloseCode.INTERNAL_ERROR,
-                    reason="Internal server error. Traceback included in previous frame.",
-                )
-                raise
+                # Report the error to THIS client and drop the connection, but keep the
+                # server alive for other/subsequent connections (the original code re-raised,
+                # tearing down serve_forever — a single bad request or a client killed
+                # mid-inference would then kill the whole server for a long eval sweep).
+                tb = traceback.format_exc()
+                logger.error(f"Inference error for {websocket.remote_address}:\n{tb}")
+                try:
+                    await websocket.send(tb)
+                    await websocket.close(
+                        code=websockets.frames.CloseCode.INTERNAL_ERROR,
+                        reason="Internal server error. Traceback included in previous frame.",
+                    )
+                except websockets.ConnectionClosed:
+                    pass
+                break
 
 
 def _health_check(connection: _server.ServerConnection, request: _server.Request) -> _server.Response | None:

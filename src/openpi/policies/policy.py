@@ -64,6 +64,17 @@ class Policy(BasePolicy):
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
             self._rng = rng or jax.random.key(0)
 
+        # System1 progress readout: the flow-sampling path (`sample_actions`) never reads the
+        # progress HEAD, so the classes/continuous variants would otherwise expose no progress
+        # at inference (only the progress-as-action variant surfaces it, via SplitProgressAction
+        # in the output transforms). When the model carries a progress head, expose an extra
+        # `predict_progress` call so infer() can return it. No-op for progress-as-action /
+        # no-head models.
+        self._has_progress_head = bool(getattr(self._model, "_use_progress_head", False))
+        logging.info(f"Policy: has_progress_head={self._has_progress_head}")
+        if self._has_progress_head and not self._is_pytorch_model:
+            self._predict_progress = nnx_utils.module_jit(model.predict_progress)
+
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
@@ -93,6 +104,19 @@ class Policy(BasePolicy):
             "state": inputs["state"],
             "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
         }
+        # Progress head (classes/continuous variants): one extra noise-independent prefix pass.
+        # classes -> softmax [K] over decile buckets; continuous -> scalar [0,1]. The
+        # progress-as-action variant has no head and returns progress via SplitProgressAction.
+        if self._has_progress_head:
+            if self._is_pytorch_model:
+                progress = self._model.predict_progress(observation)
+            else:
+                progress = self._predict_progress(observation)
+            # Cast to float32: params are restored at inference in bfloat16 (see
+            # policy_config.create_trained_policy -> restore_params(dtype=jnp.bfloat16)), so the
+            # head output is bf16, which msgpack_numpy can't serialize. Independent of the
+            # checkpoint's on-disk precision.
+            outputs["progress_head"] = jnp.asarray(progress, dtype=jnp.float32)
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
