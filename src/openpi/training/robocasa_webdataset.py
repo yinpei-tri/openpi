@@ -117,6 +117,10 @@ class WebDatasetConfig:
     # derived from this in _worker_shards / by set_resume_state. Approximate at the sample
     # level (the reservoir buffer's in-flight samples are dropped), but shard-accurate.
     resume_shards_consumed: int = 0
+    # MULTI-NODE debug: log a one-time [data-shard-split] line per (jax-process, torch-worker)
+    # showing that feeder's disjoint shard slice. Off by default; only meaningful when
+    # process_count > 1 (single-node never takes the multi-node split path).
+    debug_shard_split: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -252,12 +256,36 @@ class RoboCasaWebDataset:
         if not self._shards:
             raise ValueError(f"No .tar shards found at {cfg.shards}")
         self._epoch = 0
+        self._debug_shard_split_logged = False
+        # MULTI-NODE: capture (process_index, process_count) HERE, in the MAIN process,
+        # where jax.distributed has already been initialized. torch DataLoader workers are
+        # spawned as FRESH interpreters that never call jax.distributed.initialize(), so
+        # jax.process_index()/process_count() inside a worker return 0/1 -> every node would
+        # read ALL shards in the same order and feed DUPLICATE data. Freezing the values now
+        # and reading them via _process_info() in the worker guarantees each node gets its
+        # disjoint shard slice. Single-node: (0, 1) -> the split below is an identity no-op.
+        try:
+            import jax
+
+            self._proc_idx = jax.process_index()
+            self._proc_cnt = jax.process_count()
+        except Exception:
+            self._proc_idx, self._proc_cnt = 0, 1
         # Data-resume state (derived from cfg.resume_shards_consumed in _init_resume_state):
         #   _resume_epoch      = the epoch the resumed step falls in (skip applies only here)
         #   _resume_epoch_skip = GLOBAL shards to skip within that epoch (before per-worker split)
         self._resume_epoch = 0
         self._resume_epoch_skip = 0
         self._resume_skip_logged = False
+        # Multi-node resume is NOT supported: the per-process disjoint slice + the resume
+        # shard-skip would need to be reconciled per-process, which is untested. Fail loudly
+        # rather than silently skip the wrong shards on each node. (Single-node resume works.)
+        if self.cfg.resume_shards_consumed > 0 and self._proc_cnt > 1:
+            raise NotImplementedError(
+                "Multi-node resuming is not supported (resume_shards_consumed>0 with "
+                f"process_count={self._proc_cnt}). Resume is single-node only; for multi-node, "
+                "start a fresh run (EMA-only checkpoints, no train_state)."
+            )
         self._init_resume_state()
         # shards may be a comma-separated list of dirs (pooled dataset); split for the
         # per-dir manifest count + anchor-root derivation.
@@ -355,6 +383,15 @@ class RoboCasaWebDataset:
         self._epoch = 0
         self._init_resume_state()
 
+    def _process_info(self) -> tuple[int, int]:
+        """(process_index, process_count) for multi-node shard splitting.
+
+        Returns the values FROZEN at construction time in the main process. Do NOT call
+        jax.process_index() here: this may run inside a spawned torch worker where JAX is
+        not distributed-initialized and would report 0/1 (see __init__).
+        """
+        return self._proc_idx, self._proc_cnt
+
     def _init_resume_state(self) -> None:
         """Translate cfg.resume_shards_consumed (GLOBAL shards consumed pre-checkpoint)
         into a starting epoch + an intra-epoch global skip, and START the loader at that
@@ -384,9 +421,7 @@ class RoboCasaWebDataset:
             d = Path(d_str)
             man = (d / "manifest.jsonl") if d.is_dir() else (d.parent / "manifest.jsonl")
             if man.exists():
-                total += sum(
-                    json.loads(line)["num_samples"] for line in man.read_text().splitlines() if line.strip()
-                )
+                total += sum(json.loads(line)["num_samples"] for line in man.read_text().splitlines() if line.strip())
         return total
 
     def __len__(self) -> int:
@@ -395,11 +430,26 @@ class RoboCasaWebDataset:
     def _worker_shards(self) -> list[str]:
         """Split shards across torch DataLoader workers + shuffle shard order per epoch.
 
-        Data-resume: on the FIRST epoch after a resume (self._epoch == self._resume_epoch),
-        drop the shards this worker already consumed before the checkpoint. Ownership is
-        seed-deterministic, so we can reconstruct exactly which shards each worker had and
-        skip its consumed prefix — no persisted per-worker counter needed. Subsequent
-        epochs (wrap-around) apply no skip.
+        Two code paths, selected by process_count (frozen at construction):
+
+        SINGLE-NODE (proc_cnt == 1): unchanged from before. Shuffle by seed+epoch, slice by
+        torch worker, then apply the resume shard-skip on the resumed epoch. Data-resume:
+        ownership is seed-deterministic, so we reconstruct exactly which shards each worker
+        had and skip its consumed prefix — no persisted per-worker counter needed.
+
+        MULTI-NODE (proc_cnt > 1): split shards by jax.process_index() FIRST, so each node
+        owns a disjoint slice. Ordering is CRITICAL for correctness: process ownership must
+        be assigned BEFORE the per-epoch reshuffle, using an epoch-INDEPENDENT seed. Epochs
+        advance independently per host (__iter__ bumps self._epoch when a host finishes a
+        pass), so if we shuffled by seed+epoch and THEN sliced by process, a host at epoch 1
+        and a host at epoch 0 would shuffle differently and their shards[proc::cnt] slices
+        would OVERLAP -> duplicate training data. So:
+          1. shuffle by a FIXED seed (same on every process, every epoch), slice by process
+             -> each process owns a PERMANENT disjoint set, invariant to epoch skew.
+          2. reshuffle that fixed slice by seed+epoch for order diversity across passes.
+          3. slice by torch worker within the node.
+        Resume shard-skip is NOT applied under multi-node (multi-node resume is rejected in
+        __init__), so there is no skew between the two paths' resume handling.
         """
         try:
             import torch.utils.data as tud
@@ -410,6 +460,32 @@ class RoboCasaWebDataset:
         num_workers = info.num_workers if (info is not None and info.num_workers > 1) else 1
         worker_id = info.id if (info is not None and info.num_workers > 1) else 0
 
+        proc_idx, proc_cnt = self._process_info()
+
+        if proc_cnt > 1:
+            # --- MULTI-NODE path (see docstring). Single-node never enters here. ---
+            shards = list(self._shards)  # list_shards() returns a deterministic sorted list
+            random.Random(self.cfg.seed).shuffle(shards)  # epoch-INDEPENDENT ownership assignment
+            shards = shards[proc_idx::proc_cnt]  # this process's PERMANENT disjoint slice
+            random.Random(self.cfg.seed + self._epoch).shuffle(shards)  # per-epoch order within the slice
+            if num_workers > 1:
+                shards = shards[worker_id::num_workers]  # this worker's slice within the node
+            if self.cfg.debug_shard_split and not self._debug_shard_split_logged:
+                self._debug_shard_split_logged = True
+                logger.info(
+                    "[data-shard-split] jax_proc=%d/%d torch_worker=%d/%d epoch=%d -> %d/%d shards (first: %s)",
+                    proc_idx,
+                    proc_cnt,
+                    worker_id,
+                    num_workers,
+                    self._epoch,
+                    len(shards),
+                    len(self._shards),
+                    Path(shards[0]).name if shards else "NONE",
+                )
+            return shards
+
+        # --- SINGLE-NODE path: byte-for-byte identical to the pre-multinode behavior. ---
         shards = list(self._shards)
         random.Random(self.cfg.seed + self._epoch).shuffle(shards)
         if num_workers > 1:
@@ -569,7 +645,10 @@ class RoboCasaWebDataset:
         # etc. Without this bump the JAX trainer (which never calls set_epoch) would pin
         # _epoch forever and re-skip the same shards every pass.
         epoch = self._epoch
-        rng = random.Random(cfg.seed + epoch * 7919)
+        # Per-process reservoir rng: fold in process_index so each node shuffles its
+        # (already disjoint) buffer differently. Single-node: proc_idx==0, so this reduces
+        # to the original seed (cfg.seed + epoch*7919) -> unchanged behavior.
+        rng = random.Random(cfg.seed + epoch * 7919 + self._process_info()[0])
         buffer: list[dict[str, Any]] = []
         # Skip-and-continue tolerance (vla_foundry pattern): a shard that fails to
         # open/stream, or a single sample that fails to decode/build, is LOGGED and

@@ -146,6 +146,9 @@ class ModelTransformFactory(GroupFactory):
     preserve_newlines: bool = False
     # RoboCasa System1: append "Current Gripper: <flag>;" after the state block.
     use_gripper_flag: bool = False
+    # RoboCasa System1 `nostate` ablation: if False, drop the discretized state block from
+    # the prompt entirely (keep Task: text + gripper + Action:). Default True.
+    include_state: bool = True
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
@@ -174,6 +177,7 @@ class ModelTransformFactory(GroupFactory):
                             task_state_sep=self.task_state_sep,
                             preserve_newlines=self.preserve_newlines,
                             use_gripper_flag=self.use_gripper_flag,
+                            include_state=self.include_state,
                         ),
                         # pi0.5 discretizes the state into the prompt text, so it does not
                         # need (and should not get) a zero-padded continuous state vector.
@@ -421,13 +425,27 @@ class RoboCasaDataConfig(DataConfigFactory):
     # Prepend the whole-task goal to the subgoal prompt for disambiguating context
     # ("<task>; Current Subgoal: <subgoal>"). ON by default.
     include_task_goal: bool = True
+    # Emit the proprioceptive state block in the prompt at all. ON by default (pi0.5 ingests
+    # state via the discretized prompt ints). When OFF, drop the ENTIRE state block — neither
+    # "Initial State: …" nor "Current State: …" appears (tag token: `nostate`). This is
+    # distinct from include_anchor_state (which only drops the anchor half). PLACEHOLDER: the
+    # knob + tag are wired, but the tokenizer drop-path is not fully plumbed yet — implement
+    # when actually running the no-state ablation.
+    include_state: bool = True
     # Append the anchor (subgoal-start) lean state to the current state so pi0.5's
     # discretized prompt ints carry the proprioceptive before/after delta (rendered as
-    # "Initial State: …; Current State: …"). ON by default.
+    # "Initial State: …; Current State: …"). ON by default. Only the ANCHOR half — the
+    # Current State stays (tag token: `noanchorstate`). No effect if include_state is off.
     include_anchor_state: bool = True
     # Emit the offline-RL conditioning line ("Quality: …; Estimated Length: …; Executed
-    # Step: …") in the prompt. ON by default.
+    # Step: …") in the prompt. ON by default (tag token `nocond` drops the whole line).
     include_conditioning: bool = True
+    # Finer-grained: keep the conditioning line but drop ONLY "Executed Step: …" (tag token
+    # `noexec`). ON by default. No effect if include_conditioning is False.
+    include_executed_step: bool = True
+    # Finer-grained: keep the conditioning line but drop ONLY "Estimated Length: …" (tag
+    # token `noestl`). ON by default. No effect if include_conditioning is False.
+    include_est_length: bool = True
     # Append "Current Gripper: Open|Close;" after the state block. ON by default.
     include_gripper_flag: bool = True
     # Recompute lean state from the shard's RAW state via robocasa_policy (the same path
@@ -483,6 +501,8 @@ class RoboCasaDataConfig(DataConfigFactory):
                     include_task_goal=self.include_task_goal,
                     include_anchor_state=self.include_anchor_state,
                     include_conditioning=self.include_conditioning,
+                    include_executed_step=self.include_executed_step,
+                    include_est_length=self.include_est_length,
                     include_gripper_flag=self.include_gripper_flag,
                 )
             ],
@@ -503,6 +523,8 @@ class RoboCasaDataConfig(DataConfigFactory):
             # The conditioning line + gripper add structural newlines to preserve.
             preserve_newlines=True,
             use_gripper_flag=self.include_gripper_flag,
+            # `nostate`: drop the whole discretized state block from the prompt.
+            include_state=self.include_state,
         )(model_config)
         if self.progress_as_action:
             # INPUT: concat the progress dim onto the (normalized) action FIRST, THEN pad to
@@ -994,17 +1016,17 @@ _CONFIGS = [
             flow_loss_real_dim=11,
             use_progress_head=True,
             # 10-way progress CLASSIFIER (cross-entropy on subgoal_progress_class 0..9),
-            # not the continuous state-value. progress_readout / progress_loss_weight (0.5)
-            # / stop_gradient (False) inherit the Pi0Config defaults; override via CLI.
+            # not the continuous state-value. Override --model.progress-mode=continuous for
+            # the regression head, or --data.progress-as-action (+ --model.no-use-progress-head)
+            # for progress-as-action. progress_readout / stop_gradient (False) inherit defaults.
             progress_mode="classes",
             progress_num_classes=10,
-            # Readout head: width 1024 / depth 2 (~25M). Wider than the 512 default for
-            # more decoding capacity, but only 2 layers — depth is what drives head
-            # activation/backprop memory (S^2 attention over the ~850-token prefix x
-            # num_layers), so 4 layers cost too much (dropped max batch 192->128 and
-            # OOM'd at 160). Width is the cheaper capacity lever here. Revisit depth only
-            # if progress_acc / progress_class_mae plateau.
-            progress_hidden=1024,
+            # FROZEN hyperparameters (not swept; not in the exp-name tag): loss weight 1.0,
+            # head width 512, gradients flow (no stop-grad, the Pi0Config default). Weight
+            # 1.0 makes progress a first-class co-training signal; 512 is the cheap-but-ample
+            # head width settled on after the earlier 1024 runs.
+            progress_loss_weight=1.0,
+            progress_hidden=512,
             progress_num_layers=2,
         ),
         data=RoboCasaDataConfig(
@@ -1016,9 +1038,11 @@ _CONFIGS = [
         ),
         batch_size=64,
         num_workers=8,
-        # Fixed LR 5e-5 (peak == decay, short warmup).
+        # FROZEN LR schedule: warmup 1k -> flat 5e-5 (peak == end, no decay). A flat LR has
+        # no schedule position to restore, so an EMA-only checkpoint can be continued at any
+        # step without train_state -- matching the no-resume/EMA-only workflow.
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=500, peak_lr=5e-5, decay_steps=20_000, decay_lr=5e-5
+            warmup_steps=1_000, peak_lr=5e-5, decay_steps=20_000, decay_lr=5e-5
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=0.999,

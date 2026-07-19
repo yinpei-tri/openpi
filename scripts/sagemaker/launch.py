@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import time
@@ -47,6 +48,15 @@ QUEUE_SUFFIX = {
         "ml.p6-b200.48xlarge": "p6-b200-48xlarge-us-west-2",
     },
 }
+
+# Entrypoints whose S3 checkpoint sync is RANK-AWARE (only the primary host uploads, with
+# --delete), so they are safe to run with instance.count > 1. Non-listed JAX/PyTorch
+# entrypoints sync from every host and could let a non-primary host wipe rank-0's files.
+MULTINODE_SAFE_ENTRYPOINTS = {"sm_entrypoint_robocasa_multinode_jax.sh"}
+# Entrypoints that honor --resume. The multi-node RoboCasa entrypoint deliberately does NOT
+# (the trainer + loader reject a multi-node resume), so a resume request there would silently
+# start fresh — the launcher rejects that combination instead.
+RESUME_CAPABLE_ENTRYPOINTS = {"sm_entrypoint.sh", "sm_entrypoint_jax.sh"}
 
 
 # -----------------------------------------------------------------------------
@@ -99,10 +109,45 @@ def run(cmd: str) -> None:
     subprocess.run(cmd, shell=True, check=True, cwd=REPO_ROOT)
 
 
+def _has_buildx() -> bool:
+    """True if `docker buildx` is available (needed for the Dockerfile's BuildKit syntax
+    — COPY --from / RUN --mount). The multi-node builds use it; single-node builds work
+    either way (docker build on daemons with integrated BuildKit also works)."""
+    return subprocess.run("docker buildx version", shell=True, capture_output=True).returncode == 0
+
+
+def _s3_prefix_has_objects(s3_uri: str, aws_cfg: dict) -> bool:
+    """True if any object exists under s3_uri. Read-only (list, 1 key). Used to guard
+    against clobbering an existing experiment's checkpoints (the S3 dir is now keyed by the
+    timestamp-free semantic exp_name). Returns False on any error (never blocks submit on a
+    transient list failure — the guard is a courtesy, not a correctness gate)."""
+    from urllib.parse import urlparse
+
+    try:
+        u = urlparse(s3_uri)
+        session = boto3.Session(profile_name=aws_cfg.get("profile"), region_name=aws_cfg.get("region"))
+        resp = session.client("s3").list_objects_v2(Bucket=u.netloc, Prefix=u.path.lstrip("/"), MaxKeys=1)
+        return resp.get("KeyCount", 0) > 0
+    except Exception as e:
+        logging.warning(f"Could not check S3 for existing checkpoints ({s3_uri}): {e!r}; skipping collision guard.")
+        return False
+
+
 def ecr_account(region: str, profile: str) -> str:
     out = subprocess.check_output(
-        ["aws", "--region", region, "--profile", profile,
-         "sts", "get-caller-identity", "--query", "Account", "--output", "text"],
+        [
+            "aws",
+            "--region",
+            region,
+            "--profile",
+            profile,
+            "sts",
+            "get-caller-identity",
+            "--query",
+            "Account",
+            "--output",
+            "text",
+        ],
         text=True,
     ).strip()
     if not out.isdigit():
@@ -149,8 +194,14 @@ def build_and_push_image(cfg: dict, tag: str) -> str:
     sm_entrypoint = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh")
 
     run(login_dlc)
+    # Prefer buildx (BuildKit) — the Dockerfile may use `COPY --from` / `RUN --mount`.
+    # `--load` imports the result into the local daemon so the subsequent tag/push works
+    # (the docker-container builder doesn't auto-load). Falls back to plain `docker build`
+    # when buildx isn't present (daemons with integrated BuildKit handle the syntax too).
+    build_cmd = "docker buildx build" if _has_buildx() else "docker build"
+    load_flag = " --load" if _has_buildx() else ""
     run(
-        f"docker build --progress=plain -f {dockerfile} "
+        f"{build_cmd} --progress=plain{load_flag} -f {dockerfile} "
         f"--build-arg AWS_REGION={region} --build-arg SM_ENTRYPOINT={sm_entrypoint} -t {repo} ."
     )
     run(f"docker tag {repo} {fullname}")
@@ -283,13 +334,29 @@ def _norm_stats_fingerprint(config_name: str) -> dict:
 
 
 def _write_job_manifest(
-    *, job_name, queue_name, image_uri, env, inputs, cfg, config_name, exp_name, checkpoint_s3_uri, output_s3_uri, max_run_seconds
+    *,
+    job_name,
+    semantic,
+    queue_name,
+    image_uri,
+    env,
+    inputs,
+    cfg,
+    config_name,
+    exp_name,
+    checkpoint_s3_uri,
+    output_s3_uri,
+    max_run_seconds,
 ) -> None:
-    """Write a self-contained record of this submission to scripts/sagemaker/submitted_jobs/
-    (both .json for tooling and .md for reading). Captures everything you'd otherwise have to
-    reconstruct later: job id, wandb project, data channels + URIs, image tag, config +
-    key trainer args, checkpoint S3 location, queue/priority, and the git commit."""
-    out_dir = REPO_ROOT / "scripts" / "sagemaker" / "submitted_jobs"
+    """Write a self-contained record of this submission to
+    scripts/sagemaker/submitted_jobs/<semantic>/ (job.json for tooling, job.md for reading,
+    norm_stats.json for reproducibility). ONE folder per experiment (keyed by the semantic
+    exp_name, matching the S3 layout) instead of a flat pile of {job_name}.* files — so the
+    dir stays navigable as runs accumulate, and the job-monitor skill can find a run by its
+    semantic name. Captures everything you'd otherwise reconstruct later: job id, wandb
+    project, data channels + URIs, image tag, config + key trainer args, checkpoint S3
+    location, queue/priority, and the git commit."""
+    out_dir = REPO_ROOT / "scripts" / "sagemaker" / "submitted_jobs" / semantic
     out_dir.mkdir(parents=True, exist_ok=True)
 
     channels = {
@@ -303,7 +370,11 @@ def _write_job_manifest(
         "git_commit": _git_commit(),
         "queue": queue_name,
         "priority": cfg["queue"]["priority"],
-        "instance": {"type": cfg["instance"]["type"], "count": cfg["instance"]["count"], "volume_size_gb": cfg["job"]["volume_size"]},
+        "instance": {
+            "type": cfg["instance"]["type"],
+            "count": cfg["instance"]["count"],
+            "volume_size_gb": cfg["job"]["volume_size"],
+        },
         "max_run_days": cfg["job"]["max_run_days"],
         "image_uri": image_uri,
         "train_config": config_name,
@@ -330,17 +401,18 @@ def _write_job_manifest(
         # Fingerprint (sha256 + dims + mean[0]) of the norm_stats baked into THIS job's
         # image, so you can verify/trace exactly which normalization was used.
         "norm_stats": _norm_stats_fingerprint(config_name),
+        "semantic": semantic,
         "checkpoint_s3_dir": ckpt_dir,
         "output_artifacts": f"{output_s3_uri}/{job_name}/output.tar.gz",
         "ckpt_download_cmd": f"aws s3 sync {ckpt_dir} ./checkpoints/{config_name}/{exp_name}/ --profile {cfg['aws']['profile']}",
     }
-    (out_dir / f"{job_name}.json").write_text(json.dumps(rec, indent=2) + "\n")
+    (out_dir / "job.json").write_text(json.dumps(rec, indent=2) + "\n")
 
     # Also preserve the EXACT norm_stats.json bytes baked into this job (not just the
     # fingerprint), so the run is fully reproducible from the record alone.
     ns_src = REPO_ROOT / "assets" / config_name / "robocasa_system1" / "norm_stats.json"
     if ns_src.exists():
-        (out_dir / f"{job_name}.norm_stats.json").write_text(ns_src.read_text())
+        (out_dir / "norm_stats.json").write_text(ns_src.read_text())
 
     md = [
         f"# {job_name}",
@@ -360,13 +432,13 @@ def _write_job_manifest(
         f"- **norm_stats:** sha256 `{rec['norm_stats'].get('sha256', 'n/a')}` "
         f"(state dim {rec['norm_stats'].get('state', {}).get('dim', '?')}, "
         f"actions dim {rec['norm_stats'].get('actions', {}).get('dim', '?')}; "
-        f"full copy: `{job_name}.norm_stats.json`)",
+        f"full copy: `norm_stats.json`)",
         f"- **checkpoints:** {ckpt_dir}",
         f"- **download ckpts:** `{rec['ckpt_download_cmd']}`",
         "",
     ]
-    (out_dir / f"{job_name}.md").write_text("\n".join(md))
-    print(f"Job record written: scripts/sagemaker/submitted_jobs/{job_name}.{{json,md}}")
+    (out_dir / "job.md").write_text("\n".join(md))
+    print(f"Job record written: scripts/sagemaker/submitted_jobs/{semantic}/{{job.json,job.md,norm_stats.json}}")
 
 
 # -----------------------------------------------------------------------------
@@ -399,6 +471,31 @@ def main() -> None:
         queue_name = f"fss-{cfg['queue']['name']}-{QUEUE_SUFFIX[region][instance_type]}"
     print(f"Queue: {queue_name}")
 
+    # SPOT vs RESERVED/on-demand queues need DIFFERENT env (see the env dict below):
+    # the reserved queues (e.g. fss-vla-*) require SM_USE_RESERVED_CAPACITY=1 to admit the
+    # job, but on a SPOT queue (fss-*-spot-*) that same flag makes the scheduler STOP the
+    # job (it's asking for reserved capacity on a spot pool). So gate the flag on the queue
+    # type. Detect spot by the "-spot-" segment in the resolved queue name.
+    is_spot_queue = "-spot-" in queue_name
+    print(f"Queue type: {'SPOT' if is_spot_queue else 'reserved/on-demand'}")
+
+    # --- entrypoint / topology / resume safety gate --------------------------------------
+    entrypoint_name = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh")
+    count = int(cfg["instance"]["count"])
+    if count > 1 and entrypoint_name not in MULTINODE_SAFE_ENTRYPOINTS:
+        raise SystemExit(
+            f"instance.count={count} but entrypoint '{entrypoint_name}' is NOT multi-node safe "
+            f"(it syncs checkpoints from every host with --delete; a non-primary host could wipe "
+            f"rank-0's checkpoint). Use a rank-aware entrypoint {sorted(MULTINODE_SAFE_ENTRYPOINTS)} "
+            f"(e.g. config_robocasa_multinode.yaml), or set instance.count=1."
+        )
+    if cfg["training"].get("resume") and entrypoint_name not in RESUME_CAPABLE_ENTRYPOINTS:
+        raise SystemExit(
+            f"training.resume=true but entrypoint '{entrypoint_name}' does not support resume "
+            f"(it would silently start a FRESH run). Resume is single-node only; for multi-node, "
+            f"start fresh (EMA-only, no train_state)."
+        )
+
     secrets = load_secrets("secrets.env")
     wandb_key = os.environ.get("WANDB_API_KEY") or secrets.get("WANDB_API_KEY")
     if cfg["wandb"]["enabled"] and not wandb_key and not local:
@@ -427,17 +524,15 @@ def main() -> None:
     os.environ["AWS_DEFAULT_REGION"] = region
     if local:
         from sagemaker.local import LocalSession
+
         sm_session = LocalSession()
     else:
         sm_session = sagemaker.Session(
-            boto_session=boto3.session.Session(
-                region_name=region, profile_name=cfg["aws"]["profile"]
-            )
+            boto_session=boto3.session.Session(region_name=region, profile_name=cfg["aws"]["profile"])
         )
 
     # All trainer config flows through env vars consumed by sm_entrypoint.sh.
     env = {
-        "SM_USE_RESERVED_CAPACITY": "1",
         "PYTHONPATH": "/opt/ml/code/src:/opt/ml/code/packages/openpi-client/src",
         "NCCL_DEBUG": "INFO",
         "FI_EFA_FORK_SAFE": "1",
@@ -448,6 +543,12 @@ def main() -> None:
         "RESUME": "1" if cfg["training"].get("resume") else "0",
         "OVERWRITE": "1" if cfg["training"].get("overwrite") else "0",
     }
+    # SM_USE_RESERVED_CAPACITY: required on RESERVED/on-demand queues (fss-vla-*) to admit
+    # the job; but on a SPOT queue it causes the scheduler to STOP the job (reserved-capacity
+    # request against a spot pool). So set it ONLY for non-spot queues, and leave it UNSET on
+    # spot. (This is why an earlier 2-node spot submit never scheduled.)
+    if not is_spot_queue:
+        env["SM_USE_RESERVED_CAPACITY"] = "1"
     # Download-to-local data mode (JAX RoboCasa): if data.download_s3_uri is set, the
     # entrypoint `aws s3 sync`s that s3:// dataset root to local EBS once and reads from
     # local disk (no FastFile FUSE mount -> no ENOTCONN mid-run, fastest reads). Requires
@@ -481,27 +582,51 @@ def main() -> None:
     # reconstruct the path from the job name.
     #
     # Layout under output.s3_prefix (= s3://.../openpi/checkpoints/):
-    #   {s3_prefix}/{job_name}/{config}/{exp_name}/{step}/   (mirrored from
-    #                                                         /opt/ml/checkpoints/)
-    #   {s3_prefix}/{job_name}/output.tar.gz                  (SageMaker artifact)
+    #   {s3_prefix}/{semantic}/{config}/{exp_name}/{step}/   (the checkpoints — mirrored
+    #                                                         from /opt/ml/checkpoints/)
+    #   {s3_prefix}/_artifacts/{job_name}/output.tar.gz       (SageMaker debug/profiler
+    #                                                         tarballs — kept OUT of the
+    #                                                         semantic dir so the entrypoint's
+    #                                                         `--delete` checkpoint sync can
+    #                                                         never touch them, and they don't
+    #                                                         clutter the checkpoints root)
+    # `semantic` = sanitized exp_name (e.g. "subset0713-30k-progact") — ONE stable, readable
+    # dir per experiment (vs the old timestamped job_name, which scattered every run + every
+    # AWSBatch* artifact across the flat root). The CloudWatch job_name keeps its timestamp
+    # (uniqueness for log-stream matching); the S3 dir drops it for readability, so we guard
+    # against clobbering an existing experiment's checkpoints below.
+    config_name = cfg["training"]["config"]
+    exp_name = cfg["training"]["exp_name"]
     s3_prefix = cfg["output"]["s3_prefix"].rstrip("/")
-    checkpoint_s3_uri = f"{s3_prefix}/{job_name}/"
-    output_s3_uri = s3_prefix
+    semantic = sanitize(exp_name)
+    checkpoint_s3_uri = f"{s3_prefix}/{semantic}/"
+    # SageMaker's own output_path (debug-output/, profiler-output/, output.tar.gz) — parked
+    # under _artifacts/<job_name>/ so timestamped runs stay distinct there without polluting
+    # the checkpoints root.
+    artifacts_s3_uri = f"{s3_prefix}/_artifacts"
+    output_s3_uri = artifacts_s3_uri
 
-    # The JAX trainer (orbax) does NOT use SageMaker's managed /opt/ml/checkpoints
-    # bidirectional sync: that sync sidecar races orbax's write-then-read-back of its
-    # array-metadata file on an eventually-consistent mount and crashes `finalize`.
-    # Instead the JAX entrypoint checkpoints to a consistent instance-EBS dir and runs
-    # its own `aws s3 sync` to this URI (passed via CHECKPOINT_S3_URI). The PyTorch
-    # path keeps SageMaker-managed checkpointing.
-    is_jax = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh") == "sm_entrypoint_jax.sh"
+    # Two independent properties of the entrypoint:
+    #   is_jax            -> JAX trainer: ONE process per node (single- OR multi-node), NO
+    #                        torch_distributed (the trainer forms the mesh itself via
+    #                        jax.distributed.initialize).
+    #   self_manages_ckpt -> the entrypoint runs its OWN `aws s3 sync` from local EBS, so
+    #                        SageMaker-managed /opt/ml/checkpoints sync must be OFF (that
+    #                        sidecar races orbax's write-then-read-back on the eventually-
+    #                        consistent mount and crashes finalize; for multi-node it is a
+    #                        per-node dir, and two nodes syncing it corrupts the checkpoint).
+    # ALL JAX entrypoints (single-node sm_entrypoint_jax.sh AND the multi-node
+    # *_multinode_jax.sh) self-manage the sync + skip torch_distributed, so gate on the
+    # "_jax.sh" SUFFIX rather than the exact single-node filename. PyTorch keeps managed
+    # checkpointing + torch_distributed.
+    _entrypoint = cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh")
+    is_jax = _entrypoint.endswith("_jax.sh")
+    self_manages_ckpt = is_jax
     env["CHECKPOINT_S3_URI"] = checkpoint_s3_uri
     # Periodic background-sync interval for the JAX entrypoint (seconds). Optional in
     # the config; the entrypoint defaults to 1800 if unset.
     if cfg["output"].get("ckpt_sync_interval") is not None:
         env["CKPT_SYNC_INTERVAL"] = str(cfg["output"]["ckpt_sync_interval"])
-    config_name = cfg["training"]["config"]
-    exp_name = cfg["training"]["exp_name"]
     wandb_state = f"online (project={cfg['wandb']['project']})" if cfg["wandb"]["enabled"] else "disabled"
     print()
     print("=== Resolved S3 URIs for this job ===")
@@ -517,6 +642,22 @@ def main() -> None:
     print("=====================================")
     print()
 
+    # Collision guard: the S3 checkpoint dir is now keyed by the (timestamp-free) semantic
+    # exp_name, so a second run with the SAME exp_name would write into the same
+    # {semantic}/{config}/{exp}/ tree and the entrypoint's `--delete` final sync could
+    # clobber the earlier run's checkpoints. Refuse unless --overwrite. Skipped on dry-run /
+    # local (no real submit) and when resuming (resume intentionally reuses the dir). Never
+    # deletes anything — just checks + aborts. Requires listing S3, so guard on real submit.
+    if not (dry_run or local) and not cfg["training"].get("overwrite") and not cfg["training"].get("resume"):
+        existing = _s3_prefix_has_objects(f"{checkpoint_s3_uri}{config_name}/{exp_name}/", cfg["aws"])
+        if existing:
+            raise SystemExit(
+                f"Refusing to submit: S3 checkpoint dir already has objects at\n"
+                f"  {checkpoint_s3_uri}{config_name}/{exp_name}/\n"
+                f"exp_name '{exp_name}' is not unique (the S3 path drops the timestamp). Pick a new "
+                f"exp_name, or set training.overwrite=true to reuse/replace it."
+            )
+
     # Use the lower-level Estimator (not PyTorch) because we already bake the
     # entrypoint and source into the image — we don't want SageMaker to upload
     # a source_dir or override SAGEMAKER_PROGRAM.
@@ -528,19 +669,19 @@ def main() -> None:
         instance_count=cfg["instance"]["count"],
         instance_type="local_gpu" if local else instance_type,
         job_name=job_name,
-        # JAX path self-manages S3 sync (see CHECKPOINT_S3_URI above), so leave
-        # SageMaker's managed checkpoint sync OFF for it. PyTorch path keeps it on.
-        checkpoint_local_path=None if (local or is_jax) else cfg["output"]["checkpoint_local_path"],
-        checkpoint_s3_uri=None if (local or is_jax) else checkpoint_s3_uri,
-        output_path=cfg["output"]["s3_prefix"],
-        # torch_distributed launches one process per GPU (PyTorch entrypoint runs
-        # torchrun). The JAX trainer is a SINGLE process that shards over all GPUs
-        # itself, so it must NOT use torch_distributed. Gate on image.sm_entrypoint.
-        distribution=(
-            {}
-            if cfg["image"].get("sm_entrypoint", "sm_entrypoint.sh") == "sm_entrypoint_jax.sh"
-            else {"torch_distributed": {"enabled": True}}
-        ),
+        # Managed checkpoint sync OFF for entrypoints that self-manage it (all JAX paths,
+        # single- AND multi-node — see self_manages_ckpt above). PyTorch keeps it ON.
+        checkpoint_local_path=None if (local or self_manages_ckpt) else cfg["output"]["checkpoint_local_path"],
+        checkpoint_s3_uri=None if (local or self_manages_ckpt) else checkpoint_s3_uri,
+        # SageMaker's own output artifacts (output.tar.gz, debug-output/, profiler-output/)
+        # land under {s3_prefix}/_artifacts/{job_name}/ — OFF the checkpoints root so they
+        # don't clutter it with AWSBatch*/ dirs and can't collide with the semantic ckpt dirs.
+        output_path=output_s3_uri,
+        # torch_distributed launches one process per GPU (PyTorch runs torchrun). JAX
+        # trainers run ONE process per NODE (each owns all local GPUs) and form the mesh
+        # via jax.distributed.initialize, so they must NOT use torch_distributed — even
+        # multi-node. Gate on the "_jax" entrypoint suffix (is_jax).
+        distribution=({} if is_jax else {"torch_distributed": {"enabled": True}}),
         max_run=max_run_seconds,
         environment=env,
         keep_alive_period_in_seconds=5 * 60,
@@ -551,7 +692,9 @@ def main() -> None:
     if dry_run:
         print(f"[dry-run] would submit job_name={job_name} to {queue_name}")
         for ch, ti in inputs.items():
-            print(f"[dry-run]   channel {ch}: {ti.config['DataSource']['S3DataSource']['S3Uri']} ({ti.config['InputMode']})")
+            print(
+                f"[dry-run]   channel {ch}: {ti.config['DataSource']['S3DataSource']['S3Uri']} ({ti.config['InputMode']})"
+            )
         print(f"[dry-run] env keys: {sorted(env)}")
         return
 
@@ -575,6 +718,7 @@ def main() -> None:
     # scripts/sagemaker/submitted_jobs/ — no in-place file mutation to reconstruct later.
     _write_job_manifest(
         job_name=job_name,
+        semantic=semantic,
         queue_name=queue_name,
         image_uri=image_uri,
         env=env,

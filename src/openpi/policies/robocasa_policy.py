@@ -263,6 +263,14 @@ class RobocasaInputs(transforms.DataTransformFn):
     # Emit the offline-RL conditioning line ("Quality: …; Estimated Length: …; Executed
     # Step: …") in the prompt. At inference set these to the DESIRED values.
     include_conditioning: bool = True
+    # Finer-grained: keep the conditioning line but DROP only "Executed Step: …" (keep
+    # Quality + Estimated Length). Tag token `noexec`. No effect if include_conditioning
+    # is False (whole line already gone). Default True.
+    include_executed_step: bool = True
+    # Finer-grained: keep the conditioning line but DROP only "Estimated Length: …" (keep
+    # Quality + Executed Step). Tag token `noestl`. No effect if include_conditioning is
+    # False. Default True.
+    include_est_length: bool = True
     # Append "Current Gripper: Open|Close;" after the state block.
     include_gripper_flag: bool = True
 
@@ -351,7 +359,12 @@ class RobocasaInputs(transforms.DataTransformFn):
             # `task_goal`, and conditioning tags (quality/est_length/executed_step).
             conditioning = None
             if self.include_conditioning:
-                conditioning = {key: data[key] for key, _ in CONDITIONING_FIELDS if key in data}
+                _dropped = set()
+                if not self.include_executed_step:
+                    _dropped.add("executed_step")
+                if not self.include_est_length:
+                    _dropped.add("est_length")
+                conditioning = {key: data[key] for key, _ in CONDITIONING_FIELDS if key in data and key not in _dropped}
             inputs["prompt"] = build_prompt(
                 data["prompt"],
                 data.get("task_goal"),

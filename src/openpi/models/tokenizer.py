@@ -29,6 +29,7 @@ class PaligemmaTokenizer:
         task_state_sep: str = ", ",
         preserve_newlines: bool = False,
         gripper_flag: str | None = None,
+        include_state: bool = True,
     ) -> tuple[np.ndarray, np.ndarray]:
         # ``preserve_newlines``: keep intentional structural newlines in the prompt (e.g.
         # RoboCasa System1's "Scope:" metadata line). Default strips them (stock pi05).
@@ -44,7 +45,15 @@ class PaligemmaTokenizer:
             # (RoboCasa System1: the discretized gripper width is coarse, so the explicit
             # open/close flag is a cleaner conditioning signal).
             grip_str = f" Current Gripper: {gripper_flag};" if gripper_flag else ""
-            if state_split is not None and 0 < state_split < len(discretized_state):
+            if not include_state:
+                # ``nostate`` ablation: keep the pi05 discrete format (Task: text + gripper +
+                # Action:) but DROP the entire state block — no "State:" / "Initial State:" /
+                # "Current State:" ints at all. The gripper flag (if any) becomes the only
+                # post-task tag; it leads with its own text so drop the leading space of
+                # grip_str. With no gripper it's just "Task: <text>\nAction: ".
+                tail = f"{task_state_sep}{grip_str.lstrip()}" if grip_str else ""
+                full_prompt = f"Task: {cleaned_text}{tail}\nAction: "
+            elif state_split is not None and 0 < state_split < len(discretized_state):
                 # Render the state as TWO labeled segments (e.g. RoboCasa System1's
                 # current state + appended anchor/initial state). The vector is laid out
                 # [current, anchor]; we render the INITIAL (anchor) state FIRST, then the
