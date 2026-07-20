@@ -237,6 +237,91 @@ def val_mse_page():
     return VAL_MSE_HTML
 
 
+# ---------------------------------------------------------------------------------
+# Eval #4: STATISTICS across all methods (val MSE + episode success + subtask Gemini).
+# ---------------------------------------------------------------------------------
+def _episode_stats(root: Path) -> dict:
+    """Per-method episode-success stats (from episode_eval.py output): overall + per split
+    (atomic/composite, inferred from the task-name category in the episode_id)."""
+    out = {}
+    for m in _methods(root):
+        succ = {"all": [0, 0], "atomic": [0, 0], "composite": [0, 0]}  # [n_success, n_total]
+        for ep in _episodes(root, m):
+            try:
+                doc = json.loads((_safe(root, m, ep) / "episode.json").read_text())
+            except Exception:
+                continue
+            if doc.get("episode_success") is None:
+                continue
+            eid = doc.get("episode_id", "")
+            split = "atomic" if "/Atomic/" in eid else ("composite" if "/Composite/" in eid else None)
+            ok = 1 if doc["episode_success"] else 0
+            succ["all"][0] += ok; succ["all"][1] += 1
+            if split:
+                succ[split][0] += ok; succ[split][1] += 1
+        out[m] = {k: (v[0] / v[1] if v[1] else None) for k, v in succ.items()} | \
+                 {"n": succ["all"][1]}
+    return out
+
+
+def _subtask_stats(root: Path) -> dict:
+    """Per-method Gemini subtask-success stats (from subtask_eval + gemini_judge): overall +
+    per primitive."""
+    out = {}
+    for m in _methods(root):
+        overall = [0, 0]
+        by_prim: dict[str, list[int]] = {}
+        for ep in _episodes(root, m):
+            try:
+                doc = json.loads((_safe(root, m, ep) / "episode.json").read_text())
+            except Exception:
+                continue
+            g = doc.get("gemini")
+            if not g:
+                continue
+            per = g.get("per_subtask", {})
+            for sg in doc.get("subgoals", []):
+                cd = Path(sg["out_dir"]).name
+                v = per.get(cd, {}).get("success")
+                if v is None:
+                    continue
+                prim = sg.get("primitive", "other")
+                ok = 1 if v else 0
+                overall[0] += ok; overall[1] += 1
+                b = by_prim.setdefault(prim, [0, 0]); b[0] += ok; b[1] += 1
+        out[m] = dict(
+            overall=(overall[0] / overall[1] if overall[1] else None), n=overall[1],
+            per_primitive={p: (v[0] / v[1] if v[1] else None) for p, v in sorted(by_prim.items())})
+    return out
+
+
+@app.route("/api/stats")
+def api_stats():
+    val = []
+    if VAL_MSE_DIR.is_dir():
+        for f in sorted(VAL_MSE_DIR.glob("*.json")):
+            try:
+                d = json.loads(f.read_text())
+                steps = [s for s in d.get("steps", []) if s.get("action_mse") is not None]
+                last = max(steps, key=lambda s: s.get("step") or 0) if steps else None
+                val.append(dict(exp_name=d.get("exp_name", f.stem),
+                                final_step=(last.get("step") if last else None),
+                                action_mse=(last.get("action_mse") if last else None),
+                                flow_loss=(last.get("flow_loss") if last else None)))
+            except Exception:
+                continue
+    return jsonify(dict(
+        val_mse=val,
+        episode=_episode_stats(_root("episode")),
+        subtask=_subtask_stats(_root("subtask")),
+    ))
+
+
+@app.route("/stats")
+def stats_page():
+    return STATS_HTML
+
+
 VAL_MSE_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 <title>Validation MSE</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -290,6 +375,64 @@ function draw(){
   document.getElementById('table').innerHTML=h+"</table>";
 }
 document.getElementById('metric').onchange=draw;
+load();
+</script></body></html>"""
+
+
+STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<title>Eval Stats</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;color:#1a1a1a;background:#fafafb}
+  header{padding:10px 16px;border-bottom:1px solid #ddd;background:#fff;display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0}header h1 b{color:#b0431c}
+  nav a{margin-right:10px;color:#b0431c;text-decoration:none;font-size:13px}
+  #wrap{padding:16px;max-width:1200px;margin:0 auto}
+  h2{font-size:14px;margin:18px 0 6px}
+  table{border-collapse:collapse;font-size:12px;background:#fff;margin-bottom:8px}
+  th,td{border:1px solid #ddd;padding:3px 8px;text-align:right}th{background:#f0f0f0}
+  td.exp,th.exp{text-align:left;font-family:ui-monospace,monospace}
+  .box{background:#fff;border:1px solid #ddd;border-radius:6px;padding:12px;margin-top:10px}
+</style></head><body>
+<header>
+  <h1>Eval <b>Statistics</b></h1>
+  <nav><a href="/subtask">subtask</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
+</header>
+<div id="wrap">
+  <h2>#1 Validation MSE (final step)</h2><div id="valtab"></div>
+  <h2>#2 Episode success rate</h2><div id="eptab"></div>
+  <h2>#3 Subtask Gemini success rate</h2><div id="subtab"></div>
+  <div class="box"><canvas id="chart" height="90"></canvas></div>
+</div>
+<script>
+const COLORS=["#b0431c","#1c6bb0","#2e8b3d","#8b2eb0","#b0902e","#2eb0a3","#b02e5a","#555"];
+const pct=v=>v==null?'–':(100*v).toFixed(1)+'%';
+const f4=v=>v==null?'–':(+v).toFixed(4);
+async function load(){
+  const d=await (await fetch('/api/stats')).json();
+  // #1 val table
+  let h="<table><tr><th class='exp'>exp_name</th><th>step</th><th>action_mse</th><th>flow_loss</th></tr>";
+  d.val_mse.forEach(r=>h+=`<tr><td class='exp'>${r.exp_name}</td><td>${r.final_step??'–'}</td><td>${f4(r.action_mse)}</td><td>${f4(r.flow_loss)}</td></tr>`);
+  document.getElementById('valtab').innerHTML=h+"</table>";
+  // #2 episode table
+  h="<table><tr><th class='exp'>method</th><th>n</th><th>all</th><th>atomic</th><th>composite</th></tr>";
+  Object.entries(d.episode).forEach(([m,v])=>h+=`<tr><td class='exp'>${m}</td><td>${v.n}</td><td>${pct(v.all)}</td><td>${pct(v.atomic)}</td><td>${pct(v.composite)}</td></tr>`);
+  document.getElementById('eptab').innerHTML=h+"</table>";
+  // #3 subtask table (overall + primitives)
+  const prims=[...new Set(Object.values(d.subtask).flatMap(v=>Object.keys(v.per_primitive||{})))].sort();
+  h="<table><tr><th class='exp'>method</th><th>n</th><th>overall</th>"+prims.map(p=>`<th>${p}</th>`).join("")+"</tr>";
+  Object.entries(d.subtask).forEach(([m,v])=>{h+=`<tr><td class='exp'>${m}</td><td>${v.n}</td><td>${pct(v.overall)}</td>`+
+    prims.map(p=>`<td>${pct(v.per_primitive?.[p])}</td>`).join("")+"</tr>";});
+  document.getElementById('subtab').innerHTML=h+"</table>";
+  // grouped bar: episode-all vs subtask-overall per method
+  const methods=[...new Set([...Object.keys(d.episode),...Object.keys(d.subtask)])];
+  const ds=[
+    {label:'episode success (all)',data:methods.map(m=>d.episode[m]?100*(d.episode[m].all||0):null),backgroundColor:COLORS[0]},
+    {label:'subtask gemini (overall)',data:methods.map(m=>d.subtask[m]?100*(d.subtask[m].overall||0):null),backgroundColor:COLORS[1]},
+  ];
+  new Chart(document.getElementById('chart'),{type:'bar',data:{labels:methods,datasets:ds},
+    options:{responsive:true,scales:{y:{min:0,max:100,title:{display:true,text:'%'}}}}});
+}
 load();
 </script></body></html>"""
 
