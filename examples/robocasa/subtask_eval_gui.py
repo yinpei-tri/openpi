@@ -2,7 +2,12 @@
 Standalone Flask GUI to browse subtask-eval rollouts faithfully.
 
 Reads the structured rollout tree written by subtask_eval.py:
-  <rollout-root>/<method>/<episode_flat>/child<NN>_<primitive>/{clean.mp4, anchor_*.jpg, steps.json}
+  <rollout-root>/<method>/<episode_flat>/child<NN>_<primitive>/{clean.mp4, anchor_*.jpg,
+                                                                steps.npz + steps_meta.json}
+Per-step logs ship as a compact steps.npz (fp16 arrays) + a small steps_meta.json sidecar
+(subtask_eval._write_steps_npz). This GUI reconstructs the full per-step doc server-side
+(numpy is available here), so /api/steps returns the same JSON shape the old steps.json had;
+legacy steps.json is still read if present.
 
 Full-page layout (borrows /system1_training_sample + /system2_prompt): a top two-lane track
 (milestones + subgoals, current subtask highlighted), then a grid showing the clean rollout
@@ -20,6 +25,7 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 from flask import Flask, abort, jsonify, send_file
 
 app = Flask(__name__)
@@ -68,12 +74,67 @@ def api_episodes(method):
     return jsonify(out)
 
 
+def _reconstruct_full(sub_dir: Path) -> dict | None:
+    """Rebuild the FULL per-step doc from steps.npz + steps_meta.json (the inverse of
+    subtask_eval._write_steps_npz), so /api/steps returns the shape the GUI's JS expects
+    ({**meta, "steps": [...]}). Falls back to a legacy monolithic steps.json. None if absent."""
+    meta_f = sub_dir / "steps_meta.json"
+    npz_f = sub_dir / "steps.npz"
+    if not (meta_f.is_file() and npz_f.is_file()):
+        legacy = sub_dir / "steps.json"
+        return json.loads(legacy.read_text()) if legacy.is_file() else None
+    meta = json.loads(meta_f.read_text())
+    z = np.load(npz_f)
+    n = int(z["frame_step"].shape[0])
+    rp_by_step = {int(r["step"]): r for r in meta.get("replan", [])}
+    qstep = [int(x) for x in z["q_step"]] if "q_step" in z else []
+    q_pos = {s: k for k, s in enumerate(qstep)}
+    steps = []
+    for i in range(n):
+        nm = z["action_norms"][i]
+        fs = int(z["frame_step"][i])
+        s = dict(
+            frame_step=fs,
+            phase="act" if int(z["phase"][i]) else "settle",
+            replanned=bool(z["replanned"][i]),
+            sim_check_success=bool(z["sim_check_success"][i]),
+            cur_lean_norm=z["cur_lean_norm"][i].astype(float).round(4).tolist(),
+            cur_lean=z["cur_lean"][i].astype(float).round(4).tolist(),
+            cur_raw16=z["cur_raw16"][i].astype(float).round(4).tolist(),
+            action_raw12=z["action_raw12"][i].astype(float).round(4).tolist(),
+            oracle_action_raw12=z["oracle_action_raw12"][i].astype(float).round(4).tolist(),
+            eef_pos_world=z["eef_pos_world"][i].astype(float).round(4).tolist(),
+            gripper_width=round(float(z["gripper_width"][i]), 4),
+            action_mse_vs_oracle=round(float(z["action_mse_vs_oracle"][i]), 6),
+            action_eef_pos_norm=round(float(nm[0]), 4),
+            action_eef_rot_norm=round(float(nm[1]), 4),
+            action_base_norm=round(float(nm[2]), 4),
+        )
+        ps = float(z["progress_scalar"][i])
+        s["progress"] = "-" if np.isnan(ps) else f"{ps:.3f}"
+        rp = rp_by_step.get(fs)
+        if rp is not None and "q_chunk_norm" in z:
+            k = q_pos[fs]
+            s["progress_raw"] = rp.get("progress_raw")
+            prog = z["q_chunk_progress"][k].astype(float) if "q_chunk_progress" in z else None
+            prog = None if (prog is None or np.all(np.isnan(prog))) else prog.round(4).tolist()
+            s["query"] = dict(
+                prompt=rp.get("prompt"), gripper_flag=rp.get("gripper_flag"),
+                executed_step=rp.get("executed_step"), replan_steps=rp.get("replan_steps"),
+                horizon=rp.get("horizon"),
+                chunk_lean11_norm=z["q_chunk_norm"][k].astype(float).round(4).tolist(),
+                chunk_lean11=z["q_chunk_lean"][k].astype(float).round(4).tolist(),
+                chunk_progress=prog)
+        steps.append(s)
+    return {**meta, "steps": steps}
+
+
 @app.route("/api/steps/<method>/<episode>/<sub>")
 def api_steps(method, episode, sub):
-    f = _safe(method, episode, sub) / "steps.json"
-    if not f.exists():
+    doc = _reconstruct_full(_safe(method, episode, sub))
+    if doc is None:
         abort(404)
-    return send_file(f, mimetype="application/json")
+    return jsonify(doc)
 
 
 @app.route("/api/media/<method>/<episode>/<sub>/<path:fname>")
