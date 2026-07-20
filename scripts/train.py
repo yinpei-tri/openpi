@@ -1,6 +1,7 @@
 import contextlib
 import dataclasses
 import functools
+import json
 import logging
 import platform
 import time
@@ -114,6 +115,98 @@ def robocasa_exp_tag(config: _config.TrainConfig) -> str:
         if getattr(obj, attr, default) != default:
             parts.append(token)
     return "_".join(parts)
+
+
+# gran/verb -> prompt_source (inverse of _PROMPT_SOURCE_TO_GRAN_VERB).
+_GRAN_VERB_TO_PROMPT_SOURCE = {v: k for k, v in _PROMPT_SOURCE_TO_GRAN_VERB.items()}
+
+
+def robocasa_config_from_tag(tag: str, base_config_name: str = "pi05_robocasa_system1") -> "_config.TrainConfig":
+    """Inverse of ``robocasa_exp_tag``: rebuild the exact TrainConfig from a settings tag.
+
+    The training runs use ONE root config (``pi05_robocasa_system1``) + CLI overrides, and only
+    the resulting tag (``prog<x>_gran<y>_verb<z>[_<dev>...]``) is recorded — in the checkpoint
+    dir name. This reconstructs the config those overrides produced, so inference can serve any
+    ablation from the root config alone. Single source of truth with ``robocasa_exp_tag`` (same
+    deviation table, same gran/verb map), so tag->config->tag round-trips.
+
+    ``tag`` is the part AFTER the ``<exp_name>__`` prefix, e.g.
+    ``progreg_granfine_verbsimp_nostate``. Accepts a full dir name too (splits on ``__``).
+    """
+    import dataclasses as _dc
+
+    if "__" in tag:
+        tag = tag.split("__", 1)[1]  # tolerate a full "<exp>__<tag>" dir name
+    tokens = tag.split("_")
+    cfg = _config.get_config(base_config_name)
+    model_over: dict = {}
+    data_over: dict = {}
+
+    for tok in tokens:
+        if tok.startswith("prog"):
+            p = tok[len("prog"):]
+            if p == "cls":
+                model_over.update(progress_mode="classes", use_progress_head=True)
+                data_over.update(progress_as_action=False)
+            elif p == "reg":
+                model_over.update(progress_mode="continuous", use_progress_head=True)
+                data_over.update(progress_as_action=False)
+            elif p == "act":
+                model_over.update(use_progress_head=False)
+                data_over.update(progress_as_action=True)
+            elif p == "none":
+                model_over.update(use_progress_head=False)
+                data_over.update(progress_as_action=False)
+        elif tok.startswith("gran") or tok.startswith("verb"):
+            pass  # resolved together below
+        else:
+            # a deviation token -> flip its knob to (not default). model vs data per the table.
+            for attr, default, token in _ROBOCASA_PROMPT_DEVIATIONS:
+                if tok == token:
+                    (model_over if attr == "use_anchor_images" else data_over)[attr] = not default
+                    break
+
+    # gran/verb -> prompt_source
+    gran = next((t[len("gran"):] for t in tokens if t.startswith("gran")), "fine")
+    verb = next((t[len("verb"):] for t in tokens if t.startswith("verb")), "simp")
+    ps = _GRAN_VERB_TO_PROMPT_SOURCE.get((gran, verb))
+    if ps is not None:
+        data_over["prompt_source"] = ps
+
+    model = _dc.replace(cfg.model, **model_over) if model_over else cfg.model
+    data = _dc.replace(cfg.data, **data_over) if data_over else cfg.data
+    return _dc.replace(cfg, model=model, data=data)
+
+
+def resolve_robocasa_config(checkpoint_dir) -> "_config.TrainConfig | None":
+    """Reconstruct a RoboCasa TrainConfig for a checkpoint dir, for INFERENCE/serving.
+
+    Precedence (self-describing first, dir-name second):
+      1. ``<ckpt>/config.json`` (written by training going forward) -> its ``base_config`` +
+         ``robocasa_tag`` fed through ``robocasa_config_from_tag`` (authoritative).
+      2. else parse the settings tag out of the dir name (``<exp>__<tag>``) -> same inverter
+         (fallback for the current m0717 checkpoints, which predate config.json).
+    Returns None if neither yields a RoboCasa tag (caller should fall back to an explicit config).
+    Accepts a step dir (``.../29999``) or the run root; searches both for config.json.
+    """
+    import json as _json
+
+    p = epath.Path(str(checkpoint_dir))
+    for cand in (p, p.parent):  # config.json lives at the run root; a step dir is one level down
+        cj = cand / "config.json"
+        if cj.exists():
+            try:
+                meta = _json.loads(cj.read_text())
+                if meta.get("robocasa_tag"):
+                    return robocasa_config_from_tag(meta["robocasa_tag"],
+                                                    meta.get("base_config", "pi05_robocasa_system1"))
+            except Exception:
+                pass  # fall through to dir-name parsing
+    # dir-name fallback: find a path component containing the "__<tag>" settings suffix.
+    for part in reversed(p.parts):
+        if "__" in part and any(part.split("__", 1)[1].startswith(f"prog{x}") for x in ("cls", "reg", "act", "none")):
+            return robocasa_config_from_tag(part)
+    return None
 
 
 def init_logging():
@@ -396,6 +489,20 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
             overwrite=config.overwrite,
             resume=config.resume,
         )
+        # Write a machine-readable config descriptor next to the checkpoints so inference can
+        # reconstruct the EXACT config WITHOUT parsing the dir name. We persist the RECONSTRUCTION
+        # INPUTS (base config name + settings tag) rather than a full dataclass dump: the tag is
+        # the single source of truth (robocasa_config_from_tag inverts it, validated to round-trip),
+        # and it stays serializable + human-readable. Primary process only; best-effort.
+        if jax.process_index() == 0 and tag:
+            try:
+                (epath.Path(config.checkpoint_dir) / "config.json").write_text(json.dumps({
+                    "base_config": "pi05_robocasa_system1",
+                    "robocasa_tag": tag,
+                    "exp_name": config.exp_name,
+                }, indent=2))
+            except Exception:
+                logging.warning("Could not write config.json to the checkpoint dir; continuing.")
     # Multi-node: only the PRIMARY process (index 0) logs to wandb. Otherwise every
     # process starts its own run and you get N identical curves (the metrics are the same
     # replicated value — see below). Single-node: process_index()==0, so unchanged.
