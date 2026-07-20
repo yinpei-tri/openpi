@@ -62,15 +62,18 @@ def action_eef_base_norm(action_sim: np.ndarray) -> float:
     """L2 norm of the EEF (pos+rot) + base motion components of a robosuite-native 12-d
     action, i.e. everything that moves the robot EXCEPT the gripper open/close + control_mode.
 
-    Robosuite-native 12-d layout (see subtask_env.lerobot_action_to_sim):
-        [0:3] eef_pos, [3:6] eef_rot, [6:9] base_motion(x,y,yaw... 3 used),
-        [9] torso(dead), [10] gripper, [11] control_mode  (see SIM_*_IDX in the driver).
-    We treat "motion" as eef_pos + eef_rot + base, and ignore gripper + control_mode + torso.
+    Robosuite-native 12-d layout (see subtask_eval.py SIM_*_IDX + lerobot_action_to_sim):
+        [0:3] eef_pos, [3:6] eef_rot, [6] gripper_close, [7:11] base_motion, [11] control_mode.
+    "Motion" = eef_pos+rot ([0:6]) + base ([7:11]); gripper ([6]) and control_mode ([11]) are
+    excluded (a hold/settle commands zero motion but may still hold the gripper closed).
     """
     a = np.asarray(action_sim, dtype=np.float64).reshape(-1)
-    # eef pos+rot (0:6) and base translation/rotation (6:9). Robust to trailing dims.
-    motion = a[0:9] if a.size >= 9 else a
-    # drop torso/gripper/control if they somehow fell in the slice: only 0:6 + base 6:9.
+    if a.size >= 12:
+        motion = np.concatenate([a[0:6], a[7:11]])
+    elif a.size >= 6:
+        motion = a[0:6]  # at least the EEF part
+    else:
+        motion = a
     return float(np.linalg.norm(motion))
 
 

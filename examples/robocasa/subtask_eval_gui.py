@@ -29,50 +29,77 @@ import numpy as np
 from flask import Flask, abort, jsonify, send_file
 
 app = Flask(__name__)
-ROOT: Path = Path(".")
+ROOT: Path = Path(".")                        # default / legacy subtask rollout root
+# Named rollout trees, both written in the SAME layout by subtask_eval.py (#3) and
+# episode_eval.py (#2), so ONE viewer serves both — selected by the <root> path segment.
+ROOTS: dict[str, Path] = {}
 VAL_MSE_DIR: Path = Path("eval_out/val_mse")  # eval #1 curves (scripts/eval_val_mse.py output)
 
 
-def _methods():
-    return sorted([d.name for d in ROOT.iterdir() if d.is_dir() and (d / "index.json").exists()]) \
-        if ROOT.exists() else []
+def _root(name: str | None) -> Path:
+    """Resolve a named rollout root (falls back to the legacy single ROOT)."""
+    if name and name in ROOTS:
+        return ROOTS[name]
+    return ROOT
 
 
-def _episodes(method):
-    md = ROOT / method
+def _methods(root: Path):
+    return sorted([d.name for d in root.iterdir() if d.is_dir() and (d / "index.json").exists()]) \
+        if root.exists() else []
+
+
+def _episodes(root: Path, method):
+    md = root / method
     return sorted([d.name for d in md.iterdir() if d.is_dir() and (d / "episode.json").exists()]) \
         if md.is_dir() else []
 
 
-def _safe(method, episode=None, sub=None) -> Path:
-    p = ROOT / method
+def _safe(root: Path, method, episode=None, sub=None) -> Path:
+    p = root / method
     if episode:
         p = p / episode
     if sub:
         p = p / sub
     p = p.resolve()
-    if not str(p).startswith(str(ROOT.resolve())):
+    # Path-traversal guard: resolved path must stay under root (compare with a trailing sep so a
+    # sibling like "<root>_evil" cannot pass a naive prefix check).
+    base = str(root.resolve())
+    if p != root.resolve() and not str(p).startswith(base + "/"):
         abort(403)
     return p
 
 
+# ---- root-namespaced API (root = "subtask" | "episode"; falls back to legacy ROOT) ----
+@app.route("/api/<root>/methods")
+def api_methods_r(root):
+    rp = _root(root)
+    out = []
+    for m in _methods(rp):
+        idx = json.loads((rp / m / "index.json").read_text())
+        out.append(dict(method=m, n_episodes=idx.get("n_episodes"),
+                        horizon_mult=idx.get("horizon_mult"), settle_steps=idx.get("settle_steps"),
+                        eval_kind=idx.get("eval_kind")))
+    return jsonify(out)
+
+
+@app.route("/api/<root>/episodes/<method>")
+def api_episodes_r(root, method):
+    rp = _root(root)
+    out = []
+    for ep in _episodes(rp, method):
+        out.append(json.loads((_safe(rp, method, ep) / "episode.json").read_text()))
+    return jsonify(out)
+
+
+# ---- legacy routes (the existing "/" subtask page uses these; keep them working) ----
 @app.route("/api/methods")
 def api_methods():
-    out = []
-    for m in _methods():
-        idx = json.loads((ROOT / m / "index.json").read_text())
-        out.append(dict(method=m, n_episodes=idx.get("n_episodes"),
-                        horizon_mult=idx.get("horizon_mult"), settle_steps=idx.get("settle_steps")))
-    return jsonify(out)
+    return api_methods_r("subtask")
 
 
 @app.route("/api/episodes/<method>")
 def api_episodes(method):
-    out = []
-    for ep in _episodes(method):
-        doc = json.loads((_safe(method, ep) / "episode.json").read_text())
-        out.append(doc)
-    return jsonify(out)
+    return api_episodes_r("subtask", method)
 
 
 def _reconstruct_full(sub_dir: Path) -> dict | None:
@@ -130,26 +157,62 @@ def _reconstruct_full(sub_dir: Path) -> dict | None:
     return {**meta, "steps": steps}
 
 
-@app.route("/api/steps/<method>/<episode>/<sub>")
-def api_steps(method, episode, sub):
-    doc = _reconstruct_full(_safe(method, episode, sub))
+@app.route("/api/<root>/steps/<method>/<episode>/<sub>")
+def api_steps_r(root, method, episode, sub):
+    doc = _reconstruct_full(_safe(_root(root), method, episode, sub))
     if doc is None:
         abort(404)
     return jsonify(doc)
 
 
-@app.route("/api/media/<method>/<episode>/<sub>/<path:fname>")
-def api_media(method, episode, sub, fname):
-    f = _safe(method, episode, sub) / fname
+@app.route("/api/<root>/media/<method>/<episode>/<sub>/<path:fname>")
+def api_media_r(root, method, episode, sub, fname):
+    f = _safe(_root(root), method, episode, sub) / fname
     if not f.exists():
         abort(404)
     mt = "video/mp4" if fname.endswith(".mp4") else ("image/jpeg" if fname.endswith(".jpg") else None)
     return send_file(f, mimetype=mt)
 
 
+# legacy aliases (subtask root)
+@app.route("/api/steps/<method>/<episode>/<sub>")
+def api_steps(method, episode, sub):
+    return api_steps_r("subtask", method, episode, sub)
+
+
+@app.route("/api/media/<method>/<episode>/<sub>/<path:fname>")
+def api_media(method, episode, sub, fname):
+    return api_media_r("subtask", method, episode, sub, fname)
+
+
+def _viewer_page(root_name: str) -> str:
+    """The rollout viewer page bound to a rollout root ('subtask' or 'episode'). Injects
+    window.RN so the shared gui.js hits /api/<root>/... and a small nav bar."""
+    nav = ('<nav style="font-size:13px">'
+           '<a href="/subtask" style="color:#b0431c;margin-right:8px">subtask</a>'
+           '<a href="/episode" style="color:#b0431c;margin-right:8px">episode</a>'
+           '<a href="/val_mse" style="color:#b0431c;margin-right:8px">val_mse</a>'
+           '<a href="/stats" style="color:#b0431c">stats</a></nav>')
+    inject = f"<script>window.RN={root_name!r};</script>"
+    # Put the RN global BEFORE gui.js loads, and drop the nav into the top bar.
+    html = INDEX_HTML.replace("<script src=\"/gui.js\">", inject + "<script src=\"/gui.js\">")
+    html = html.replace("<div id=\"top\">", f"<div id=\"top\">{nav}", 1)
+    return html
+
+
 @app.route("/")
 def index():
-    return INDEX_HTML
+    return _viewer_page("subtask")
+
+
+@app.route("/subtask")
+def subtask_page():
+    return _viewer_page("subtask")
+
+
+@app.route("/episode")
+def episode_page():
+    return _viewer_page("episode")
 
 
 # ---------------------------------------------------------------------------------
@@ -338,6 +401,7 @@ def gui_js():
 
 
 GUI_JS = r"""
+const RN=window.RN||'subtask';   // rollout root: 'subtask' (#3) or 'episode' (#2)
 const $=s=>document.querySelector(s);
 const S={method:null,eps:[],epi:0,subi:0,steps:null,fps:20,norm:true};
 const esc=s=>(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
@@ -456,13 +520,13 @@ function drawCurves(cur){
 }
 
 async function loadMethods(){
-  const ms=await (await fetch('/api/methods')).json();
+  const ms=await (await fetch(`/api/${RN}/methods`)).json();
   $('#method').innerHTML=ms.map(m=>`<option value="${m.method}">${m.method}</option>`).join('');
   window._ms=ms; if(ms.length){S.method=ms[0].method; await loadEpisodes();}
 }
 async function loadEpisodes(){
   S.method=$('#method').value;
-  S.eps=await (await fetch('/api/episodes/'+S.method)).json();
+  S.eps=await (await fetch(`/api/${RN}/episodes/`+S.method)).json();
   $('#episode').innerHTML=S.eps.map((e,i)=>`<option value="${i}">${e.task_name} :: ${e.episode_id.split('/').pop()}</option>`).join('');
   const m=window._ms.find(x=>x.method===S.method)||{};
   $('#dsinfo').textContent=`${S.method} · ${m.n_episodes} eps · budget ${m.horizon_mult}x · settle ${m.settle_steps}`;
@@ -487,7 +551,7 @@ function drawTrack(){
 async function selectSub(i){
   const ep=S.eps[S.epi]; if(i<0||i>=ep.subgoals.length)return;
   S.subi=i; const sg=ep.subgoals[i];
-  S.steps=await (await fetch(`/api/steps/${S.method}/${ep.episode_id.replaceAll('/','__')}/${sg.out_dir.split('/').pop()}`)).json();
+  S.steps=await (await fetch(`/api/${RN}/steps/${S.method}/${ep.episode_id.replaceAll('/','__')}/${sg.out_dir.split('/').pop()}`)).json();
   S.fps=S.steps.fps||20;
   $('#subpos').textContent=`subtask ${i} / ${ep.subgoals.length-1}`;
   $('#prevSub').disabled=i<=0; $('#nextSub').disabled=i>=ep.subgoals.length-1;
@@ -496,15 +560,15 @@ async function selectSub(i){
   buildSeries();
   drawTrack();
   renderStatic();
-  const base=`/api/media/${S.method}/${ep.episode_id.replaceAll('/','__')}/${sg.out_dir.split('/').pop()}/`;
+  const base=`/api/${RN}/media/${S.method}/${ep.episode_id.replaceAll('/','__')}/${sg.out_dir.split('/').pop()}/`;
   $('#vid').src=base+S.steps.clean_video;
   $('#slider').max=S.steps.steps.length-1; $('#slider').value=0; showFrame(0);
 }
 
 function renderStatic(){
   const d=S.steps, ep=S.eps[S.epi];
-  const base=`/api/media/${S.method}/${ep.episode_id.replaceAll('/','__')}/${d.clean_video.replace('clean.mp4','')}`;
-  const bdir=`/api/media/${S.method}/${ep.episode_id.replaceAll('/','__')}/${ep.subgoals[S.subi].out_dir.split('/').pop()}/`;
+  const base=`/api/${RN}/media/${S.method}/${ep.episode_id.replaceAll('/','__')}/${d.clean_video.replace('clean.mp4','')}`;
+  const bdir=`/api/${RN}/media/${S.method}/${ep.episode_id.replaceAll('/','__')}/${ep.subgoals[S.subi].out_dir.split('/').pop()}/`;
   const anc=Object.entries(d.anchor_images||{}).map(([k,f])=>`<figure><img src="${bdir}${f}"><figcaption>${k}</figcaption></figure>`).join("");
   $('#grid').innerHTML=`
     <div class="col">
@@ -695,17 +759,25 @@ loadMethods();
 
 
 def main():
-    global ROOT, VAL_MSE_DIR
+    global ROOT, ROOTS, VAL_MSE_DIR
     p = argparse.ArgumentParser()
-    p.add_argument("--rollout-root", type=Path, required=True)
+    p.add_argument("--rollout-root", type=Path, required=True,
+                   help="SUBTASK rollout tree (subtask_eval.py output) -> /subtask")
+    p.add_argument("--episode-root", type=Path, default=None,
+                   help="EPISODE rollout tree (episode_eval.py output) -> /episode")
     p.add_argument("--val-mse-dir", type=Path, default=Path("eval_out/val_mse"),
                    help="dir of scripts/eval_val_mse.py output JSONs (the /val_mse curves)")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8092)
     args = p.parse_args()
     ROOT = args.rollout_root.resolve()
+    ROOTS = {"subtask": ROOT}
+    if args.episode_root is not None:
+        ROOTS["episode"] = args.episode_root.resolve()
     VAL_MSE_DIR = args.val_mse_dir.resolve()
-    print(f"Serving rollouts from {ROOT}  ->  http://{args.host}:{args.port}/")
+    print(f"Serving subtask rollouts from {ROOT}  ->  http://{args.host}:{args.port}/subtask")
+    if "episode" in ROOTS:
+        print(f"  episode rollouts from {ROOTS['episode']}  ->  /episode")
     print(f"  val_mse curves from {VAL_MSE_DIR}  ->  /val_mse")
     app.run(host=args.host, port=args.port, threaded=True)
 
