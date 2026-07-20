@@ -480,6 +480,7 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
+    _robocasa_config_descriptor = None  # set below for RoboCasa runs; copied into each step dir
     if tentative_run:
         checkpoint_manager, resuming = None, False
     else:
@@ -494,13 +495,18 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
         # INPUTS (base config name + settings tag) rather than a full dataclass dump: the tag is
         # the single source of truth (robocasa_config_from_tag inverts it, validated to round-trip),
         # and it stays serializable + human-readable. Primary process only; best-effort.
+        # Written in two places: (1) HERE at the run root, up front, so it survives even if
+        # training crashes before the first save; (2) later, into each FINALIZED step dir
+        # (after wait_until_finished, below) so a single uploaded step
+        # dir (e.g. .../99) is self-describing on its own. resolve_robocasa_config reads either.
         if jax.process_index() == 0 and tag:
+            _robocasa_config_descriptor = json.dumps({
+                "base_config": "pi05_robocasa_system1",
+                "robocasa_tag": tag,
+                "exp_name": config.exp_name,
+            }, indent=2)
             try:
-                (epath.Path(config.checkpoint_dir) / "config.json").write_text(json.dumps({
-                    "base_config": "pi05_robocasa_system1",
-                    "robocasa_tag": tag,
-                    "exp_name": config.exp_name,
-                }, indent=2))
+                (epath.Path(config.checkpoint_dir) / "config.json").write_text(_robocasa_config_descriptor)
             except Exception:
                 logging.warning("Could not write config.json to the checkpoint dir; continuing.")
     # Multi-node: only the PRIMARY process (index 0) logs to wandb. Otherwise every
@@ -674,6 +680,19 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
     if checkpoint_manager:
         logging.info("Waiting for checkpoint manager to finish")
         checkpoint_manager.wait_until_finished()
+        # Drop config.json INTO each finalized step dir (.../<step>/config.json) so an
+        # individually-uploaded step checkpoint is self-describing. Must run AFTER
+        # wait_until_finished: orbax stages each step in a `<step>.orbax-checkpoint-tmp-*`
+        # dir and only renames it to `<step>/` at finalize, so writing earlier would race
+        # (and could create a `<step>/` that collides with orbax's rename). Primary process
+        # only, best-effort; the run-root copy written up front is the fallback.
+        if jax.process_index() == 0 and _robocasa_config_descriptor is not None:
+            try:
+                root = epath.Path(config.checkpoint_dir)
+                for step in checkpoint_manager.all_steps():
+                    (root / str(step) / "config.json").write_text(_robocasa_config_descriptor)
+            except Exception:
+                logging.warning("Could not write per-step config.json; the run-root copy still applies.")
 
 
 if __name__ == "__main__":
