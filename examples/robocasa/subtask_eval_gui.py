@@ -403,6 +403,12 @@ def gui_js():
 GUI_JS = r"""
 const RN=window.RN||'subtask';   // rollout root: 'subtask' (#3) or 'episode' (#2)
 const $=s=>document.querySelector(s);
+// Gemini verdict for a subgoal (#3): episode.json.gemini.per_subtask[<child_dir>].success.
+function subVerdict(ep,s){
+  const cd=(s.out_dir||'').split('/').pop();
+  const g=ep.gemini&&ep.gemini.per_subtask&&ep.gemini.per_subtask[cd];
+  return g?g.success:null;
+}
 const S={method:null,eps:[],epi:0,subi:0,steps:null,fps:20,norm:true};
 const esc=s=>(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
 const fmt=(a,p=3)=>(a||[]).map(v=>(v>=0?'+':'')+Number(v).toFixed(p)).join(' ');
@@ -542,7 +548,13 @@ function drawTrack(){
   const curMs=subs[S.subi].milestone_index;
   const pct=(x)=>100*x/T;
   const msSegs=Object.entries(ms).map(([k,v])=>`<div class="pb-seg pb-ms ${+k===curMs?'cur':''}" style="left:${pct(v.a)}%;width:${pct(v.b-v.a+1)}%" title="${esc(v.text)}" data-ms="${k}">${esc(v.text)}</div>`).join("");
-  const fsSegs=subs.map((s,i)=>`<div class="pb-seg pb-fs ${i===S.subi?'cur':''}" style="left:${pct(s.span[0])}%;width:${pct(s.span[1]-s.span[0]+1)}%" title="[${s.primitive}] ${esc(s.subgoal)}" data-sub="${i}">${esc(s.subgoal)}</div>`).join("");
+  const fsSegs=subs.map((s,i)=>{
+    const v=subVerdict(ep,s);   // gemini success: true/false/null
+    const vc=v===true?'#2e8b3d':(v===false?'#b0431c':'');   // green / red / default
+    const adv=(s.advanced===true)?' ✓':(s.advanced===false?' ⧗':'');  // #2: stop fired / timeout
+    const style=`left:${pct(s.span[0])}%;width:${pct(s.span[1]-s.span[0]+1)}%`+(vc?`;box-shadow:inset 0 -3px 0 ${vc}`:'');
+    return `<div class="pb-seg pb-fs ${i===S.subi?'cur':''}" style="${style}" title="[${s.primitive}] ${esc(s.subgoal)}${v===null?'':' | gemini:'+(v?'PASS':'FAIL')}" data-sub="${i}">${esc(s.subgoal)}${adv}</div>`;
+  }).join("");
   $('#track').innerHTML=`<div class="pb-row"><div class="pb-lab">milestones</div><div class="pb-lane">${msSegs}</div></div>
     <div class="pb-row"><div class="pb-lab">subgoals</div><div class="pb-lane">${fsSegs}</div></div>`;
   document.querySelectorAll('.pb-fs').forEach(el=>el.onclick=()=>selectSub(+el.dataset.sub));
@@ -555,8 +567,15 @@ async function selectSub(i){
   S.fps=S.steps.fps||20;
   $('#subpos').textContent=`subtask ${i} / ${ep.subgoals.length-1}`;
   $('#prevSub').disabled=i<=0; $('#nextSub').disabled=i>=ep.subgoals.length-1;
-  $('#primchip').textContent=`[${sg.primitive}] ${sg.subgoal}`;
-  $('#mschip').textContent=`milestone: ${sg.milestone_subgoal||sg.milestone_index}`;
+  // primchip: primitive + subgoal, plus (#3) the Gemini verdict, plus (#2) episode success banner.
+  const v=subVerdict(ep,sg);
+  const vtxt=(v===true?'  · gemini: PASS':(v===false?'  · gemini: FAIL':''));
+  const reset=(RN==='episode')?'  · reset: first-only':'  · reset: hard (GT)';
+  $('#primchip').textContent=`[${sg.primitive}] ${sg.subgoal}${vtxt}${reset}`;
+  let ms=`milestone: ${sg.milestone_subgoal||sg.milestone_index}`;
+  if(ep.episode_success!=null)ms+=`  ·  EPISODE: ${ep.episode_success?'SUCCESS':'fail'} (advanced ${ep.n_advanced}/${ep.n_subgoals})`;
+  else if(ep.gemini)ms+=`  ·  gemini task rate: ${(100*(ep.gemini.success_rate||0)).toFixed(0)}%`;
+  $('#mschip').textContent=ms;
   buildSeries();
   drawTrack();
   renderStatic();
