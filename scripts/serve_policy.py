@@ -97,7 +97,10 @@ def create_policy(args: Args) -> _policy.Policy:
                 # RoboCasa System1: reconstruct the exact config from the checkpoint itself
                 # (config.json first, dir-name settings tag as fallback) so the served model +
                 # transforms match how THIS checkpoint was trained.
-                from scripts.train import resolve_robocasa_config
+                # Sibling import: serve_policy.py runs as a script (`uv run scripts/serve_policy.py`),
+                # so sys.path[0] is scripts/ itself and `scripts` is not an importable package —
+                # `from scripts.train import ...` raises ModuleNotFoundError. Import the sibling module.
+                from train import resolve_robocasa_config
                 train_config = resolve_robocasa_config(args.policy.dir)
                 if train_config is None:
                     raise ValueError(

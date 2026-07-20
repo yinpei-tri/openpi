@@ -199,7 +199,11 @@ def _write_steps_npz(sub_dir, doc_meta, step_records):
     arrs["progress_scalar"] = prog
     # replan-only chunks + prompt sidecar
     qi = [i for i, s in enumerate(step_records) if s.get("query")]
-    arrs["q_step"] = np.asarray(qi, np.int16)
+    # Store the FRAME step of each query (not the record index): the GUI reader keys q_step
+    # by frame_step (rp_by_step / q_pos[fs]), and the settle warmup logs `settle_steps` records
+    # with NEGATIVE frame_step before the main loop, so record index != frame_step whenever
+    # settle_steps > 0 (the default). qi order is preserved, so q_chunk_* stay positionally aligned.
+    arrs["q_step"] = np.asarray([int(step_records[i]["frame_step"]) for i in qi], np.int16)
     if qi:
         H = len(step_records[qi[0]]["query"]["chunk_lean11"])
         arrs["q_chunk_norm"] = np.asarray(
