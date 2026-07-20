@@ -172,3 +172,4 @@ cython_debug/
 .local_output/
 robocasa_training_data/
 openpi_pretrained_model
+eval_out/

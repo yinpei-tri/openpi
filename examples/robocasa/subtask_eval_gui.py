@@ -30,6 +30,7 @@ from flask import Flask, abort, jsonify, send_file
 
 app = Flask(__name__)
 ROOT: Path = Path(".")
+VAL_MSE_DIR: Path = Path("eval_out/val_mse")  # eval #1 curves (scripts/eval_val_mse.py output)
 
 
 def _methods():
@@ -149,6 +150,85 @@ def api_media(method, episode, sub, fname):
 @app.route("/")
 def index():
     return INDEX_HTML
+
+
+# ---------------------------------------------------------------------------------
+# Eval #1: validation-MSE curves (no rollout GUI — just per-ckpt/step metric curves).
+# Reads eval_out/val_mse/*.json written by scripts/eval_val_mse.py.
+# ---------------------------------------------------------------------------------
+@app.route("/api/val_mse")
+def api_val_mse():
+    """Return every val-MSE run: [{exp_name, steps:[{step, action_mse, flow_loss, ...}]}]."""
+    out = []
+    if VAL_MSE_DIR.is_dir():
+        for f in sorted(VAL_MSE_DIR.glob("*.json")):
+            try:
+                out.append(json.loads(f.read_text()))
+            except Exception:
+                continue
+    return jsonify(out)
+
+
+@app.route("/val_mse")
+def val_mse_page():
+    return VAL_MSE_HTML
+
+
+VAL_MSE_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<title>Validation MSE</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  body{font-family:system-ui,sans-serif;margin:0;color:#1a1a1a;background:#fafafb}
+  header{padding:10px 16px;border-bottom:1px solid #ddd;background:#fff;display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0}header h1 b{color:#b0431c}
+  nav a{margin-right:10px;color:#b0431c;text-decoration:none;font-size:13px}
+  #wrap{padding:16px;max-width:1100px;margin:0 auto}
+  label{font-size:13px}select{font-size:13px;padding:2px 6px}
+  #chart-box{background:#fff;border:1px solid #ddd;border-radius:6px;padding:12px;margin-top:12px}
+  table{border-collapse:collapse;font-size:12px;margin-top:16px;background:#fff}
+  th,td{border:1px solid #ddd;padding:3px 8px;text-align:right}th{background:#f0f0f0}
+  td.exp{text-align:left;font-family:ui-monospace,monospace}
+</style></head><body>
+<header>
+  <h1>Validation <b>MSE</b></h1>
+  <nav><a href="/subtask">subtask</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
+  <label>metric <select id="metric">
+    <option value="action_mse">action_mse</option>
+    <option value="flow_loss">flow_loss</option>
+    <option value="progress_loss">progress_loss</option>
+    <option value="progress_acc">progress_acc</option>
+    <option value="progress_class_mae">progress_class_mae</option>
+  </select></label>
+</header>
+<div id="wrap">
+  <div id="chart-box"><canvas id="chart" height="120"></canvas></div>
+  <div id="table"></div>
+</div>
+<script>
+const COLORS=["#b0431c","#1c6bb0","#2e8b3d","#8b2eb0","#b0902e","#2eb0a3","#b02e5a","#555"];
+let RUNS=[], CH=null;
+async function load(){ RUNS=await (await fetch('/api/val_mse')).json(); draw(); }
+function draw(){
+  const metric=document.getElementById('metric').value;
+  const ds=RUNS.map((r,i)=>{
+    const pts=(r.steps||[]).filter(s=>s[metric]!=null).sort((a,b)=>(a.step||0)-(b.step||0))
+                 .map(s=>({x:s.step,y:s[metric]}));
+    return {label:r.exp_name,data:pts,borderColor:COLORS[i%COLORS.length],
+            backgroundColor:COLORS[i%COLORS.length],tension:0.15,pointRadius:3};
+  });
+  if(CH)CH.destroy();
+  CH=new Chart(document.getElementById('chart'),{type:'line',data:{datasets:ds},
+    options:{responsive:true,parsing:false,scales:{x:{type:'linear',title:{display:true,text:'step'}},
+             y:{title:{display:true,text:metric}}},plugins:{legend:{labels:{font:{size:11}}}}}});
+  // table: metric at the LAST step per run
+  let h="<table><tr><th class='exp'>exp_name</th><th>last step</th><th>"+metric+"</th></tr>";
+  RUNS.forEach(r=>{const s=(r.steps||[]).filter(x=>x[metric]!=null).sort((a,b)=>(a.step||0)-(b.step||0)).pop();
+    if(s)h+=`<tr><td class='exp'>${r.exp_name}</td><td>${s.step}</td><td>${(+s[metric]).toFixed(4)}</td></tr>`;});
+  document.getElementById('table').innerHTML=h+"</table>";
+}
+document.getElementById('metric').onchange=draw;
+load();
+</script></body></html>"""
 
 
 INDEX_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
@@ -615,14 +695,18 @@ loadMethods();
 
 
 def main():
-    global ROOT
+    global ROOT, VAL_MSE_DIR
     p = argparse.ArgumentParser()
     p.add_argument("--rollout-root", type=Path, required=True)
+    p.add_argument("--val-mse-dir", type=Path, default=Path("eval_out/val_mse"),
+                   help="dir of scripts/eval_val_mse.py output JSONs (the /val_mse curves)")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8092)
     args = p.parse_args()
     ROOT = args.rollout_root.resolve()
+    VAL_MSE_DIR = args.val_mse_dir.resolve()
     print(f"Serving rollouts from {ROOT}  ->  http://{args.host}:{args.port}/")
+    print(f"  val_mse curves from {VAL_MSE_DIR}  ->  /val_mse")
     app.run(host=args.host, port=args.port, threaded=True)
 
 
