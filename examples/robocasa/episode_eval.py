@@ -143,9 +143,12 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
             action_plan.extend(chunk_sim[:replan_steps])
             chunk_lean = np.stack([sim_action_to_lean11(a) for a in chunk_sim], axis=0)
             chunk_lean_norm = (quantile_norm(chunk_lean, q01a, q99a) if q01a is not None else None)
+            # Prefer the REAL assembled prompt the server tokenized (real discretized state
+            # ints); fall back to the placeholder template only if absent.
+            real_prompt = (result.get("prompt_text") if isinstance(result, dict) else None) \
+                or build_prompt_text(task_goal, sg.subgoal, "Success", est_len, executed, gripper_flag)
             query = dict(
-                # Full assembled prompt (matches subtask_eval so the GUI renders identically).
-                prompt=build_prompt_text(task_goal, sg.subgoal, "Success", est_len, executed, gripper_flag),
+                prompt=real_prompt,
                 gripper_flag=gripper_flag, executed_step=int(executed),
                 replan_steps=int(replan_steps), horizon=int(HORIZON),
                 chunk_lean11=np.round(chunk_lean, 4).tolist(),

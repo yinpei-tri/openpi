@@ -30,7 +30,8 @@ class PaligemmaTokenizer:
         preserve_newlines: bool = False,
         gripper_flag: str | None = None,
         include_state: bool = True,
-    ) -> tuple[np.ndarray, np.ndarray]:
+        return_prompt: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, str]:
         # ``preserve_newlines``: keep intentional structural newlines in the prompt (e.g.
         # RoboCasa System1's "Scope:" metadata line). Default strips them (stock pi05).
         cleaned_text = prompt.strip().replace("_", " ")
@@ -76,6 +77,7 @@ class PaligemmaTokenizer:
             # This is the Pi0 format, where the state is part of the continuous action expert input.
             # tokenize "\n" separately as the "start of answer" token
             tokens = self._tokenizer.encode(cleaned_text, add_bos=True) + self._tokenizer.encode("\n")
+            full_prompt = cleaned_text  # no discrete state block in the pi0 path
         tokens_len = len(tokens)
         if tokens_len < self._max_len:
             padding = [False] * (self._max_len - tokens_len)
@@ -90,6 +92,10 @@ class PaligemmaTokenizer:
             tokens = tokens[: self._max_len]
             mask = [True] * self._max_len
 
+        if return_prompt:
+            # The exact text string fed to the SentencePiece encoder (with real discretized
+            # state ints, gripper flag, etc.) — captured for faithful eval logging.
+            return np.asarray(tokens), np.asarray(mask), full_prompt
         return np.asarray(tokens), np.asarray(mask)
 
 

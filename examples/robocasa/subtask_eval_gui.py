@@ -578,21 +578,23 @@ function promptHTML(p){return esc(p).replace(/(Task:|Current Subgoal:|Quality:|E
 function renderPromptFields(gs){
   if(!gs){$('#prompt').innerHTML='<div class="pf"><span class="pfv">(warmup — no query yet)</span></div>';return;}
   const q=gs.query||{}; const P=q.prompt||"";
+  // P is now the REAL assembled prompt string the server tokenized (result["prompt_text"]),
+  // with the actual discretized state ints — parse every field straight out of it.
   const grab=(re)=>{const m=P.match(re); return m?m[1].trim():"—";};
-  const task=grab(/Task:\s*([^\n;]*)/), subgoal=grab(/Current Subgoal:\s*([^\n;]*)/);
+  const task=grab(/Task:\s*([^\n;]*)/), subgoal=grab(/Current Subgoal:\s*([^\n]*?)(?:\n|$)/);
   const quality=grab(/Quality:\s*([^\n;]*)/), estlen=grab(/Estimated Length:\s*([^\n;]*)/);
-  // discretized 256-bin ints of the state AT THE GOVERNING REPLAN (anchor=Initial first, then Current)
-  const curInts=discretize(gs.cur_lean_norm), ancInts=discretize(S.steps.anchor_state_lean14_norm);
+  const execstep=grab(/Executed Step:\s*([^\n;]*)/), grip=grab(/Current Gripper:\s*([^\n;]*)/);
+  const initSt=grab(/Initial State:\s*([^;]*)/), curSt=grab(/Current State:\s*([^;]*)/);
   const row=(k,v,cls)=>`<div class="pf"><span class="pfk">${k}</span><span class="pfv ${cls||''}">${esc(String(v))}</span></div>`;
   $('#prompt').innerHTML=
     row('Task', task)+
     row('Current Subgoal', subgoal, 'hl')+
     row('Quality', quality)+
     row('Estimated Length', estlen)+
-    row('Executed Step', gs.frame_step, 'hl')+
-    row('Current Gripper', q.gripper_flag)+
-    row('Initial State', ancInts?ancInts.join(' '):'—', 'ints')+
-    row('Current State', curInts?curInts.join(' '):'—', 'ints')+
+    row('Executed Step', execstep, 'hl')+
+    row('Current Gripper', grip)+
+    row('Initial State', initSt, 'ints')+
+    row('Current State', curSt, 'ints')+
     row('Action', '→ predicted chunk (right)');
 }
 // discretize a NORMALIZED value array into 256 bins over [-1,1] (matches PaligemmaTokenizer:
@@ -845,10 +847,6 @@ function renderStatic(){
         <div class="fchips" id="fchips"></div>
       </div>
       <div class="card"><h3>LANGUAGE PROMPT (policy input @ current step — same within a chunk, changes on replan)</h3><div class="prompt-box" id="prompt"></div></div>
-      <div class="card">
-        <h3>EXECUTED vs ORACLE @ current step</h3>
-        <div id="execcmp"></div>
-      </div>
       <div class="card grow">
         <h3>PROGRESS (predicted, executed rollout)</h3>
         <canvas id="curveP"></canvas>
@@ -866,6 +864,10 @@ function renderStatic(){
 
     <div class="col">
       <div class="card"><h3>TASK SUCCESS</h3><div id="success"></div></div>
+      <div class="card">
+        <h3>EXECUTED vs ORACLE @ current step</h3>
+        <div id="execcmp"></div>
+      </div>
       <div class="card grow">
         <h3>PREDICTED ACTION CHUNK @ current query (full horizon) <button class="toggle" id="tg-chunk"></button></h3>
         <div id="chunk"></div>

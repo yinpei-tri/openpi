@@ -306,6 +306,11 @@ class TokenizePrompt(DataTransformFn):
     # (Task: text + gripper + Action:). RoboCasa System1 `nostate` ablation. Default True
     # (state rendered as usual). No effect when discrete_state_input is False (pi0 path).
     include_state: bool = True
+    # If True, also emit "prompt_text": the EXACT assembled string fed to the tokenizer
+    # (real discretized state ints + gripper flag). OFF by default so training collation
+    # (which np.stacks every sample key) never sees a str; Policy.infer turns it ON to
+    # log the true model input at eval, popping it before batching.
+    emit_prompt_text: bool = False
 
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
@@ -327,7 +332,7 @@ class TokenizePrompt(DataTransformFn):
         if self.use_gripper_flag and g not in (None, ""):
             gripper_flag = g.item() if (hasattr(g, "item") and not isinstance(g, str)) else str(g)
 
-        tokens, token_masks = self.tokenizer.tokenize(
+        tokens, token_masks, prompt_text = self.tokenizer.tokenize(
             prompt,
             state,
             state_split=self.state_split,
@@ -336,8 +341,15 @@ class TokenizePrompt(DataTransformFn):
             task_state_sep=self.task_state_sep,
             gripper_flag=gripper_flag,
             include_state=self.include_state,
+            return_prompt=True,
         )
-        return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+        out = {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
+        if self.emit_prompt_text:
+            # The EXACT assembled string fed to the tokenizer (real discretized state ints +
+            # gripper flag). Serving only (Policy.infer pops it before batching); never on in
+            # training, where the collate np.stacks every key and a str would break it.
+            out["prompt_text"] = prompt_text
+        return out
 
 
 @dataclasses.dataclass(frozen=True)

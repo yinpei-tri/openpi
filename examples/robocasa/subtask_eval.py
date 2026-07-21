@@ -405,8 +405,13 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
             chunk_lean = np.stack([sim_action_to_lean11(a) for a in chunk_sim], axis=0)
             chunk_lean_norm = (quantile_norm(chunk_lean, q01a, q99a) if q01a is not None else None)
             prog_full = _read_progress(result) or None
+            # Prefer the REAL assembled prompt the server tokenized (result["prompt_text"],
+            # with actual discretized state ints); fall back to the placeholder template only
+            # if absent (e.g. oracle mode has no server / older ckpts).
+            real_prompt = (result.get("prompt_text") if isinstance(result, dict) else None) \
+                or build_prompt_text(task_goal, sg.subgoal, "Success", est_len, executed, gripper_flag)
             query = dict(
-                prompt=build_prompt_text(task_goal, sg.subgoal, "Success", est_len, executed, gripper_flag),
+                prompt=real_prompt,
                 gripper_flag=gripper_flag, executed_step=executed,
                 # Only the chunks the GUI displays: lean-11 (real, → env.step after unnorm) + its
                 # normalized form (model's direct output). Dropped chunk_raw_lerobot12 / chunk_sim12

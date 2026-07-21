@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import pathlib
@@ -78,6 +79,14 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    # At SERVING/eval time, ask TokenizePrompt to also emit the exact assembled prompt string
+    # (real discretized state ints) so Policy.infer can return the TRUE model input for logging.
+    # dataclasses are frozen, so rebuild each TokenizePrompt with the flag flipped on.
+    model_input_transforms = [
+        dataclasses.replace(t, emit_prompt_text=True) if isinstance(t, transforms.TokenizePrompt) else t
+        for t in data_config.model_transforms.inputs
+    ]
+
     return _policy.Policy(
         model,
         transforms=[
@@ -85,7 +94,7 @@ def create_trained_policy(
             transforms.InjectDefaultPrompt(default_prompt),
             *data_config.data_transforms.inputs,
             transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
+            *model_input_transforms,
         ],
         output_transforms=[
             *data_config.model_transforms.outputs,

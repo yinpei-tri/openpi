@@ -90,7 +90,11 @@ def _eval_one_ckpt(step_dir: pathlib.Path, args) -> dict:
     loader = _data_loader.create_data_loader(
         config,
         sharding=None,
-        shuffle=True,
+        # No shuffle for a metric eval: a fixed deterministic prefix of the val set (the shards
+        # are already globally shuffled at build time). shuffle=True would force the reservoir
+        # buffer (16k default) to fill from S3/disk before the FIRST batch — the GPU-starving
+        # slowdown we measured. Streaming shards directly yields batches immediately.
+        shuffle=False,
         num_batches=args.num_batches,
         framework="jax",
     )

@@ -80,6 +80,10 @@ class Policy(BasePolicy):
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
+        # Pop the exact assembled prompt string (TokenizePrompt emits it at serving) BEFORE
+        # batching — JAX can't collate a str. Echoed into the outputs so eval logs the TRUE
+        # model input (real discretized state ints). None if not a discrete-state config.
+        prompt_text = inputs.pop("prompt_text", None)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -124,6 +128,10 @@ class Policy(BasePolicy):
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
+        # Echo the true assembled prompt AFTER the output transforms (they operate on arrays;
+        # keep the str out of their way). This is exactly what the tokenizer encoded.
+        if prompt_text is not None:
+            outputs["prompt_text"] = prompt_text
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
