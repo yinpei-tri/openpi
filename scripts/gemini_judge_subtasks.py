@@ -34,9 +34,13 @@ if _ROBOANNO not in sys.path:
 
 from robo_annotator.vlm_backend import _gemini_generate  # noqa: E402
 
-DEFAULT_MODEL = "gemini-2.5-pro"
+# gemini-3.x pro (matches the model that produced the subgoal annotations) — required
+# because RoboAnnotator's shared _gemini_config pins thinking_level=HIGH, which only
+# gemini-3 models accept (gemini-2.5-pro returns 400 INVALID_ARGUMENT). gemini-3.x is
+# GLOBAL/Vertex-only, so the default backend is Vertex ADC (no --gemini-api-key).
+DEFAULT_MODEL = "gemini-3.1-pro-preview"
 DEFAULT_PROJECT = "gen-lang-client-0648980768"
-DEFAULT_LOCATION = "us-central1"
+DEFAULT_LOCATION = "global"
 
 # Structured verdict schema (google-genai response_schema).
 VERDICT_SCHEMA = {
