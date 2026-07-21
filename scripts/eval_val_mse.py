@@ -81,7 +81,7 @@ def _eval_one_ckpt(step_dir: pathlib.Path, args) -> dict:
         # Resolve norm_stats from <step_dir>/assets/robocasa_system1/norm_stats.json.
         assets=_config.AssetsConfig(assets_dir=str(step_dir / "assets"), asset_id="robocasa_system1"),
     )
-    config = dataclasses.replace(config, data=data, batch_size=args.batch_size, num_workers=0)
+    config = dataclasses.replace(config, data=data, batch_size=args.batch_size, num_workers=args.num_workers)
 
     params = _model.restore_params(step_dir / "params", restore_type=jax.Array, dtype=jnp.bfloat16)
     model = config.model.load(params)
@@ -134,8 +134,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True, help="ckpt run dir (all step subdirs) OR a single step dir")
     ap.add_argument("--only-step", type=int, default=None, help="restrict to one step")
-    ap.add_argument("--num-batches", type=int, default=16)
+    ap.add_argument("--num-batches", type=int, default=1024, help="1024 x batch-size = samples/step (default 8192)")
     ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--num-workers", type=int, default=8,
+                    help="data-loader workers; the val WebDataset (6 JPEGs/sample) is decode-bound, "
+                         "so 0 makes it GPU-starved. 8 keeps the GPU fed.")
     ap.add_argument("--flow-steps", type=int, default=10, help="flow-matching integration steps for sampling")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True, help="output JSON path")

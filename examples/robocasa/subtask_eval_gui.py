@@ -157,6 +157,18 @@ def _reconstruct_full(sub_dir: Path) -> dict | None:
     return {**meta, "steps": steps}
 
 
+@app.route("/api/<root>/gemini/<method>/<episode>/<sub>")
+def api_gemini_r(root, method, episode, sub):
+    """Serve a subtask's gemini.json (success/confidence/reason) if the judge has run."""
+    f = _safe(_root(root), method, episode, sub) / "gemini.json"
+    if not f.is_file():
+        return jsonify(None)
+    try:
+        return jsonify(json.loads(f.read_text()))
+    except Exception:
+        return jsonify(None)
+
+
 @app.route("/api/<root>/steps/<method>/<episode>/<sub>")
 def api_steps_r(root, method, episode, sub):
     doc = _reconstruct_full(_safe(_root(root), method, episode, sub))
@@ -522,7 +534,8 @@ INDEX_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   <div id="top">
     <h1><b>Subtask</b> Eval</h1>
     <label class="dssel">method<select id="method"></select></label>
-    <label class="dssel">task/episode<select id="episode"></select></label>
+    <label class="dssel">task<select id="task"></select></label>
+    <label class="dssel">episode<select id="episode"></select></label>
     <div class="nav">
       <button id="prevSub">‹ subtask</button>
       <span class="pos" id="subpos">— / —</span>
@@ -577,7 +590,7 @@ function renderPromptFields(gs){
     row('Quality', quality)+
     row('Estimated Length', estlen)+
     row('Executed Step', gs.frame_step, 'hl')+
-    row('Current Gripper', gs.gripper_flag)+
+    row('Current Gripper', q.gripper_flag)+
     row('Initial State', ancInts?ancInts.join(' '):'—', 'ints')+
     row('Current State', curInts?curInts.join(' '):'—', 'ints')+
     row('Action', '→ predicted chunk (right)');
@@ -612,13 +625,26 @@ const LEAN_LABELS=["base_vx","base_vy","yaw_v","ctrl","eef_dx","eef_dy","eef_dz"
 function sim12ToLean11(a){return [a[7],a[8],a[10],a[11],a[0],a[1],a[2],a[3],a[4],a[5],a[6]];}
 function stateBlock(vals,groups){return groups.map(([n,s,e])=>`  ${n.padEnd(12)} ${vals.slice(s,e).map(x=>Number(x).toFixed(3).padStart(8)).join(' ')}`).join("\n");}
 
-// scalar progress in [0,1] from a step's progress_raw (classes -> E[frac]; continuous/action -> value)
+// scalar progress in [0,1] from a step's progress_raw. classes -> argmax CLASS normalized
+// (argmax/(K-1)): a faithful staircase of the classifier's discrete decile prediction, NOT the
+// smoothed expected value. continuous/action -> the value directly.
 function progScalar(pr){
   if(!pr)return null;
-  if(pr.progress_kind==='classes')return pr.progress_expected_frac;
+  if(pr.progress_kind==='classes'){
+    const k=pr.progress_num_classes||10;
+    return (pr.progress_argmax!=null)?pr.progress_argmax/(k-1):pr.progress_expected_frac;
+  }
   if(pr.progress_kind==='continuous')return pr.progress_now;
   if(pr.progress_kind==='action')return pr.progress_now;
   return null;
+}
+// Human-readable progress label for the current step (shown in the success/prompt panels).
+function progLabel(pr){
+  if(!pr)return '—';
+  if(pr.progress_kind==='classes')return `class ${pr.progress_argmax}/${(pr.progress_num_classes||10)-1} (conf ${(pr.progress_conf||0).toFixed(2)})`;
+  if(pr.progress_kind==='continuous')return `${(pr.progress_now||0).toFixed(3)}`;
+  if(pr.progress_kind==='action')return `${(pr.progress_now||0).toFixed(3)} → ${(pr.progress_end||0).toFixed(3)}`;
+  return '—';
 }
 // Build per-step series for the current subtask. Also precompute, for EACH frame, the index of
 // the GOVERNING query — the most recent replan step at/before it. The model is only queried on
@@ -676,10 +702,19 @@ async function loadMethods(){
 async function loadEpisodes(){
   S.method=$('#method').value;
   S.eps=await (await fetch(`/api/${RN}/episodes/`+S.method)).json();
-  $('#episode').innerHTML=S.eps.map((e,i)=>`<option value="${i}">${e.task_name} :: ${e.episode_id.split('/').pop()}</option>`).join('');
+  // TASK dropdown: unique task_name; EPISODE dropdown: the episodes of the selected task.
+  const tasks=[...new Set(S.eps.map(e=>e.task_name))].sort();
+  $('#task').innerHTML=tasks.map(t=>`<option value="${t}">${t}</option>`).join('');
   const m=window._ms.find(x=>x.method===S.method)||{};
   $('#dsinfo').textContent=`${S.method} · ${m.n_episodes} eps · budget ${m.horizon_mult}x · settle ${m.settle_steps}`;
-  S.epi=0; S.subi=0; await selectEpisode(0);
+  fillEpisodes();
+}
+// Populate the episode dropdown for the selected task, then select its first episode.
+function fillEpisodes(){
+  const task=$('#task').value;
+  const opts=S.eps.map((e,i)=>({e,i})).filter(x=>x.e.task_name===task);
+  $('#episode').innerHTML=opts.map(x=>`<option value="${x.i}">${x.e.episode_id.split('/').pop()}</option>`).join('');
+  if(opts.length)selectEpisode(opts[0].i);
 }
 async function selectEpisode(i){ S.epi=i; S.subi=0; drawTrack(); await selectSub(0); }
 
@@ -725,6 +760,42 @@ async function selectSub(i){
   const base=`/api/${RN}/media/${S.method}/${ep.episode_id.replaceAll('/','__')}/${sg.out_dir.split('/').pop()}/`;
   $('#vid').src=base+S.steps.clean_video;
   $('#slider').max=S.steps.steps.length-1; $('#slider').value=0; showFrame(0);
+}
+
+// TASK SUCCESS panel: episode success (#2) OR subtask Gemini verdict + reasoning (#3),
+// plus the model's self-stop info and the current progress readout.
+async function renderSuccess(){
+  const el=$('#success'); if(!el)return;
+  const ep=S.eps[S.epi], sg=ep.subgoals[S.subi];
+  const cd=(sg.out_dir||'').split('/').pop();
+  const rows=[];
+  const row=(k,v,cls)=>`<div class="pf"><span class="pfk">${k}</span><span class="pfv ${cls||''}">${v}</span></div>`;
+  const yn=b=>b===true?'<b style="color:#2e8b3d">SUCCESS</b>':(b===false?'<b style="color:#b0431c">FAIL</b>':'—');
+  if(RN==='episode' || ep.episode_success!=null){
+    rows.push(row('EPISODE (env check)', yn(ep.episode_success), 'hl'));
+    rows.push(row('subgoals advanced', `${ep.n_advanced}/${ep.n_subgoals}`));
+    rows.push(row('this subgoal advanced', yn(sg.advanced)));
+    if(sg.stop_reason&&sg.stop_reason.timeout)rows.push(row('stop', 'budget timeout (no self-stop)'));
+    else if(sg.advanced)rows.push(row('stop', 'progress+quiescence fired'));
+  } else {
+    // subtask (#3): env auxiliary + Gemini verdict + reasoning (fetched from gemini.json)
+    rows.push(row('sim _check_success (aux)', yn(sg.sim_success_final)));
+    rows.push(row('self-stopped', sg.stopped==null?'—':(sg.stopped?'yes (progress+quiescence)':'no (budget cap)')));
+    const g=ep.gemini&&ep.gemini.per_subtask&&ep.gemini.per_subtask[cd];
+    rows.push(row('GEMINI verdict', g?yn(g.success):'(not judged)', 'hl'));
+    if(g&&g.confidence!=null)rows.push(row('confidence', (+g.confidence).toFixed(2)));
+  }
+  // current-step progress readout (argmax class for progcls) — id'd so showFrame can refresh it
+  const cur=S._curStep||(S.steps&&S.steps.steps?S.steps.steps[0]:null);
+  rows.push(`<div class="pf"><span class="pfk">progress @ frame</span><span class="pfv hl" id="succ-prog">${cur?progLabel(cur.progress_raw):'—'}</span></div>`);
+  el.innerHTML=rows.join('');
+  // Gemini reasoning (subtask only) — fetch the full text from gemini.json.
+  if(RN!=='episode'){
+    try{
+      const gj=await (await fetch(`/api/${RN}/gemini/${S.method}/${ep.episode_id.replaceAll('/','__')}/${cd}`)).json();
+      if(gj&&gj.reason)el.innerHTML+=`<div class="pf" style="flex-direction:column;align-items:flex-start"><span class="pfk">gemini reasoning</span><span class="pfv" style="white-space:normal;font-weight:400">${esc(gj.reason)}</span></div>`;
+    }catch(e){}
+  }
 }
 
 function renderStatic(){
@@ -774,6 +845,10 @@ function renderStatic(){
         <div class="fchips" id="fchips"></div>
       </div>
       <div class="card"><h3>LANGUAGE PROMPT (policy input @ current step — same within a chunk, changes on replan)</h3><div class="prompt-box" id="prompt"></div></div>
+      <div class="card">
+        <h3>EXECUTED vs ORACLE @ current step</h3>
+        <div id="execcmp"></div>
+      </div>
       <div class="card grow">
         <h3>PROGRESS (predicted, executed rollout)</h3>
         <canvas id="curveP"></canvas>
@@ -790,15 +865,13 @@ function renderStatic(){
     </div>
 
     <div class="col">
+      <div class="card"><h3>TASK SUCCESS</h3><div id="success"></div></div>
       <div class="card grow">
         <h3>PREDICTED ACTION CHUNK @ current query (full horizon) <button class="toggle" id="tg-chunk"></button></h3>
         <div id="chunk"></div>
       </div>
-      <div class="card">
-        <h3>EXECUTED vs ORACLE @ current step</h3>
-        <div id="execcmp"></div>
-      </div>
     </div>`;
+  renderSuccess();
   wireVideo();
 }
 
@@ -839,6 +912,7 @@ function showFrame(i){
     s.replanned?`<span class="c rep">REPLAN</span>`:'',
   ].join('');
   S._curStep=s;
+  const sp=$('#succ-prog'); if(sp)sp.textContent=progLabel(s.progress_raw);
   // Governing replan for THIS frame: the model was queried there and its prompt + chunk hold
   // until the next replan. Deriving from govQ (not a mutated _lastQuery) is correct when scrubbing
   // in any direction. gs = the governing step record; its .query is what the model actually saw.
@@ -912,6 +986,7 @@ document.addEventListener('keydown',e=>{
   if(e.key==='ArrowUp'){e.preventDefault();selectSub(S.subi-1);}
 });
 $('#method').onchange=loadEpisodes;
+$('#task').onchange=fillEpisodes;
 $('#episode').onchange=e=>selectEpisode(+e.target.value);
 $('#prevSub').onclick=()=>selectSub(S.subi-1);
 $('#nextSub').onclick=()=>selectSub(S.subi+1);

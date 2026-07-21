@@ -288,7 +288,7 @@ def main():
     ap.add_argument("--norm-stats", type=Path, required=True, help="ckpt norm_stats.json")
     ap.add_argument("--subgoal-method", default=DEFAULT_SUBGOAL_METHOD)
     ap.add_argument("--resize-size", type=int, default=224)
-    ap.add_argument("--replan-steps", type=int, default=8)
+    ap.add_argument("--replan-steps", type=int, default=16)
     ap.add_argument("--horizon-mult", type=float, default=2.0)
     ap.add_argument("--max-steps-cap", type=int, default=400)
     ap.add_argument("--settle-steps", type=int, default=10)

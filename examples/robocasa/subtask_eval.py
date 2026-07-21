@@ -67,6 +67,7 @@ from robocasa.scripts.eval.subtask_env import (
 from robocasa.scripts.eval.subtask_overlay import render_header
 import robocasa.utils.lerobot_utils as LU
 from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
+from stop_criterion import StopConfig, StopTracker   # sibling module (examples/robocasa/)
 
 HORIZON = 20            # policy action chunk length (pi05 System1)
 # gripper_close index in ROBOSUITE-NATIVE order (after lerobot_action_to_sim): eef_pos[0:3],
@@ -135,7 +136,9 @@ def _read_progress(result: dict) -> dict:
         if ph.size > 1:  # classes softmax
             k = ph.size
             out["progress_kind"] = "classes"
-            out["progress_argmax"] = int(np.argmax(ph))
+            out["progress_num_classes"] = int(k)
+            out["progress_argmax"] = int(np.argmax(ph))       # predicted decile class 0..k-1
+            out["progress_conf"] = float(np.max(ph))          # softmax confidence of the argmax
             out["progress_expected_frac"] = float(np.dot(np.arange(k), ph) / (k - 1))
         else:            # continuous scalar
             out["progress_kind"] = "continuous"
@@ -279,7 +282,8 @@ def _progress_str(prog: dict | None) -> str:
 def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
                     base_pos_ref, base_yaw_ref, anchor_imgs, anchor_state,
                     task_goal, resize, replan_steps, horizon_mult, max_steps_cap,
-                    settle_steps=10, norm_stats=None, ep_len=None, zero_arm_in_base=True):
+                    settle_steps=10, norm_stats=None, ep_len=None, zero_arm_in_base=True,
+                    stop_cfg: StopConfig | None = None):
     """Reset to the subgoal start, gripper-settle, roll out the policy, and LOG EVERYTHING.
 
     No success criterion is applied here (Gemini judges later). We just faithfully record,
@@ -353,6 +357,11 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
     first_chunk_mse = None
     executed = 0
     query = None
+    # Early-stop (policy only): the shared progress-AND-quiescence rule. The hard-boundary
+    # `budget` stays as the CAP; a triggered stop terminates the subtask early (as System1 is
+    # trained to settle at a subgoal boundary). Disabled in oracle mode (client is None).
+    tracker = StopTracker(stop_cfg) if (stop_cfg is not None and client is not None) else None
+    stopped_reason = None
     while executed < budget:
         replanned = False
         query = None
@@ -422,6 +431,13 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
         env.step(a_step)
         timers["sim_s"] += time.monotonic() - _t; timers["n_sim"] += 1
         executed += 1
+        # progress-AND-quiescence early stop (feed the RAW commanded action `a`, not the
+        # base-mode-zeroed `a_step`, so quiescence reflects the model's actual command).
+        if tracker is not None:
+            tracker.update(a, last_prog)
+            if tracker.should_stop():
+                stopped_reason = tracker.reason()
+                break
 
     # end-of-rollout final state signals (post last step)
     final_success = bool(sim.check_full_success())
@@ -439,6 +455,7 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
                 progress_trace=progress_trace, n_progress_reads=len(progress_trace),
                 sim_success_final=final_success,
                 sim_success_any=any(r["sim_check_success"] for r in step_records),
+                stopped=stopped_reason is not None, stop_reason=stopped_reason,
                 timing=timing,
                 _clean_frames=clean_frames,
                 _step_records=step_records)
@@ -490,7 +507,8 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
                 replan_steps=args.replan_steps, horizon_mult=args.horizon_mult,
                 max_steps_cap=args.max_steps_cap, settle_steps=args.settle_steps,
                 norm_stats=norm_stats, ep_len=len(actions),
-                zero_arm_in_base=not args.no_zero_arm_in_base)
+                zero_arm_in_base=not args.no_zero_arm_in_base,
+                stop_cfg=getattr(args, "_stop_cfg", None))
 
             clean = roll.pop("_clean_frames", [])
             roll.pop("_overlay_frames", None)   # overlay video no longer used by the GUI (info is in panels)
@@ -530,7 +548,9 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
                 base_pos_ref=np.round(np.asarray(base_pos_ref), 4).tolist(), base_yaw_ref=round(float(base_yaw_ref), 4),
                 summary={k: roll[k] for k in ("steps", "budget", "span_len", "est_length",
                         "first_chunk_action_mse", "mean_step_action_mse",
-                        "sim_success_final", "sim_success_any", "n_progress_reads")},
+                        "sim_success_final", "sim_success_any", "n_progress_reads",
+                        "stopped")},
+                stopped=roll["stopped"], stop_reason=roll["stop_reason"],
                 timing=roll["timing"], progress_final=roll["progress_final"])
             # Compact per-step log: steps.npz (fp16 arrays + uint8 flags) + steps_meta.json sidecar.
             _write_steps_npz(sub_dir, doc_meta, step_records)
@@ -542,7 +562,8 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
                        out_dir=str(sub_dir.relative_to(out_root)), timing=roll["timing"],
                        **{k: roll[k] for k in ("steps", "budget", "span_len", "est_length",
                           "first_chunk_action_mse", "mean_step_action_mse",
-                          "sim_success_final", "sim_success_any", "progress_final")})
+                          "sim_success_final", "sim_success_any", "progress_final",
+                          "stopped", "stop_reason")})
             records.append(rec)
         ep_doc = dict(method=method, episode_id=ann.episode_id, task_name=ann.task_name,
                       instruction=ann.instruction, n_subgoals=len(ann.subgoals),
@@ -570,7 +591,7 @@ def main():
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8010)
     p.add_argument("--resize-size", type=int, default=224)
-    p.add_argument("--replan-steps", type=int, default=5)
+    p.add_argument("--replan-steps", type=int, default=16)
     p.add_argument("--horizon-mult", type=float, default=2.0,
                    help="policy step budget = span_len * this (clamped to --max-steps-cap)")
     p.add_argument("--max-steps-cap", type=int, default=400)
@@ -590,7 +611,16 @@ def main():
                    help="ORACLE mode: replay recorded actions instead of a served policy (no "
                         "server needed). Same structured logs/videos, as a ground-truth reference.")
     p.add_argument("--limit", type=int, default=None)
+    # Early-stop (progress AND action-quiescence). ON by default for policy runs; the hard
+    # `budget` stays as the cap. --no-stop disables it (roll the full budget, as before).
+    p.add_argument("--no-stop", action="store_true", help="disable the progress+quiescence early stop")
+    p.add_argument("--stop-progress", type=float, default=0.95)
+    p.add_argument("--stop-eps", type=float, default=0.02)
+    p.add_argument("--stop-window", type=int, default=5)
     args = p.parse_args()
+    # Stop config: disabled in oracle mode (replay) or when --no-stop.
+    args._stop_cfg = None if (args.no_stop or args.oracle) else \
+        StopConfig(progress_thresh=args.stop_progress, eps=args.stop_eps, window=args.stop_window)
     norm_stats = None
     if args.norm_stats is not None:
         norm_stats = json.loads(args.norm_stats.read_text()).get("norm_stats")
