@@ -9,6 +9,7 @@ end-to-end flow, and — importantly — the **commit rule**.
 > - Multi-node training: [robocasa_multinode_training.md](robocasa_multinode_training.md)
 > - Norm stats: [norm_stats.md](norm_stats.md)
 > - Eval harness internals: `robocasa/robocasa/scripts/eval/README.md`
+> - **Data construction (how the shards are built) + inspection GUIs:** `RoboAnnotator/docs/data_pipeline_and_gui.md`
 
 ---
 
