@@ -31,6 +31,7 @@ import functools
 import io
 import json
 import logging
+import os
 from pathlib import Path
 import random
 import tarfile
@@ -49,6 +50,44 @@ CAM_KEYS = ("scene_left", "scene_right", "wrist")
 # eef_rot(7:10), gripper_close(10)]. Settle-pad HOLDS control_mode + gripper at their
 # last real value and zeros the rest (velocity/eef -> 0 == "stop moving").
 LEAN_ACTION_HOLD_IDX = [3, 10]
+
+
+# ---------------------------------------------------------------------------
+# SUBOPTIMAL (failure+recovery) non-linear progress overlay.
+# A suboptimal merged span's true progress is NOT a single 0->1 ramp: it rises during the approach,
+# DROPS to 0 at the failed grasp, then rises 0->1 over the recovery. This overlay supplies that
+# curve without re-sharding — an in-tree JSON of markers keyed by span-prefix + a piecewise formula
+# applied at load time. Only suboptimal spans are in the JSON; every other span falls through to the
+# usual linear ramp (dict.get -> None), so non-suboptimal data is byte-identical to before.
+#   JSON: src/openpi/training/assets/suboptimal_progress.json (baked into the docker image).
+#   key : <flat_episode_id>__<vtag>__s<start:06d>-<end:06d>  (episode_id '/'->'__', variant ':'->'-')
+# Built by RoboAnnotator producers/build_suboptimal_progress_json.py --markers-only (single source
+# of truth for the formula: robo_annotator/system2/build_samples.py::suboptimal_progress_frac).
+# ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
+def _suboptimal_overlay() -> dict:
+    try:
+        import importlib.resources
+
+        p = importlib.resources.files("openpi.training") / "assets" / "suboptimal_progress.json"
+        return json.loads(p.read_text())
+    except Exception:  # noqa: BLE001 - missing/unreadable overlay -> everything stays linear
+        return {}
+
+
+def _suboptimal_frac(t: int, s: int, e: int, grip_onset: int, fail_end: int) -> float:
+    """Piecewise suboptimal progress at frame ``t`` in span [s,e]: approach linear rise 0->onset_frac
+    (onset_frac=(grip_onset-s)/(e-s)), then linear ramp DOWN to 0 through the failed grasp
+    (grip_onset..fail_end], then linear rise 0->1 over the recovery (fail_end..e]."""
+    span = max(1, e - s)
+    onset_frac = (grip_onset - s) / span
+    if t <= grip_onset:
+        p = (t - s) / max(1, grip_onset - s) * onset_frac
+    elif t <= fail_end:
+        p = onset_frac * (1.0 - (t - grip_onset) / max(1, fail_end - grip_onset))
+    else:
+        p = (t - fail_end) / max(1, e - fail_end)
+    return min(1.0, max(0.0, p))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -587,11 +626,23 @@ class RoboCasaWebDataset:
         # classifier head wants 0-indexed labels 0..K-1, so shift by -1 and clip into
         # range (defends against an out-of-range label silently becoming an all-zeros
         # one-hot row = dead gradient). progress_frac stays the raw [0,1] fraction.
-        sample["progress_frac"] = np.float32(meta.get("subgoal_progress_frac", meta.get("progress_frac", 0.0)))
-        k = self.cfg.progress_num_classes
-        raw_cls = int(meta.get("subgoal_progress_class", 1))
-        sample["progress_class"] = np.int32(np.clip(raw_cls - 1, 0, k - 1))
         sp = meta.get("span", [0, 0])
+        k = self.cfg.progress_num_classes
+        # SUBOPTIMAL non-linear overlay for the CURRENT-frame scalar progress (drives the
+        # classification / continuous progress head). Only matches suboptimal merged spans; all
+        # other spans use the producer's linear meta values UNCHANGED.
+        _sp_pref = (f'{meta["episode_id"].replace("/", "__")}'
+                    f'__{meta.get("variant", "normal").replace(":", "-")}__s{int(sp[0]):06d}-{int(sp[1]):06d}')
+        _sp_mk = _suboptimal_overlay().get(_sp_pref)
+        if _sp_mk is not None:
+            _frac = _suboptimal_frac(int(meta.get("frame_index", sp[0])), int(sp[0]), int(sp[1]),
+                                     int(_sp_mk["grip_onset"]), int(_sp_mk["fail_end"]))
+            sample["progress_frac"] = np.float32(_frac)
+            sample["progress_class"] = np.int32(np.clip(int(_frac * k), 0, k - 1))
+        else:
+            sample["progress_frac"] = np.float32(meta.get("subgoal_progress_frac", meta.get("progress_frac", 0.0)))
+            raw_cls = int(meta.get("subgoal_progress_class", 1))
+            sample["progress_class"] = np.int32(np.clip(raw_cls - 1, 0, k - 1))
         sample["subgoal_start"] = np.int32(sp[0])
         sample["subgoal_end"] = np.int32(sp[1])
         sample["frame_index"] = np.int32(meta.get("frame_index", 0))
@@ -603,10 +654,26 @@ class RoboCasaWebDataset:
         # this dim is already in range, so it must not go through Normalize).
         if self.cfg.progress_as_action:
             horizon = self.cfg.action_horizon
-            frac0 = float(sample["progress_frac"])
-            span_len = int(sp[1]) - int(sp[0])
-            steps = np.arange(horizon, dtype=np.float32)
-            prog = np.minimum(1.0, frac0 + steps / span_len) if span_len > 0 else np.full(horizon, frac0, np.float32)
+            # SUBOPTIMAL non-linear overlay: if this sample's span-prefix is in the overlay JSON
+            # (only failure+recovery merged spans are), the per-step progress follows the
+            # approach->miss->recover curve; step i is the command at frame t0+i, clamped to 1.0
+            # past the subgoal end (settle-pad, complete). Every non-suboptimal span -> mk is None
+            # -> the linear branch below runs UNCHANGED.
+            _s, _e = int(sp[0]), int(sp[1])
+            _t0 = int(sample["frame_index"])
+            _prefix = (f'{meta["episode_id"].replace("/", "__")}'
+                       f'__{meta.get("variant", "normal").replace(":", "-")}__s{_s:06d}-{_e:06d}')
+            _mk = _suboptimal_overlay().get(_prefix)
+            if _mk is not None:
+                _go, _fe = int(_mk["grip_onset"]), int(_mk["fail_end"])
+                prog = np.array(
+                    [_suboptimal_frac(_t0 + i, _s, _e, _go, _fe) if (_t0 + i) <= _e else 1.0
+                     for i in range(horizon)], dtype=np.float32)
+            else:
+                frac0 = float(sample["progress_frac"])
+                span_len = int(sp[1]) - int(sp[0])
+                steps = np.arange(horizon, dtype=np.float32)
+                prog = np.minimum(1.0, frac0 + steps / span_len) if span_len > 0 else np.full(horizon, frac0, np.float32)
             # Zero out (set to complete) past the last in-subgoal step, per the pad mask.
             mask = arrays.get("action_pad_mask_subgoal")
             if mask is not None and not mask.all():
@@ -664,6 +731,20 @@ class RoboCasaWebDataset:
         # to the original seed (cfg.seed + epoch*7919) -> unchanged behavior.
         rng = random.Random(cfg.seed + epoch * 7919 + self._process_info()[0])
         buffer: list[dict[str, Any]] = []
+        # --- data-loading progress logs (opt-in via ROBOCASA_WDS_LOG=1) ---------------------
+        # The reservoir fills to cfg.shuffle_buffer BEFORE the first sample is yielded, so a
+        # large buffer + JPEG-decode-bound shards can look like a multi-minute hang with the
+        # GPU idle. These logs make the warmup visible (and are the knob to tune: set
+        # shuffle_buffer small for eval / a metric pass where decorrelation doesn't matter).
+        _wds_log = os.environ.get("ROBOCASA_WDS_LOG") == "1"
+        _t_iter0 = _time.monotonic()
+        _n_shards_done = 0
+        _n_built = 0
+        _n_yielded = 0
+        _first_yielded = False
+        if _wds_log:
+            logger.info("[wds] __iter__ start: epoch=%d shuffle_buffer=%d n_shards(worker)=%d",
+                        epoch, cfg.shuffle_buffer, len(self._worker_shards()))
         # Skip-and-continue tolerance (vla_foundry pattern): a shard that fails to
         # open/stream, or a single sample that fails to decode/build, is LOGGED and
         # SKIPPED rather than crashing a multi-day run. A transient S3/FUSE blip on one
@@ -689,16 +770,32 @@ class RoboCasaWebDataset:
                     if sample is None:
                         continue
                     buffer.append(sample)
+                    _n_built += 1
+                    if _wds_log and not _first_yielded and (_n_built % 1000 == 0):
+                        logger.info("[wds] warming reservoir: %d/%d samples (%.1fs elapsed)",
+                                    _n_built, cfg.shuffle_buffer, _time.monotonic() - _t_iter0)
                     # Once the buffer is warm, emit a random element for every new one
                     # added (reservoir-style streaming shuffle: buffer size stays ~constant).
                     if len(buffer) >= cfg.shuffle_buffer:
                         j = rng.randrange(len(buffer))
                         buffer[j], buffer[-1] = buffer[-1], buffer[j]
+                        if _wds_log and not _first_yielded:
+                            _first_yielded = True
+                            logger.info("[wds] reservoir warm (%d samples) after %.1fs -> first yield",
+                                        len(buffer), _time.monotonic() - _t_iter0)
+                        _n_yielded += 1
                         yield buffer.pop()
+                _n_shards_done += 1
+                if _wds_log and _n_shards_done % 10 == 0:
+                    logger.info("[wds] %d shards done, %d built, %d yielded (%.1fs)",
+                                _n_shards_done, _n_built, _n_yielded, _time.monotonic() - _t_iter0)
             except Exception as e:
                 logger.warning("Skipping shard %s (failed to open): %r", shard, e)
                 continue
         # Drain the remaining buffer in random order.
+        if _wds_log:
+            logger.info("[wds] shards exhausted; draining %d buffered samples (%d built, %d yielded, %.1fs)",
+                        len(buffer), _n_built, _n_yielded, _time.monotonic() - _t_iter0)
         rng.shuffle(buffer)
         yield from buffer
         # Advance the epoch so the NEXT pass reshuffles differently AND the resume

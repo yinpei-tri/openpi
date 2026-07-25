@@ -480,6 +480,68 @@ class Pi0(_model.BaseModel):
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
 
+    def sample_actions_with_progress(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> tuple[_model.Actions, at.Array]:
+        """Sample the action chunk AND read the progress head in ONE prefix forward pass.
+
+        sample_actions and predict_progress each run the (expensive) 3B PaliGemma prefix pass;
+        called separately that pass is duplicated (~2x cost for head variants). Here the prefix
+        runs ONCE — its output feeds the progress head, and its KV cache feeds the flow-sampling
+        loop — so head variants cost ~the same as sample_actions alone. Requires use_progress_head
+        (progact/no-head variants have no head; use sample_actions and read the action dim).
+        Returns (actions [b, ah, ad], progress: [b] sigmoid for continuous | [b, K] softmax for
+        classes).
+        """
+        if not self._use_progress_head:
+            raise ValueError("sample_actions_with_progress called but use_progress_head is False")
+        observation = _model.preprocess_observation(None, observation, train=False, image_keys=self._image_keys)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # ONE prefix pass: keep BOTH prefix_out (-> progress head) and kv_cache (-> flow loop).
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        (prefix_out, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+
+        # progress from the same prefix features (no second big forward pass)
+        logits = self._progress_logits(prefix_out, prefix_mask)
+        progress = jax.nn.softmax(logits, axis=-1) if self._progress_mode == "classes" else nnx.sigmoid(logits)
+
+        def step(carry):
+            x_t, time = carry
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask_s = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask_s, suffix_attn_mask], axis=-1)
+            positions_s = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (prefix_out_s, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens], mask=full_attn_mask, positions=positions_s,
+                kv_cache=kv_cache, adarms_cond=[None, adarms_cond],
+            )
+            assert prefix_out_s is None
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            _, time = carry
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0, progress
+
     def predict_progress(self, observation: _model.Observation) -> at.Array:
         """Inference-time subgoal-completion progress. Used by the eval server / System2.
 

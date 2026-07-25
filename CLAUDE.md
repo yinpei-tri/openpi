@@ -74,6 +74,10 @@ A `DataConfig` (returned by a `DataConfigFactory.create(...)`) carries three tra
 
 Outputs run in reverse. `compute_norm_stats.py` produces the `norm_stats.json` that lives under `assets/<config_name>/<asset_id>/`. See `docs/norm_stats.md` for the “reload pretrain norm stats” pattern, which matters when fine-tuning on a robot that was in the pretraining mix.
 
+#### RoboCasa System1 suboptimal progress overlay
+
+`training/robocasa_webdataset.py` applies a **non-linear progress target for suboptimal (failure+recovery) spans**: their progress rises during the approach, **drops to 0 at the failed grasp**, then rises 0→1 over the recovery — instead of a single linear ramp. Driven by an in-tree markers JSON (`training/assets/suboptimal_progress.json`, baked into the docker image), keyed by span-prefix `<flat_episode_id>__<vtag>__s<start>-<end>`, applied via `_suboptimal_overlay()` + `_suboptimal_frac()` in both the `progress_as_action` target and the scalar `progress_frac`/`progress_class`. **Only suboptimal merged spans match** (dict-miss → the linear path runs unchanged, so all other data is identical). To regenerate the JSON, see the RoboAnnotator producer `producers/build_suboptimal_progress_json.py --markers-only` and `docs/suboptimal_progress_overlay.md` (the single source of truth for the formula is RoboAnnotator's `build_samples.py::suboptimal_progress_frac`).
+
 ### Training scripts
 
 - `scripts/train.py` — JAX trainer. Uses `nnx.split`/`nnx.merge`, `optax`, FSDP via `openpi.training.sharding`, Orbax checkpoints in `openpi.training.checkpoints`, wandb logging.

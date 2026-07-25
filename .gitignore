@@ -4,6 +4,11 @@ checkpoints/
 data/
 wandb/
 
+# Exception: the in-tree suboptimal-progress overlay markers must be tracked (baked
+# into the training image; a missing file silently disables the overlay).
+!src/openpi/training/assets/
+!src/openpi/training/assets/suboptimal_progress.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
