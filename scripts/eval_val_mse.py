@@ -75,9 +75,16 @@ def _eval_one_ckpt(step_dir: pathlib.Path, args) -> dict:
     if not ckpt_norm.is_file():
         raise SystemExit(f"Missing ckpt norm_stats: {ckpt_norm}")
 
+    # Disable the reservoir shuffle for the val metric pass. RoboCasaDataConfig.create() bakes
+    # `shuffle_buffer` into the WebDatasetConfig, and the iterable fills that reservoir (default
+    # 16000) BEFORE yielding the first sample — a decode-bound warmup that leaves the GPU idle for
+    # minutes (create_data_loader's shuffle=False does NOT touch it). A metric eval over a fixed
+    # val set needs no decorrelation, so shuffle_buffer=1: samples stream straight through and the
+    # first batch lands immediately.
     data = dataclasses.replace(
         config.data,
         shards=_val_shards(),
+        shuffle_buffer=1,
         # Resolve norm_stats from <step_dir>/assets/robocasa_system1/norm_stats.json.
         assets=_config.AssetsConfig(assets_dir=str(step_dir / "assets"), asset_id="robocasa_system1"),
     )
@@ -86,6 +93,34 @@ def _eval_one_ckpt(step_dir: pathlib.Path, args) -> dict:
     params = _model.restore_params(step_dir / "params", restore_type=jax.Array, dtype=jnp.bfloat16)
     model = config.model.load(params)
     model.eval()
+
+    # JIT the model calls (freeze state), exactly like Policy.infer's fast serving path. WITHOUT
+    # this the 3B PaliGemma + 10 flow-integration steps run EAGERLY — every op dispatched from
+    # Python one at a time, no XLA fusion, GPU ~0% util, ~50s/batch. Jitted, it compiles once then
+    # runs as one fused GPU program (~1s/batch after the first). num_steps is a Python constant ->
+    # static_argnames so it doesn't trigger retracing.
+    from openpi.shared import nnx_utils
+    # Determine the ACTIVE progress mode from BOTH data + model config, not model.progress_mode
+    # alone. For progact, progress_as_action=True + use_progress_head=False, but progress_mode is
+    # left at its inherited "classes" — reading it alone would misroute progact to the (disabled)
+    # head path and silently skip progress. Precedence: action (data flag) > head mode > none.
+    has_head = bool(getattr(config.model, "use_progress_head", False))
+    if bool(getattr(config.data, "progress_as_action", False)):
+        prog_mode = "action"
+    elif has_head:
+        prog_mode = getattr(config.model, "progress_mode", None)
+    else:
+        prog_mode = "none"
+    # Head variants (progcls/progreg): sample actions AND read the progress head in ONE prefix
+    # forward pass (sample_actions_with_progress) — calling sample_actions + predict_progress
+    # separately re-runs the expensive 3B prefix twice (~2x). progact/no-head: plain sample_actions
+    # (progress is the action's extra dim, read from the chunk below).
+    if has_head:
+        sample_prog_fn = nnx_utils.module_jit(model.sample_actions_with_progress, static_argnames=("num_steps",))
+        sample_fn = None
+    else:
+        sample_fn = nnx_utils.module_jit(model.sample_actions, static_argnames=("num_steps",))
+        sample_prog_fn = None
 
     loader = _data_loader.create_data_loader(
         config,
@@ -99,23 +134,58 @@ def _eval_one_ckpt(step_dir: pathlib.Path, args) -> dict:
         framework="jax",
     )
 
+    import logging, time
+    log = logging.getLogger("val_mse")
     rng = jax.random.key(args.seed)
-    mse_vals, flow_vals, prog_vals, acc_vals, mae_vals = [], [], [], [], []
-    for obs, act in loader:
-        rng, s_rng, l_rng = jax.random.split(rng, 3)
-        # action_mse: sampled vs GT, in normalized action space (both are post-Normalize here).
-        pred = model.sample_actions(s_rng, obs, num_steps=args.flow_steps)
-        # Only score the REAL action dims (exclude zero-pad to model action_dim, and the proact
-        # 12th progress dim which is not a control action). Use the GT chunk's finite region.
-        real_dim = getattr(config.model, "flow_loss_real_dim", None) or act.shape[-1]
-        mse = float(jnp.mean((pred[..., :real_dim] - act[..., :real_dim]) ** 2))
+    # We compute ONLY inference outputs vs ground truth (no training losses):
+    #   action_mse   = sampled action chunk vs GT chunk, in normalized action space
+    #   progress_*   = predicted subgoal-progress vs GT (mode-dependent, see below)
+    real_dim = getattr(config.model, "flow_loss_real_dim", None)
+    mse_vals, prog_err_vals, prog_acc_vals = [], [], []
+    _t = time.monotonic()
+    for bi, (obs, act) in enumerate(loader):
+        rng, s_rng = jax.random.split(rng)
+        rd = real_dim or act.shape[-1]
+        # Head variants: actions + progress from ONE prefix pass. Others: actions only.
+        p = None
+        if sample_prog_fn is not None:
+            pred, p = sample_prog_fn(s_rng, obs, num_steps=args.flow_steps)
+        else:
+            pred = sample_fn(s_rng, obs, num_steps=args.flow_steps)
+        # Score the REAL control dims only: exclude zero-pad to model action_dim AND the progact
+        # 12th progress dim (handled separately as progress, not a control action).
+        mse = float(jnp.mean((pred[..., :rd] - act[..., :rd]) ** 2))
         mse_vals.append(mse)
 
-        _, metrics = model.compute_loss(l_rng, obs, act, train=False, return_metrics=True)
-        flow_vals.append(float(metrics.get("flow_loss", jnp.nan)))
-        prog_vals.append(float(metrics.get("progress_loss", jnp.nan)))
-        acc_vals.append(float(metrics.get("progress_acc", jnp.nan)))
-        mae_vals.append(float(metrics.get("progress_class_mae", jnp.nan)))
+        # --- predicted progress vs GT ---
+        # progress_mae is reported in a COMMON [0,1] fraction space across all variants so the
+        # numbers are comparable: proreg already lives in [0,1]; progact lives in [-1,1] (2*frac-1)
+        # and is rescaled to [0,1] via (x+1)/2 before the MAE.
+        if prog_mode == "action":
+            # progact (v2): NO independent head — progress IS the sampled action chunk's extra
+            # (last) dim. Compare the FIRST-STEP progress (step 0 = this frame's progress), which
+            # is the value System1 would act on. rd = real control dims, so index rd = progress dim.
+            # Both pred & GT are in [-1,1]; rescale to [0,1] to match proreg's scale.
+            pred_frac = (pred[:, 0, rd] + 1.0) / 2.0
+            gt_frac = (act[:, 0, rd] + 1.0) / 2.0
+            prog_err_vals.append(float(jnp.mean(jnp.abs(pred_frac - gt_frac))))
+        elif p is not None:  # head variant: progress came from sample_actions_with_progress
+            if prog_mode == "classes" and obs.progress_class is not None:
+                pred_cls = jnp.argmax(p, axis=-1)
+                gt_cls = obs.progress_class.reshape(-1)
+                prog_acc_vals.append(float(jnp.mean((pred_cls == gt_cls).astype(jnp.float32))))
+                # Bucket MAE rescaled to [0,1]: classes are deciles 0..K-1, so dividing the
+                # bucket-distance by (K-1) puts it on the same [0,1] progress scale as reg/act.
+                k = p.shape[-1]
+                prog_err_vals.append(float(jnp.mean(jnp.abs(pred_cls - gt_cls).astype(jnp.float32)) / max(k - 1, 1)))
+            elif obs.progress is not None:  # continuous (proreg) — already [0,1]
+                prog_err_vals.append(float(jnp.mean(jnp.abs(p.reshape(-1) - obs.progress.reshape(-1)))))
+
+        dt = time.monotonic() - _t; _t = time.monotonic()
+        # Batch 1 includes one-time JIT compile of the jitted sample/progress fns (GPU ~0% during
+        # graph build); steady-state batches are ~1s. Log both so the sweep is sized from steady.
+        log.info("batch %d/%d: +%.1fs  action_mse=%.4f%s", bi + 1, args.num_batches, dt, mse,
+                 "  (incl. JIT)" if bi == 0 else "")
 
     def m(xs):
         a = np.array(xs, np.float64)
@@ -125,16 +195,20 @@ def _eval_one_ckpt(step_dir: pathlib.Path, args) -> dict:
     return dict(
         step=int(step_dir.name) if step_dir.name.isdigit() else None,
         action_mse=m(mse_vals),
-        flow_loss=m(flow_vals),
-        progress_loss=m(prog_vals),
-        progress_acc=m(acc_vals),
-        progress_class_mae=m(mae_vals),
+        # progress vs GT: for classes -> accuracy + bucket-MAE; continuous/action -> MAE. None if
+        # the variant surfaces no comparable progress signal.
+        progress_acc=m(prog_acc_vals) if prog_acc_vals else None,
+        progress_mae=m(prog_err_vals) if prog_err_vals else None,
+        progress_mode=prog_mode,
         n_batches=len(mse_vals),
         batch_size=args.batch_size,
     )
 
 
 def main():
+    import logging
+    logging.basicConfig(level=logging.INFO, force=True,
+                        format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--run-dir", required=True, help="ckpt run dir (all step subdirs) OR a single step dir")
     ap.add_argument("--only-step", type=int, default=None, help="restrict to one step")
@@ -157,18 +231,21 @@ def main():
     print(f"jax devices: {jax.devices()}")
     print(f"exp={exp_name}  steps={[s.name for s in steps]}  val={_val_shards()}")
 
+    out = pathlib.Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
     results = []
     for sd in steps:
         print(f"--- {sd.name} ---")
         r = _eval_one_ckpt(sd, args)
         results.append(r)
-        print(f"    action_mse={r['action_mse']}  flow_loss={r['flow_loss']}  "
-              f"progress_loss={r['progress_loss']}  acc={r['progress_acc']}  mae={r['progress_class_mae']}")
+        print(f"    action_mse={r['action_mse']}  progress_acc={r['progress_acc']}  "
+              f"progress_mae={r['progress_mae']}  ({r['progress_mode']})")
+        # Write incrementally after EACH checkpoint: a later ckpt failing (OOM, bad params)
+        # then can't discard the completed ones. Overwrites with the growing list each time.
+        out.write_text(json.dumps(dict(exp_name=exp_name, val_shards=_val_shards(), steps=results), indent=2))
 
-    out = pathlib.Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(dict(exp_name=exp_name, val_shards=_val_shards(), steps=results), indent=2))
-    print(f"wrote {out}")
+    print(f"wrote {out}  ({len(results)} checkpoint(s))")
 
 
 if __name__ == "__main__":

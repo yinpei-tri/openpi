@@ -64,17 +64,23 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
                                 base_pos_ref, base_yaw_ref, anchor_imgs, anchor_state,
                                 task_goal, resize, replan_steps, horizon_mult, max_steps_cap,
                                 stop_cfg: StopConfig, norm_stats, last_cmd_grip_init,
-                                do_settle: bool, settle_steps: int, zero_arm_in_base: bool = True):
+                                do_settle: bool, settle_steps: int, zero_arm_in_base: bool = True,
+                                oracle: bool = False):
     """Roll out ONE subgoal WITHOUT resetting the sim (state carries over from the previous
     subgoal). Terminates when the stop rule fires (advanced=True) or the budget cap is hit
     (advanced=False). Returns clean frames + step records (subtask_eval layout) + advance info.
 
     ``do_settle``: only the FIRST subgoal runs a gripper-settle warmup (it followed a hard
     reset_to); later subgoals continue from live sim state, so NO settle.
+
+    ``oracle``: replay the RECORDED GT actions for this subgoal's span instead of querying the
+    policy (client is None). Reproduces the ground-truth episode as a reference: budget = span_len,
+    no stop rule (advance exactly at the recorded span boundary), no settle. Same log/video layout.
     """
     span_len = sg.end - sg.start + 1
     est_len = SE.estimated_length(span_len)
-    budget = int(min(max_steps_cap, max(HORIZON, round(span_len * horizon_mult))))
+    # Oracle replays exactly the recorded span; policy gets slack beyond it (clamped).
+    budget = span_len if oracle else int(min(max_steps_cap, max(HORIZON, round(span_len * horizon_mult))))
 
     q01s = q99s = q01a = q99a = None
     if norm_stats is not None:
@@ -106,8 +112,9 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
         step_records.append(fld)
 
     # First subgoal only: gripper-settle warmup (mirrors subtask_eval; later subgoals skip it).
+    # Oracle replays the recorded actions verbatim, so it never settles.
     last_cmd_grip = last_cmd_grip_init
-    if do_settle:
+    if do_settle and not oracle:
         settle = settle_action_from_first(sim_actions[sg.start])
         last_cmd_grip = float(settle[SIM_GRIP_IDX])
         for si in range(settle_steps):
@@ -129,15 +136,24 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
         if not action_plan:
             replanned = True
             gripper_flag = "Close" if last_cmd_grip > 0 else "Open"
-            element = SE._obs_dict(
-                env, base_pos_ref=base_pos_ref, base_yaw_ref=base_yaw_ref,
-                anchor_imgs=anchor_imgs, anchor_state=anchor_state,
-                subgoal_text=sg.subgoal, task_goal=task_goal, est_length=est_len,
-                executed_step=executed, gripper_flag=gripper_flag, resize=resize)
-            result = client.infer(element)
-            chunk = np.asarray(result["actions"])          # (H,12) LeRobot order, unnormalized
-            chunk_sim = np.stack([lerobot_action_to_sim(a) for a in chunk], axis=0)
-            prog = SE._read_progress(result)
+            if oracle:
+                # ORACLE: "predict" the recorded action chunk from this step (robosuite-native
+                # order already). Same structured logs/video as a policy run, as a GT reference.
+                oi = min(sg.start + executed, ep_len - 1)
+                chunk_sim = np.stack([sim_actions[min(oi + j, ep_len - 1)]
+                                      for j in range(HORIZON)], axis=0)
+                result = {}
+                prog = None
+            else:
+                element = SE._obs_dict(
+                    env, base_pos_ref=base_pos_ref, base_yaw_ref=base_yaw_ref,
+                    anchor_imgs=anchor_imgs, anchor_state=anchor_state,
+                    subgoal_text=sg.subgoal, task_goal=task_goal, est_length=est_len,
+                    executed_step=executed, gripper_flag=gripper_flag, resize=resize)
+                result = client.infer(element)
+                chunk = np.asarray(result["actions"])          # (H,12) LeRobot order, unnormalized
+                chunk_sim = np.stack([lerobot_action_to_sim(a) for a in chunk], axis=0)
+                prog = SE._read_progress(result)
             if prog:
                 prog["at_step"] = executed
             action_plan.extend(chunk_sim[:replan_steps])
@@ -158,8 +174,6 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
         action_sim = action_plan.popleft()
         last_cmd_grip = float(action_sim[SIM_GRIP_IDX])
         _log_step(executed, "act", action_sim, prog, replanned, query=query)
-        # feed the stop tracker: this step's commanded action + the latest replan's progress.
-        tracker.update(action_sim, prog if replanned else last_replan_prog)
         # Match subtask_eval: in MOBILE/base mode (control_mode>0) zero the arm eef delta on the
         # STEPPED action (whole-body IK otherwise integrates the residual into large arm drift).
         a_step = action_sim
@@ -167,13 +181,20 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
             a_step = action_sim.copy(); a_step[0:6] = 0.0
         env.step(a_step)
         executed += 1
-        # Check stop AFTER at least one full replan window so quiescence has data.
-        if tracker.should_stop():
-            advanced = True
-            stop_reason = tracker.reason()
-            break
+        # Oracle replays the whole recorded span (budget=span_len) with NO early stop — it just
+        # advances at the boundary. Policy uses the progress+quiescence stop rule.
+        if not oracle:
+            tracker.update(action_sim, prog if replanned else last_replan_prog)
+            if tracker.should_stop():   # only after a full replan window (quiescence has data)
+                advanced = True
+                stop_reason = tracker.reason()
+                break
 
-    if not advanced:
+    if oracle:
+        # Oracle "advances" by construction at the recorded span end (it IS the GT boundary).
+        advanced = True
+        stop_reason = dict(oracle=True, span_end=True)
+    elif not advanced:
         stop_reason = dict(timeout=True, budget=budget, **tracker.reason())
 
     return dict(
@@ -224,7 +245,7 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str, n
                 replan_steps=args.replan_steps, horizon_mult=args.horizon_mult,
                 max_steps_cap=args.max_steps_cap, stop_cfg=stop_cfg, norm_stats=norm_stats,
                 last_cmd_grip_init=last_cmd_grip, do_settle=(i == 0), settle_steps=args.settle_steps,
-                zero_arm_in_base=not args.no_zero_arm_in_base)
+                zero_arm_in_base=not args.no_zero_arm_in_base, oracle=(client is None))
             last_cmd_grip = roll["last_cmd_grip"]
 
             clean = roll.pop("_clean_frames", [])
@@ -288,7 +309,12 @@ def main():
     ap.add_argument("--port", type=int, default=8010)
     ap.add_argument("--out-root", type=Path, default=Path("episode_rollouts"))
     ap.add_argument("--method", required=True, help="label for this run (proact/procls/proreg or exp tag)")
-    ap.add_argument("--norm-stats", type=Path, required=True, help="ckpt norm_stats.json")
+    ap.add_argument("--oracle", action="store_true",
+                    help="ORACLE mode: replay the recorded GT actions continuously through the "
+                         "subgoal list (no server, no norm-stats needed) — a ground-truth reference "
+                         "episode in the SAME layout as a policy run (method dir e.g. 'oracle').")
+    ap.add_argument("--norm-stats", type=Path, default=None,
+                    help="ckpt norm_stats.json (required for a policy run; omit for --oracle)")
     ap.add_argument("--subgoal-method", default=DEFAULT_SUBGOAL_METHOD)
     ap.add_argument("--resize-size", type=int, default=224)
     ap.add_argument("--replan-steps", type=int, default=16)
@@ -303,29 +329,63 @@ def main():
     ap.add_argument("--stop-window", type=int, default=5)
     args = ap.parse_args()
 
-    norm_stats = json.loads(Path(args.norm_stats).read_text())
-    norm_stats = norm_stats.get("norm_stats", norm_stats)
-    client = _wcp.WebsocketClientPolicy(host=args.host, port=args.port)
+    if args.oracle:
+        client = None
+        norm_stats = None
+        if args.norm_stats is not None:   # optional: normalized state/action logging in oracle too
+            norm_stats = json.loads(Path(args.norm_stats).read_text())
+            norm_stats = norm_stats.get("norm_stats", norm_stats)
+        print(f"ORACLE replay; rolling out episodes as method '{args.method}' into {args.out_root}")
+    else:
+        if args.norm_stats is None:
+            raise SystemExit("--norm-stats is required for a policy run (or pass --oracle)")
+        norm_stats = json.loads(Path(args.norm_stats).read_text())
+        norm_stats = norm_stats.get("norm_stats", norm_stats)
+        client = _wcp.WebsocketClientPolicy(host=args.host, port=args.port)
 
     eps = [ln.strip() for ln in Path(args.episode_list).read_text().splitlines() if ln.strip()]
     idx = []
-    for ep in eps:
-        print(f"=== EPISODE {ep} ===")
-        try:
-            doc = eval_episode(Path(ep), client, args, args.out_root, args.method, norm_stats=norm_stats)
-            idx.append(dict(episode_id=doc["episode_id"], task_name=doc["task_name"],
-                            episode_success=doc["episode_success"], n_advanced=doc["n_advanced"],
-                            n_subgoals=doc["n_subgoals"]))
-        except Exception as e:
-            traceback.print_exc()
-            idx.append(dict(episode=ep, error=repr(e)))
     idx_path = args.out_root / args.method / "index.json"
     idx_path.parent.mkdir(parents=True, exist_ok=True)
-    idx_path.write_text(json.dumps(dict(
-        eval_kind="episode", method=args.method, n_episodes=len(eps),
-        stop=dict(progress=args.stop_progress, eps=args.stop_eps, window=args.stop_window),
-        episodes=idx), indent=1))
-    print(f"wrote {idx_path}")
+
+    def _write_index():
+        # Per-task timing rollup so we can read the avg wall-time per task at a glance.
+        by_task: dict[str, list[float]] = {}
+        for e in idx:
+            t, s = e.get("task_name"), e.get("seconds")
+            if t and s is not None:
+                by_task.setdefault(t, []).append(s)
+        task_timing = {t: dict(n=len(v), total_s=round(sum(v), 1), avg_s=round(sum(v) / len(v), 1))
+                       for t, v in sorted(by_task.items())}
+        done = [e for e in idx if e.get("seconds") is not None]
+        total_s = round(sum(e["seconds"] for e in done), 1)
+        idx_path.write_text(json.dumps(dict(
+            eval_kind="episode", method=args.method, n_episodes=len(eps), n_done=len(idx),
+            stop=dict(progress=args.stop_progress, eps=args.stop_eps, window=args.stop_window),
+            total_seconds=total_s,
+            avg_seconds_per_episode=round(total_s / len(done), 1) if done else None,
+            task_timing=task_timing,
+            episodes=idx), indent=1))
+
+    t_run = time.time()
+    for i, ep in enumerate(eps):
+        print(f"=== [{i+1}/{len(eps)}] EPISODE {ep} ===", flush=True)
+        ep_t0 = time.time()
+        try:
+            doc = eval_episode(Path(ep), client, args, args.out_root, args.method, norm_stats=norm_stats)
+            secs = round(time.time() - ep_t0, 2)
+            idx.append(dict(episode_id=doc["episode_id"], task_name=doc["task_name"],
+                            episode_success=doc["episode_success"], n_advanced=doc["n_advanced"],
+                            n_subgoals=doc["n_subgoals"], seconds=secs))
+            print(f"    -> success={doc['episode_success']} advanced={doc['n_advanced']}/{doc['n_subgoals']} "
+                  f"({secs}s)", flush=True)
+        except Exception as e:
+            traceback.print_exc()
+            secs = round(time.time() - ep_t0, 2)
+            idx.append(dict(episode=ep, error=repr(e), seconds=secs))
+        # Write incrementally after EACH episode so a crash (OOM / bad ep) keeps completed timing.
+        _write_index()
+    print(f"wrote {idx_path}  (total {round(time.time() - t_run, 1)}s over {len(eps)} episodes)")
 
 
 if __name__ == "__main__":

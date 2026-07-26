@@ -70,6 +70,40 @@ def create_trained_policy(
             raise ValueError("Asset id is required to load norm stats.")
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
 
+    # RoboCasa `noanchorstate` fix (scoped by the checkpoint's robocasa_tag ONLY). This variant sets
+    # include_anchor_state=False -> the model uses a 14-d state (no anchor half). But its shipped
+    # norm_stats.json has a 28-d state (the 14-d current-state stats TILED x2, produced when the
+    # norm-stats pass ran with include_anchor_state=True). The OUTPUT Unnormalize (which does NOT
+    # slice) then hits a (14,) vs (28,) broadcast error. The two 28-d halves are IDENTICAL, so the
+    # correct 14-d stats are exactly the first half — truncate to it. Guarded to ONLY the
+    # `noanchorstate` tag so it can never touch the anchor-on checkpoints (v1-v11) whose 28-d stats
+    # are correct. (A prior version keyed on data_config.state_split, which is NOT a field on the
+    # created DataConfig -> it read None for everyone and wrongly truncated all ckpts.)
+    _rc_tag = ""
+    try:
+        import json as _json
+        for _cand in (pathlib.Path(str(checkpoint_dir)), pathlib.Path(str(checkpoint_dir)).parent):
+            _cj = _cand / "config.json"
+            if _cj.exists():
+                _rc_tag = _json.loads(_cj.read_text()).get("robocasa_tag", "") or ""
+                break
+        if not _rc_tag:
+            _rc_tag = str(checkpoint_dir)  # fall back to dir name (carries the tag)
+    except Exception:
+        _rc_tag = str(checkpoint_dir)
+    if ("noanchorstate" in _rc_tag and norm_stats is not None
+            and isinstance(norm_stats, dict) and norm_stats.get("state") is not None):
+        import numpy as _np
+        ss = norm_stats["state"]
+        cur = ss.mean.shape[-1] if getattr(ss, "mean", None) is not None else None
+        if cur is not None and cur % 2 == 0:
+            half = cur // 2
+            if _np.allclose(ss.mean[:half], ss.mean[half:]):  # genuinely a tiled 28-d entry
+                _half = lambda a: (a[:half] if a is not None else a)  # noqa: E731
+                norm_stats = dict(norm_stats)
+                norm_stats["state"] = transforms.NormStats(
+                    mean=_half(ss.mean), std=_half(ss.std), q01=_half(ss.q01), q99=_half(ss.q99))
+
     # Determine the device to use for PyTorch models
     if is_pytorch and pytorch_device is None:
         try:

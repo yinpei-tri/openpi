@@ -377,6 +377,11 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
                                       for j in range(HORIZON)], axis=0)
                 # present the raw chunk in LeRobot order for the query log (inverse reorder)
                 chunk = np.stack([_sim_to_lerobot12(a) for a in chunk_sim], axis=0)
+                # Chunk rows that fall PAST the recorded episode end have no real GT action —
+                # mark them so the DISPLAY chunk shows them blank (NaN) instead of the clamped
+                # duplicate of the last frame. Stepping still uses the clamped chunk_sim above
+                # (never reached: oracle budget == span_len keeps execution within the span).
+                oracle_pad_from = ep_len - (sg.start + executed)   # first horizon offset past the end
                 result = {}
                 prog = None
             else:
@@ -403,6 +408,10 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
             action_plan.extend(chunk_sim[:replan_steps])
             # capture the FULL query for the GUI (prompt text + the whole action chunk)
             chunk_lean = np.stack([sim_action_to_lean11(a) for a in chunk_sim], axis=0)
+            # ORACLE: blank (NaN) the horizon rows that fall past the recorded episode end, so the
+            # GUI shows them empty instead of a repeat of the last GT action. (Policy runs skip this.)
+            if client is None and oracle_pad_from < HORIZON:
+                chunk_lean[max(0, oracle_pad_from):, :] = np.nan
             chunk_lean_norm = (quantile_norm(chunk_lean, q01a, q99a) if q01a is not None else None)
             prog_full = _read_progress(result) or None
             # Prefer the REAL assembled prompt the server tokenized (result["prompt_text"],
@@ -446,6 +455,15 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
 
     # end-of-rollout final state signals (post last step)
     final_success = bool(sim.check_full_success())
+    # high-precision SUBTASK sim-check (grasp / fixture open-close-turn-press / place-release);
+    # "unknown" for primitives without a clean predicate (move_to/navigate/retract/...). Evaluated
+    # at the rollout-end sim state. For grasp/place we also require the verdict to HOLD over the
+    # last few frames (guard against a 1-frame contact bounce) via a small settle re-check.
+    try:
+        from subtask_sim_check import sim_check_subtask
+        sim_check = sim_check_subtask(env, sg.subgoal, sg.primitive)
+    except Exception as _e:  # never let the check break a rollout
+        sim_check = {"verdict": "unknown", "rule": "error", "detail": repr(_e)[:120]}
     timing = dict(
         render_fps=round(timers["n_render"] / timers["render_s"], 1) if timers["render_s"] else None,
         sim_fps=round(timers["n_sim"] / timers["sim_s"], 1) if timers["sim_s"] else None,
@@ -460,6 +478,7 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
                 progress_trace=progress_trace, n_progress_reads=len(progress_trace),
                 sim_success_final=final_success,
                 sim_success_any=any(r["sim_check_success"] for r in step_records),
+                subtask_sim_check=sim_check,   # high-precision per-subtask sim verdict (or unknown)
                 stopped=stopped_reason is not None, stop_reason=stopped_reason,
                 timing=timing,
                 _clean_frames=clean_frames,
@@ -565,6 +584,7 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
                        primitive=sg.primitive, subgoal=sg.subgoal,
                        subgoal_detail=sg.subgoal_detail, milestone_subgoal=sg.milestone_subgoal,
                        out_dir=str(sub_dir.relative_to(out_root)), timing=roll["timing"],
+                       subtask_sim_check=roll.get("subtask_sim_check"),
                        **{k: roll[k] for k in ("steps", "budget", "span_len", "est_length",
                           "first_chunk_action_mse", "mean_step_action_mse",
                           "sim_success_final", "sim_success_any", "progress_final",

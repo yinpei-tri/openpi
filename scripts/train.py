@@ -117,6 +117,42 @@ def robocasa_exp_tag(config: _config.TrainConfig) -> str:
     return "_".join(parts)
 
 
+def robocasa_resolved_flags(config: "_config.TrainConfig") -> dict:
+    """Explicit, human-legible flag values for a resolved RoboCasa TrainConfig.
+
+    The tag (``robocasa_exp_tag``) is the compact source of truth, but it's not readable at a
+    glance (you have to know the token table). This returns the ACTUAL resolved values so
+    config.json self-documents what the model/data were configured with. Each prompt-content knob
+    is read from its owning object (``use_anchor_images`` from the model, the rest from the data
+    factory), matching where ``robocasa_config_from_tag`` writes them.
+    """
+    data = config.data
+    m = config.model
+    if not hasattr(data, "prompt_source"):
+        return {}
+    # progress predictor (mirror robocasa_exp_tag's derivation)
+    if getattr(data, "progress_as_action", False):
+        predictor = "action"
+    elif not getattr(m, "use_progress_head", True):
+        predictor = "none"
+    elif getattr(m, "progress_mode", "classes") == "continuous":
+        predictor = "regression"
+    else:
+        predictor = "classes"
+    flags = {
+        "progress_predictor": predictor,
+        "progress_as_action": bool(getattr(data, "progress_as_action", False)),
+        "use_progress_head": bool(getattr(m, "use_progress_head", True)),
+        "progress_mode": getattr(m, "progress_mode", "classes"),
+        "prompt_source": getattr(data, "prompt_source", "subgoal"),
+    }
+    # prompt-content knobs (owner per the deviation table: use_anchor_images -> model, else data)
+    for attr, default, _tok in _ROBOCASA_PROMPT_DEVIATIONS:
+        obj = m if attr == "use_anchor_images" else data
+        flags[attr] = bool(getattr(obj, attr, default))
+    return flags
+
+
 # gran/verb -> prompt_source (inverse of _PROMPT_SOURCE_TO_GRAN_VERB).
 _GRAN_VERB_TO_PROMPT_SOURCE = {v: k for k, v in _PROMPT_SOURCE_TO_GRAN_VERB.items()}
 
@@ -504,6 +540,9 @@ def main(config: _config.TrainConfig, tentative_run: bool = False):
                 "base_config": "pi05_robocasa_system1",
                 "robocasa_tag": tag,
                 "exp_name": config.exp_name,
+                # Explicit resolved flag values (human-legible; the tag above is the compact form).
+                # resolve_robocasa_config still rebuilds from the tag — these document what that yields.
+                "resolved_flags": robocasa_resolved_flags(config),
             }, indent=2)
             try:
                 (epath.Path(config.checkpoint_dir) / "config.json").write_text(_robocasa_config_descriptor)
