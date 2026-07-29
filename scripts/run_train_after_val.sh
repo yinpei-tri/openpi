@@ -6,7 +6,7 @@ set -u
 OPENPI=/home/yinpei.dai/openpi
 MASTER=$OPENPI/_evallogs/sweep_master.log
 TRAIN_SHARDS=$OPENPI/robocasa_training_data/system1_midset_0717/shards
-TRAIN_OUT=$OPENPI/_evallogs/trainmse_results
+TRAIN_OUT=$OPENPI/m0717_eval_results/trainmse_results
 
 echo "[chain] waiting for val sweep to complete ..."
 while ! grep -q "SWEEP COMPLETE" "$MASTER" 2>/dev/null; do

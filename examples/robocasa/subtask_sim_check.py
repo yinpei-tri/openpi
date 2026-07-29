@@ -134,23 +134,61 @@ def _call_env(fn, env):
         return fn()
 
 
-def _fixture_openness(env, fx) -> float | None:
-    """Normalized openness in [0,1]-ish: prefer get_door_state (the SAME signal the drawer/door
-    tasks' _check_success uses, thresholded at 0.95 open / 0.05 closed) — is_open/is_closed use a
-    different aggregate that FALSE-NEGATIVES on drawers (calibration: drawer door_state=1.31 but
-    is_open=False). Returns the max joint value, or None if unavailable."""
+# _per_door_openness collects a {joint_name -> normalized openness} dict, using whichever accessor
+# the fixture exposes: get_door_state (cabinets/drawers/single-hinge) OR the base
+# Fixture.get_joint_state on the door joints (multi-door fridges like FridgeFrenchDoor / SideBySide
+# have NO get_door_state and their is_open/is_closed AGGREGATE over BOTH doors — a per-joint read is
+# the only way to score a single-door subgoal). Returns {} if no per-joint signal is available.
+def _per_door_openness(env, fx) -> dict:
     if hasattr(fx, "get_door_state"):
         try:
             ds = _call_env(fx.get_door_state, env)
             if isinstance(ds, dict) and ds:
-                return float(max(ds.values()))
+                return {str(k): float(v) for k, v in ds.items()}
         except Exception:
             pass
-    return None
+    # fall back to the raw door joints via the base Fixture.get_joint_state
+    for attr in ("_fridge_door_joint_names", "door_joint_names"):
+        names = getattr(fx, attr, None)
+        if names:
+            try:
+                js = fx.get_joint_state(env, list(names))
+                if isinstance(js, dict) and js:
+                    return {str(k): float(v) for k, v in js.items()}
+            except Exception:
+                pass
+    return {}
 
 
-def _fixture_open(env, fx) -> bool | None:
-    o = _fixture_openness(env, fx)
+# _fixture_openness returns a normalized openness (the SAME signal the door/drawer tasks'
+# _check_success uses: 0.95 open / 0.05 closed — is_open/is_closed FALSE-NEGATIVE on drawers,
+# calibration showed door_state=1.31 but is_open=False). Returns (value, ambiguous):
+#   value = the selected joint's openness (or an aggregate for single-joint fixtures)
+#   ambiguous = True when the fixture has MULTIPLE doors but the subgoal text doesn't name ONE
+#               specific door -> caller returns UNKNOWN rather than a wrong max/min aggregate
+#               (multi-door fridge: "close the right door" left the left door open -> aggregate
+#                is_closed stays False -> old code wrongly read "not closed"). Precision-first.
+def _fixture_openness(env, fx, txt: str = "") -> tuple[float | None, bool]:
+    ds = _per_door_openness(env, fx)
+    if not ds:
+        return None, False
+    if len(ds) == 1:
+        return float(next(iter(ds.values()))), False
+    # multiple joints: try to pick the one the subgoal text names (left/right/top/bottom/side).
+    lo = (txt or "").lower()
+    for side in ("left", "right", "top", "bottom", "upper", "lower"):
+        if side in lo:
+            hits = [v for k, v in ds.items() if side in str(k).lower()]
+            if len(hits) == 1:
+                return float(hits[0]), False
+    # multi-door but no clean single-door selection -> ambiguous (caller -> unknown)
+    return None, True
+
+
+def _fixture_open(env, fx, txt: str = "") -> bool | None:
+    o, ambig = _fixture_openness(env, fx, txt)
+    if ambig:
+        return None
     if o is not None:
         return o >= 0.95   # task _check_success 'open' threshold
     try:
@@ -159,8 +197,10 @@ def _fixture_open(env, fx) -> bool | None:
         return None
 
 
-def _fixture_closed(env, fx) -> bool | None:
-    o = _fixture_openness(env, fx)
+def _fixture_closed(env, fx, txt: str = "") -> bool | None:
+    o, ambig = _fixture_openness(env, fx, txt)
+    if ambig:
+        return None
     if o is not None:
         return o <= 0.05   # task _check_success 'close' threshold
     try:
@@ -252,14 +292,17 @@ def sim_check_subtask(env, subgoal_text: str, primitive: str) -> dict:
             ok = (not state) if want_off else state
             return _V("success" if ok else "failure", "fixture_state", target=fxnm,
                       detail=f"on={state} want_off={want_off}")
-        # (2) door/drawer open-close joint threshold (only if NOT a stateful fixture)
+        # (2) door/drawer open-close joint threshold (only if NOT a stateful fixture). Pass the
+        # subgoal text so a multi-door fixture can select the specific door named ("right"/"left"…);
+        # if it's multi-door and the text doesn't name one, _fixture_open/closed return None ->
+        # unknown (don't guess an aggregate — precision-first).
         want_open = prim in FIXTURE_OPEN or (prim == "turn" and not want_off)
-        st = _fixture_open(env, fx) if want_open else _fixture_closed(env, fx)
+        st = _fixture_open(env, fx, txt) if want_open else _fixture_closed(env, fx, txt)
         if st is not None:
             return _V("success" if st else "failure",
                       "fixture_open" if want_open else "fixture_closed", target=fxnm,
                       detail=f"{'open' if want_open else 'closed'}={st}")
-        return _V("unknown", "fixture_no_signal", target=fxnm)
+        return _V("unknown", "fixture_ambiguous_or_no_signal", target=fxnm)
 
     # everything else: move_to / navigate / reach / retract / hold / stir / scrub / ...
     return _V("unknown", f"primitive_{prim or 'none'}")

@@ -18,7 +18,8 @@ For each fine (child) subgoal of an episode:
   2. capture the frame-0 base reference (ONCE per episode) for relative base pose,
   3. roll out the policy CLOSED-LOOP with the child's ``subgoal`` text as the prompt (+ the
      full training conditioning: task_goal, Quality/Estimated Length/Executed Step, gripper
-     flag, anchor images+state), for a step budget = span_len * horizon_mult (clamped),
+     flag, anchor images+state), for a step budget per --budget-formula (default "legacy" =
+     the v1..v12 formula min(cap, horizon_mult*span_len); "longsafe" is long-span-safe),
      replanning every ``replan_steps``,
   4. evaluate the SAME per-subtask criterion as the oracle phase; also record progress head /
      progress-as-action output and action-similarity (MSE vs the oracle actions from the
@@ -70,6 +71,29 @@ from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
 from stop_criterion import StopConfig, StopTracker   # sibling module (examples/robocasa/)
 
 HORIZON = 20            # policy action chunk length (pi05 System1)
+
+# Per-subgoal policy step-budget formulas. Selectable so the v1..v12 target-split eval (run with the
+# ORIGINAL formula) stays reproducible while new runs can use the long-span-safe one.
+#   "legacy"  = min(max_steps_cap, max(HORIZON, round(horizon_mult * span_len)))  -- the v1..v12 form.
+#               NOTE: a hard cap that can fall BELOW span_len for long spans (e.g. a 1222-frame span
+#               capped at 400 -> guaranteed spurious timeout).
+#   "longsafe"= max(HORIZON, min(a + max_steps_cap, round(horizon_mult * a))), a = max(span_len, est).
+#               2x for short/normal spans (== legacy there when uncapped); for LONG spans the
+#               +max_steps_cap slack wins so the budget stays bounded yet ALWAYS exceeds the span.
+BUDGET_FORMULAS = ("legacy", "longsafe")
+DEFAULT_BUDGET_FORMULA = "legacy"   # keep the v1..v12 default; opt into "longsafe" per-run
+
+
+def compute_budget(span_len: int, est_len: int, horizon_mult: float, max_steps_cap: int,
+                   formula: str = DEFAULT_BUDGET_FORMULA) -> int:
+    """Policy step budget for one subgoal. See BUDGET_FORMULAS. (Oracle bypasses this and uses
+    span_len exactly.)"""
+    if formula == "longsafe":
+        a = max(int(span_len), int(est_len))
+        return int(max(HORIZON, min(a + max_steps_cap, round(horizon_mult * a))))
+    # "legacy" (default) — the formula the v1..v12 eval used.
+    return int(min(max_steps_cap, max(HORIZON, round(horizon_mult * span_len))))
+
 # gripper_close index in ROBOSUITE-NATIVE order (after lerobot_action_to_sim): eef_pos[0:3],
 # eef_rot[3:6], grip[6], base[7:11], control[11]. gripper_flag reads the last commanded value
 # here, matching training (which read the raw command's gripper dim).
@@ -283,7 +307,9 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
                     base_pos_ref, base_yaw_ref, anchor_imgs, anchor_state,
                     task_goal, resize, replan_steps, horizon_mult, max_steps_cap,
                     settle_steps=10, norm_stats=None, ep_len=None, zero_arm_in_base=True,
-                    stop_cfg: StopConfig | None = None):
+                    stop_cfg: StopConfig | None = None, budget_formula=DEFAULT_BUDGET_FORMULA,
+                    is_last_of_milestone=False, is_terminal_milestone=False,
+                    milestone_text="", oracle_ref=None):
     """Reset to the subgoal start, gripper-settle, roll out the policy, and LOG EVERYTHING.
 
     No success criterion is applied here (Gemini judges later). We just faithfully record,
@@ -302,8 +328,9 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
         # ORACLE: replay exactly the recorded subgoal span (stop at the true end), no extra budget.
         budget = span_len
     else:
-        # policy: give slack beyond the recorded span (2x per the eval design), clamped.
-        budget = int(min(max_steps_cap, max(HORIZON, round(span_len * horizon_mult))))
+        # policy: slack beyond the recorded span, per the selected formula (see compute_budget /
+        # BUDGET_FORMULAS). Default "legacy" reproduces the v1..v12 eval; "longsafe" fixes long spans.
+        budget = compute_budget(span_len, est_len, horizon_mult, max_steps_cap, budget_formula)
 
     q01s = q99s = q01a = q99a = None
     if norm_stats is not None:
@@ -342,7 +369,17 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
         step_records.append(fld)
 
     # --- gripper-settle warmup: zero motion, keep control_mode + gripper of the 1st action ---
+    # HOLD-CURRENT: force CLOSE only if the gripper is actually in CONTACT with an env object at reset
+    # (keyed on contact, NOT finger width — an empty gripper can rest at ~0.04 and must keep the
+    # recorded GT gripper), so a carried object isn't dropped during the zero-motion settle.
     settle = settle_action_from_first(sim_actions[sg.start])
+    try:
+        import milestone_sim_check as _MS
+        _holding = _MS._gripper_contact_obj(env) is not None
+    except Exception:
+        _holding = False
+    if _holding:
+        settle = settle.copy(); settle[SIM_GRIP_IDX] = 1.0
     for si in range(settle_steps):
         _log_step(-settle_steps + si, "settle", settle, None, replanned=False)
         env.step(settle)
@@ -455,15 +492,34 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
 
     # end-of-rollout final state signals (post last step)
     final_success = bool(sim.check_full_success())
-    # high-precision SUBTASK sim-check (grasp / fixture open-close-turn-press / place-release);
-    # "unknown" for primitives without a clean predicate (move_to/navigate/retract/...). Evaluated
-    # at the rollout-end sim state. For grasp/place we also require the verdict to HOLD over the
-    # last few frames (guard against a 1-frame contact bounce) via a small settle re-check.
+    # FINESTEP sim-check = the MILESTONE criterion, but applied ONLY at the LAST fine subgoal of each
+    # milestone (the span whose end IS the milestone's settled goal). Non-terminal fine subgoals in a
+    # milestone (move_to / reach / grasp-then-lift steps) -> "unknown" (None), because only the
+    # milestone's ending event is a clean, oracle-referenced success signal. This is the SAME check
+    # as /milestone; the only difference is the reset was to THIS subgoal's start (not the milestone
+    # start). Terminal milestone -> episode-level env _check_success.
+    if not is_last_of_milestone:
+        sim_check = {"verdict": "unknown", "rule": "not_milestone_end",
+                     "detail": "not the last fine subgoal of its milestone — no goal event here"}
+    elif is_terminal_milestone:
+        sim_check = {"verdict": "success" if final_success else "failure",
+                     "rule": "episode_check_success",
+                     "detail": f"env _check_success at terminal milestone end = {final_success}"}
+    else:
+        try:
+            import milestone_sim_check as _MS
+            sim_check = _MS.milestone_check(env, milestone_text or sg.subgoal, oracle_ref) if oracle_ref \
+                else {"verdict": "unknown", "rule": "no_oracle_ref", "detail": "oracle ref missing for this milestone"}
+        except Exception as _e:
+            sim_check = {"verdict": "unknown", "rule": "error", "detail": repr(_e)[:120]}
+    # Persist the rollout-END flattened MuJoCo state so subtask_sim_check can be RE-SCORED offline
+    # (without re-driving the env) if the sim-check rules change. qpos-based checks (door open/close,
+    # object pose) round-trip exactly via reset_to({"states": final_sim_state}); latch flags like
+    # microwave._turned_on are Python attrs NOT in this vector, so those few rules still need a re-run.
     try:
-        from subtask_sim_check import sim_check_subtask
-        sim_check = sim_check_subtask(env, sg.subgoal, sg.primitive)
-    except Exception as _e:  # never let the check break a rollout
-        sim_check = {"verdict": "unknown", "rule": "error", "detail": repr(_e)[:120]}
+        final_sim_state = np.asarray(env.sim.get_state().flatten(), np.float64)
+    except Exception:
+        final_sim_state = None
     timing = dict(
         render_fps=round(timers["n_render"] / timers["render_s"], 1) if timers["render_s"] else None,
         sim_fps=round(timers["n_sim"] / timers["sim_s"], 1) if timers["sim_s"] else None,
@@ -482,7 +538,24 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
                 stopped=stopped_reason is not None, stop_reason=stopped_reason,
                 timing=timing,
                 _clean_frames=clean_frames,
-                _step_records=step_records)
+                _step_records=step_records,
+                _final_sim_state=final_sim_state)
+
+
+def _load_oracle_milestone_refs(out_root: Path, oracle_method: str, episode_id: str) -> dict:
+    """Load {str(milestone_index): ref} from the MILESTONE oracle run's episode.json. finestep reuses
+    the milestone oracle refs (the milestone dir is a SIBLING of the finestep dir under the shared
+    m0717_eval_results root — out_root here is .../finestep, so hop to .../milestone)."""
+    ms_root = out_root.parent / "milestone" / oracle_method
+    f = ms_root / episode_id.replace("/", "__") / "episode.json"
+    if not f.is_file():
+        return {}
+    try:
+        doc = json.loads(f.read_text())
+    except Exception:
+        return {}
+    return {str(m["milestone_index"]): m.get("ref")
+            for m in doc.get("subgoals", doc.get("milestones", [])) if m.get("ref")}
 
 
 def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
@@ -516,6 +589,17 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
         sim = EpisodeSim(env=env, lerobot_dir=ann.lerobot_dir, episode_index=ann.episode_index)
         sim._model_loaded = True
 
+        # Milestone grouping: the LAST fine subgoal of each milestone is where the milestone goal
+        # settles -> that's where we apply the milestone sim-check (see rollout_subgoal). Load the
+        # oracle milestone refs (by milestone_index) so the check is oracle-referenced. Terminal
+        # milestone -> episode success. milestone text = the child's milestone_subgoal.
+        last_child_of_ms = {}   # milestone_index -> child_index of its last subgoal
+        for sg in ann.subgoals:
+            last_child_of_ms[sg.milestone_index] = sg.child_index
+        terminal_ms = max(last_child_of_ms) if last_child_of_ms else -1
+        oracle_refs = _load_oracle_milestone_refs(out_root, args.oracle_method, ann.episode_id) \
+            if getattr(args, "oracle_method", None) else {}
+
         records = []
         for sg in ann.subgoals:
             # anchor snapshot at subgoal START: 3 cam images + raw 16-d state (states-only reset).
@@ -532,13 +616,22 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
                 max_steps_cap=args.max_steps_cap, settle_steps=args.settle_steps,
                 norm_stats=norm_stats, ep_len=len(actions),
                 zero_arm_in_base=not args.no_zero_arm_in_base,
-                stop_cfg=getattr(args, "_stop_cfg", None))
+                stop_cfg=getattr(args, "_stop_cfg", None),
+                budget_formula=getattr(args, "budget_formula", DEFAULT_BUDGET_FORMULA),
+                is_last_of_milestone=(sg.child_index == last_child_of_ms.get(sg.milestone_index)),
+                is_terminal_milestone=(sg.milestone_index == terminal_ms),
+                milestone_text=sg.milestone_subgoal,
+                oracle_ref=oracle_refs.get(str(sg.milestone_index)))
 
             clean = roll.pop("_clean_frames", [])
             roll.pop("_overlay_frames", None)   # overlay video no longer used by the GUI (info is in panels)
             step_records = roll.pop("_step_records", [])
+            final_sim_state = roll.pop("_final_sim_state", None)
             sub_dir = ep_out / f"child{sg.child_index:02d}_{sg.primitive}"
             sub_dir.mkdir(parents=True, exist_ok=True)
+            # Persist rollout-END flattened MuJoCo state -> offline re-scoring of subtask_sim_check.
+            if final_sim_state is not None:
+                np.save(sub_dir / "final_sim_state.npy", final_sim_state)
             if clean:
                 # Full-res 256x768 video (kept for clarity — the steps.npz slimming already made
                 # the per-subtask payload tiny). GOP=1 (every frame a keyframe) so the GUI seeks to
@@ -618,8 +711,13 @@ def main():
     p.add_argument("--resize-size", type=int, default=224)
     p.add_argument("--replan-steps", type=int, default=16)
     p.add_argument("--horizon-mult", type=float, default=2.0,
-                   help="policy step budget = span_len * this (clamped to --max-steps-cap)")
-    p.add_argument("--max-steps-cap", type=int, default=400)
+                   help="policy step budget multiplier (see --budget-formula)")
+    p.add_argument("--max-steps-cap", type=int, default=400,
+                   help="budget cap ('legacy': hard cap) / additive long-span slack ('longsafe')")
+    p.add_argument("--budget-formula", choices=BUDGET_FORMULAS, default=DEFAULT_BUDGET_FORMULA,
+                   help="'legacy' = min(cap, max(H, horizon_mult*span_len)) — the v1..v12 eval "
+                        "formula (default, reproducible); 'longsafe' = min(a+cap, horizon_mult*a) "
+                        "with a=max(span_len,est_len) — bounded yet always exceeds the span")
     p.add_argument("--settle-steps", type=int, default=10,
                    help="zero-motion gripper-settle steps after reset before the policy acts")
     p.add_argument("--no-zero-arm-in-base", action="store_true",
@@ -635,6 +733,9 @@ def main():
     p.add_argument("--oracle", action="store_true",
                    help="ORACLE mode: replay recorded actions instead of a served policy (no "
                         "server needed). Same structured logs/videos, as a ground-truth reference.")
+    p.add_argument("--oracle-method", default="oracle",
+                   help="method dir under the sibling milestone/ tree holding the oracle milestone "
+                        "refs (finestep_sim_check reuses them). Set empty to disable the finestep check.")
     p.add_argument("--limit", type=int, default=None)
     # Early-stop (progress AND action-quiescence). ON by default for policy runs; the hard
     # `budget` stays as the cap. --no-stop disables it (roll the full budget, as before).
@@ -688,11 +789,15 @@ def main():
         tm = next((s.get("timing") for s in r.get("subgoals", []) if s.get("timing")), None)
         tstr = f" | render {tm['render_fps']}fps, sim {tm['sim_fps']}fps, infer {tm['infer_ms']}ms" if tm else ""
         tag = "ERR" if r.get("error") else f"{n} subgoals rolled out ({n_simsucc} sim_success_final)"
-        print(f"[{i+1}/{len(episodes)}] {r.get('episode_id')} :: {tag} ({secs}s){tstr}", flush=True)
+        _avg = sum(e["seconds"] for e in results) / max(1, len(results))
+        _eta = _avg * (len(episodes) - (i + 1))
+        print(f"[{i+1}/{len(episodes)}] {r.get('episode_id')} :: {tag} ({secs}s"
+              f", avg {_avg:.1f}s/ep, ETA {_eta/60:.1f}m){tstr}", flush=True)
 
     index = dict(method=args.method, subgoal_method=args.subgoal_method,
                  host=args.host, port=args.port, replan_steps=args.replan_steps,
                  horizon_mult=args.horizon_mult, settle_steps=args.settle_steps,
+                 max_steps_cap=args.max_steps_cap, budget_formula=args.budget_formula,
                  n_episodes=len(results), wall_seconds=round(time.time() - t0, 1),
                  episodes=results)
     idx_path = args.out_root / args.method / "index.json"
