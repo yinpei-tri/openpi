@@ -39,13 +39,13 @@ from subtask_sim_check import resolve_fixture
 from subtask_sim_check import _per_door_openness
 from subtask_sim_check import _call_env
 
-# ---- tolerances (only where there is NO oracle scalar to compare, or as a match tol) ----
-FINGER_TOL = 0.01        # |finger_opening - oracle| for grasp
-LIFT_FRAC = 0.5          # rollout Δz must be >= this * oracle Δz for "pick up"
-PLACE_DIST_TOL = 0.05    # gripper->obj dist must be >= oracle_dist - this (m)
-JOINT_TOL = 0.10         # |joint_qpos - oracle_joint| normalized-qpos match tol
+# ---- tolerances. Design: the SUBTASK success criterion is intentionally LESS STRICT than the
+# episode _check_success, so it pinpoints REAL per-subgoal failures (not settling/pose nitpicks);
+# the episode signal is AND-combined at the end to catch task-level failure. ----
+LIFT_FRAC = 0.5          # (milestone pick_up only) rollout Δz >= this * oracle Δz
+JOINT_TOL = 0.10         # |joint_qpos - oracle_joint| normalized-qpos match tol (open/close/pull/push)
 NAV_DIST_TOL = 0.30      # base xy within this of oracle end-xy (m)
-NAV_COS_TOL = 0.90       # cos(base_yaw - oracle_yaw) >= this
+NAV_COS_TOL = 0.17       # cos(base_yaw - oracle_yaw) >= this  (~±80°, loose — heading roughly right)
 
 _MANIP_PRIMS = ("grasp", "pick_up", "place", "release", "open", "close", "pull", "push",
                 "turn", "press")
@@ -154,6 +154,22 @@ def _fixture_state_flag(env, fx):
 
 
 # --------------------------------------------------------------------------- goal primitive
+# Meaningful spans that get a per-span subtask verdict (finestep scores each of these; skips the
+# rest = move_to/reach/retract/carry/hold/stir/scrub/dump). "navigate"/"search"/"goto" = base moves.
+MEANINGFUL_PRIMS = ("grasp", "place", "release", "open", "close", "pull", "push", "turn", "press",
+                    "navigate", "search", "goto")
+
+
+def span_goal_primitive(primitive: str) -> str | None:
+    """Normalize a SINGLE fine-subgoal primitive to its subtask-check goal (or None if not scorable).
+    Unlike milestone_goal_primitive (which reduces a whole child LIST + detects grasp+lift=pick_up),
+    this scores ONE span by its own primitive — finestep grasp stays 'grasp' (no pick_up)."""
+    p = (primitive or "").lower()
+    if p in ("goto",):
+        return "navigate"
+    return p if p in MEANINGFUL_PRIMS else None
+
+
 def milestone_goal_primitive(child_prims: list[str]) -> str:
     """The milestone's goal = its LAST child primitive that isn't pure repositioning. Also detect
     the grasp+lift 'pick up' pattern: a grasp followed only by move_to/lift children."""
@@ -221,80 +237,72 @@ def capture_ref_state(env, milestone_text: str, goal_prim: str, start_obj_z: flo
 
 
 # --------------------------------------------------------------------------- policy check
-def milestone_check(env, milestone_text: str, ref: dict) -> dict:
-    """Verdict for a POLICY rollout at its milestone end, compared to the oracle REF state."""
+def subtask_check(env, subgoal_text: str, ref: dict, last_grip: float | None = None) -> dict:
+    """SUBTASK success verdict for a POLICY rollout span end, vs the oracle REF. Intentionally LOOSE
+    (see tolerances) — pinpoints real per-subgoal failure; the caller AND-combines with episode
+    _check_success at the terminal span. `last_grip` = the last COMMANDED gripper action (+1 close /
+    -1 open), used for grasp (must be closing) and place/release (must be opening)."""
     gp = (ref or {}).get("goal_prim", "other")
 
     if gp in ("grasp", "pick_up"):
         obj = ref.get("obj")
         if not obj:
-            return _V("unknown", "grasp_unresolved", detail="no manipulable env.object resolved for this milestone")
+            return _V("unknown", "grasp_unresolved", detail="no manipulable env.object resolved")
         try:
             in_contact = env.check_contact(env.robots[0].gripper["right"], env.objects[obj])
         except Exception:
             return _V("unknown", "grasp_error", target=obj)
-        fo, rfo = _finger_opening(env), ref.get("finger_opening")
-        fdiff = abs(fo - rfo) if (fo is not None and rfo is not None) else None
-        finger_ok = (fdiff is not None and fdiff <= FINGER_TOL)
-        grasped = bool(in_contact and finger_ok)
-        # human-readable comparison: rollout vs oracle, and which term failed
-        fstr = (f"finger_opening rollout={fo:.4f} vs oracle={rfo:.4f} |Δ|={fdiff:.4f} "
-                f"(tol {FINGER_TOL}{'' if finger_ok else ' -> TOO DIFFERENT'})") if fdiff is not None else "finger_opening n/a"
-        cstr = f"gripper-contact={in_contact}{'' if in_contact else ' -> NOT touching object'}"
+        # LOOSE grasp: in contact AND the gripper is COMMANDED CLOSED (action > 0). Uses the commanded
+        # action (policy intent, stable/binary) rather than finger qpos vs oracle (noisy, mid-transition).
+        closing = (last_grip is None) or (last_grip > 0)
+        grasped = bool(in_contact and closing)
+        cstr = (f"contact={in_contact}{'' if in_contact else ' -> NOT touching obj'}; "
+                f"grip_cmd={'close' if (last_grip is None or last_grip>0) else 'OPEN'}"
+                f"{'' if closing else ' -> not closing'}")
         if gp == "grasp":
-            v = "success" if grasped else "failure"
-            why = "" if grasped else "  FAIL because " + (
-                "not in contact" if not in_contact else "finger opening differs from oracle")
-            return _V(v, "grasp", target=obj, detail=f"{cstr}; {fstr}{why}")
-        # pick_up: grasp + lifted vs oracle Δz
-        zc, z0 = _obj_z(env, obj), ref.get("obj_z_start")
-        ze = ref.get("obj_z_end")
+            why = "" if grasped else "  FAIL because " + ("not in contact" if not in_contact else "gripper not closing")
+            return _V("success" if grasped else "failure", "grasp", target=obj, detail=cstr + why)
+        # pick_up (milestone only): grasp + lifted vs oracle Δz
+        zc, z0, ze = _obj_z(env, obj), ref.get("obj_z_start"), ref.get("obj_z_end")
         if zc is None or z0 is None or ze is None:
-            return _V("unknown", "pickup_no_z", target=obj)
-        oracle_dz = ze - z0
-        roll_dz = zc - z0
+            return _V("success" if grasped else "failure", "grasp", target=obj, detail=cstr)  # no z -> grasp only
+        oracle_dz, roll_dz = ze - z0, zc - z0
         need = LIFT_FRAC * oracle_dz
         lifted = oracle_dz <= 1e-4 or roll_dz >= need
         v = "success" if (grasped and lifted) else "failure"
         why = "" if v == "success" else "  FAIL because " + (
-            ("not grasped: " + ("no contact" if not in_contact else "finger differs")) if not grasped
-            else f"not lifted enough (rollout Δz {roll_dz:.3f} < {LIFT_FRAC}×oracle {need:.3f})")
+            "not grasped" if not grasped else f"not lifted (Δz {roll_dz:.3f} < {LIFT_FRAC}×oracle {need:.3f})")
         return _V(v, "pick_up", target=obj,
-                  detail=f"{cstr}; {fstr}; lift Δz rollout={roll_dz:.3f} vs oracle={oracle_dz:.3f} "
-                         f"(need ≥{need:.3f}){why}")
+                  detail=f"{cstr}; lift Δz rollout={roll_dz:.3f} vs oracle={oracle_dz:.3f}{why}")
 
     if gp in ("place", "release"):
         obj = ref.get("obj")
         if not obj:
             return _V("unknown", "place_unresolved", detail="no held env.object resolved")
-        # target receptacle: prefer the one the ORACLE resolved (object it ended up in); else text.
-        recep = ref.get("receptacle") or _resolve_receptacle(env, milestone_text, exclude=obj)
-        in_recep = None
-        if recep:
-            try:
-                in_recep = bool(OU.check_obj_in_receptacle(env, obj, recep))
-            except Exception:
-                in_recep = None
-        d, rd = _gripper_obj_dist(env, obj), ref.get("gripper_obj_dist")
-        released = (d is not None and rd is not None and d >= rd - PLACE_DIST_TOL)
-        if in_recep is None:
-            # no resolvable receptacle -> can only verify release, not placement -> unknown
+        recep = ref.get("receptacle") or _resolve_receptacle(env, subgoal_text, exclude=obj)
+        if not recep:
             return _V("unknown", "place_no_receptacle", target=obj,
-                      detail=f"could not resolve a target receptacle for {obj} (fixture target? -> unknown)")
-        dstr = (f"gripper→obj dist rollout={d:.3f} vs oracle={rd:.3f} "
-                f"(need ≥{rd - PLACE_DIST_TOL:.3f}{'' if released else ' -> STILL HOLDING/too close'})") if (d is not None and rd is not None) else "dist n/a"
-        rstr = f"in_receptacle({recep})={in_recep}{'' if in_recep else ' -> object NOT in target'}"
-        v = "success" if (in_recep and released) else "failure"
+                      detail=f"no target receptacle for {obj} (fixture target? -> unknown)")
+        # LOOSE place: object in CONTACT with the receptacle (drop the xy-radius term) AND the gripper
+        # is COMMANDED OPEN (action < 0) — i.e. it let go. Contact-only is far less strict than
+        # check_obj_in_receptacle (which also requires within 0.7*recep-radius of the center).
+        try:
+            in_contact = bool(env.check_contact(env.objects[obj], env.objects[recep]))
+        except Exception:
+            return _V("unknown", "place_contact_error", target=f"{obj}->{recep}")
+        opened = (last_grip is None) or (last_grip < 0)
+        v = "success" if (in_contact and opened) else "failure"
         why = "" if v == "success" else "  FAIL because " + (
-            "object not in target receptacle" if not in_recep else "gripper still near object (not released)")
-        return _V(v, "place_released", target=f"{obj}->{recep}", detail=f"{rstr}; {dstr}{why}")
+            f"{obj} not touching {recep}" if not in_contact else "gripper not opened (still holding)")
+        return _V(v, "place_released", target=f"{obj}->{recep}",
+                  detail=f"obj-recep contact={in_contact}; grip_cmd={'open' if opened else 'CLOSE'}{why}")
 
     if gp in ("open", "close", "pull", "push"):
         fxnm = ref.get("fixture")
         ref_door = ref.get("door_openness") or {}
         if not fxnm or not ref_door:
             return _V("unknown", "fixture_unresolved", detail="no fixture/door-joint resolved")
-        fx, _, _ = resolve_fixture(env, milestone_text)
+        fx, _, _ = resolve_fixture(env, subgoal_text)
         if fx is None:
             return _V("unknown", "fixture_unresolved")
         cur = _per_door_openness(env, fx)
@@ -319,7 +327,7 @@ def milestone_check(env, milestone_text: str, ref: dict) -> dict:
         ref_flag = ref.get("state_flag")
         if not fxnm or ref_flag is None:
             return _V("unknown", "fixture_state_unresolved", detail="no on/off state flag resolved")
-        fx, _, _ = resolve_fixture(env, milestone_text)
+        fx, _, _ = resolve_fixture(env, subgoal_text)
         cur = _fixture_state_flag(env, fx) if fx is not None else None
         if cur is None:
             return _V("unknown", "fixture_no_state", target=fxnm)
@@ -383,3 +391,7 @@ def _resolve_receptacle(env, milestone_text: str, exclude: str) -> str | None:
         if any(t in txt for t in toks) or n.lower() in txt:
             hits.append(n)
     return hits[0] if len(hits) == 1 else None
+
+
+# Back-compat alias (old name).
+milestone_check = subtask_check

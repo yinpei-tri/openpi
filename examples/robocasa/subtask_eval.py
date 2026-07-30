@@ -308,9 +308,13 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
                     task_goal, resize, replan_steps, horizon_mult, max_steps_cap,
                     settle_steps=10, norm_stats=None, ep_len=None, zero_arm_in_base=True,
                     stop_cfg: StopConfig | None = None, budget_formula=DEFAULT_BUDGET_FORMULA,
-                    is_last_of_milestone=False, is_terminal_milestone=False,
-                    milestone_text="", oracle_ref=None):
+                    is_episode_terminal=False, oracle_ref=None, continue_next: "Subgoal | None" = None):
     """Reset to the subgoal start, gripper-settle, roll out the policy, and LOG EVERYTHING.
+
+    ``continue_next`` (terminal-retract merge): after this subgoal, keep rolling the given NEXT
+    subgoal (a trailing "retract the arm") WITHOUT resetting — state carries over — so the episode
+    _check_success is read AFTER the arm retracts (needed for place/release whose success also checks
+    gripper-object distance). The retract frames are appended to this span's video/steps.
 
     No success criterion is applied here (Gemini judges later). We just faithfully record,
     per step: the executed action (raw12 / lean11 / normalized / component norms), the ORACLE
@@ -490,28 +494,51 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
                 stopped_reason = tracker.reason()
                 break
 
+    # TERMINAL-RETRACT MERGE: continue into the trailing "retract the arm" subgoal WITHOUT resetting,
+    # so the episode _check_success is read AFTER the arm retracts. Retract is trivial/reliable, so we
+    # replay its RECORDED GT actions (deterministic, a few steps) rather than re-querying the policy —
+    # we only need the arm out of the way for place/release's gripper-object distance term to settle.
+    if continue_next is not None:
+        for fr in range(continue_next.start, continue_next.end + 1):
+            a = np.asarray(lerobot_action_to_sim(np.asarray(sim_actions[min(fr, len(sim_actions) - 1)])),
+                           dtype=np.float64)
+            _log_step(executed, "act", a, None, replanned=False)
+            a_step = a
+            if zero_arm_in_base and a[SIM_CTRL_IDX] > 0.0:
+                a_step = a.copy(); a_step[0:6] = 0.0
+            env.step(a_step)
+            executed += 1
+
     # end-of-rollout final state signals (post last step)
     final_success = bool(sim.check_full_success())
-    # FINESTEP sim-check = the MILESTONE criterion, but applied ONLY at the LAST fine subgoal of each
-    # milestone (the span whose end IS the milestone's settled goal). Non-terminal fine subgoals in a
-    # milestone (move_to / reach / grasp-then-lift steps) -> "unknown" (None), because only the
-    # milestone's ending event is a clean, oracle-referenced success signal. This is the SAME check
-    # as /milestone; the only difference is the reset was to THIS subgoal's start (not the milestone
-    # start). Terminal milestone -> episode-level env _check_success.
-    if not is_last_of_milestone:
-        sim_check = {"verdict": "unknown", "rule": "not_milestone_end",
-                     "detail": "not the last fine subgoal of its milestone — no goal event here"}
-    elif is_terminal_milestone:
-        sim_check = {"verdict": "success" if final_success else "failure",
-                     "rule": "episode_check_success",
-                     "detail": f"env _check_success at terminal milestone end = {final_success}"}
+    # FINESTEP sim-check = the SUBTASK criterion applied to THIS span's OWN primitive (grasp / place /
+    # release / open / close / pull / push / turn / press / goto), each from its GT-reset start.
+    # move_to / reach / retract / carry / hold / ... -> "unknown" (skipped, no goal event). Compared
+    # to this span's per-child oracle ref. If this span is the EPISODE-TERMINAL span (or the merged
+    # prev+retract terminal), AND the subtask verdict with the episode _check_success.
+    import milestone_sim_check as _MS
+    gp = _MS.span_goal_primitive(sg.primitive)
+    if gp is None:
+        sim_check = {"verdict": "unknown", "rule": f"skip_{sg.primitive}",
+                     "detail": f"{sg.primitive} is not a meaningful span (move_to/retract/…) — skipped"}
+    elif oracle_ref is None:
+        sim_check = {"verdict": "unknown", "rule": "no_oracle_ref",
+                     "detail": "oracle ref missing for this span"}
     else:
         try:
-            import milestone_sim_check as _MS
-            sim_check = _MS.milestone_check(env, milestone_text or sg.subgoal, oracle_ref) if oracle_ref \
-                else {"verdict": "unknown", "rule": "no_oracle_ref", "detail": "oracle ref missing for this milestone"}
+            sim_check = _MS.subtask_check(env, sg.subgoal, oracle_ref, last_grip=last_cmd_grip)
         except Exception as _e:
             sim_check = {"verdict": "unknown", "rule": "error", "detail": repr(_e)[:120]}
+    # EPISODE-TERMINAL span: AND the subtask verdict with the env _check_success (task ground truth).
+    if is_episode_terminal:
+        sv = sim_check.get("verdict")
+        if sv in ("success", "failure"):
+            v = "success" if (sv == "success" and final_success) else "failure"
+            sim_check = {"verdict": v, "rule": "subtask_AND_episode",
+                         "detail": f"subtask={sv} AND episode_check_success={final_success} -> {v}. {sim_check.get('detail','')}"}
+        else:
+            sim_check = {"verdict": "success" if final_success else "failure", "rule": "episode_check_success",
+                         "detail": f"env _check_success at episode end = {final_success} (subtask unknown)"}
     # Persist the rollout-END flattened MuJoCo state so subtask_sim_check can be RE-SCORED offline
     # (without re-driving the env) if the sim-check rules change. qpos-based checks (door open/close,
     # object pose) round-trip exactly via reset_to({"states": final_sim_state}); latch flags like
@@ -554,8 +581,8 @@ def _load_oracle_milestone_refs(out_root: Path, oracle_method: str, episode_id: 
         doc = json.loads(f.read_text())
     except Exception:
         return {}
-    return {str(m["milestone_index"]): m.get("ref")
-            for m in doc.get("subgoals", doc.get("milestones", [])) if m.get("ref")}
+    return {str(m["child_index"]): m.get("ref")
+            for m in doc.get("subgoals", []) if m.get("ref") and m.get("child_index") is not None}
 
 
 def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
@@ -589,24 +616,34 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
         sim = EpisodeSim(env=env, lerobot_dir=ann.lerobot_dir, episode_index=ann.episode_index)
         sim._model_loaded = True
 
-        # Milestone grouping: the LAST fine subgoal of each milestone is where the milestone goal
-        # settles -> that's where we apply the milestone sim-check (see rollout_subgoal). Load the
-        # oracle milestone refs (by milestone_index) so the check is oracle-referenced. Terminal
-        # milestone -> episode success. milestone text = the child's milestone_subgoal.
-        last_child_of_ms = {}   # milestone_index -> child_index of its last subgoal
-        for sg in ann.subgoals:
-            last_child_of_ms[sg.milestone_index] = sg.child_index
-        terminal_ms = max(last_child_of_ms) if last_child_of_ms else -1
+        # Per-SPAN oracle refs (by child_index): each meaningful span (grasp/place/.../goto) is scored
+        # on its own primitive vs its own ref. Loaded from the sibling milestone/oracle run.
         oracle_refs = _load_oracle_milestone_refs(out_root, args.oracle_method, ann.episode_id) \
             if getattr(args, "oracle_method", None) else {}
+        subs = list(ann.subgoals)
+        last_ci = subs[-1].child_index if subs else -1
+        # TERMINAL-RETRACT MERGE: if the LAST subgoal is "retract the arm", it carries no goal event,
+        # but the PREVIOUS meaningful subgoal's success is best judged by the episode _check_success
+        # AFTER the retract completes (some place/release success also checks gripper-object distance,
+        # which only settles once the arm retracts). So: roll the previous subgoal, then CONTINUE into
+        # the retract WITHOUT resetting, and score the previous subgoal's span with episode success.
+        merge_prev_ci = None
+        if subs and ("retract" in (subs[-1].subgoal or "").lower()) and len(subs) >= 2:
+            merge_prev_ci = subs[-2].child_index
 
         records = []
-        for sg in ann.subgoals:
+        i = 0
+        while i < len(subs):
+            sg = subs[i]
             # anchor snapshot at subgoal START: 3 cam images + raw 16-d state (states-only reset).
             sim.reset_to_frame(sg.start)
             anchor_obs = env._get_observations(force_update=True)
             anchor_imgs = images_from_obs(anchor_obs)
             anchor_state = raw_state_from_obs(anchor_obs)
+            # This span is the episode-terminal SCORING span if it's the last subgoal, OR it's the
+            # pre-retract subgoal in a terminal-retract merge (we roll it + the retract together).
+            do_merge = (merge_prev_ci is not None and sg.child_index == merge_prev_ci)
+            is_ep_terminal = (sg.child_index == last_ci) or do_merge
             roll = rollout_subgoal(
                 env, sim, client, states, actions, sg,
                 base_pos_ref=base_pos_ref, base_yaw_ref=base_yaw_ref,
@@ -618,10 +655,10 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
                 zero_arm_in_base=not args.no_zero_arm_in_base,
                 stop_cfg=getattr(args, "_stop_cfg", None),
                 budget_formula=getattr(args, "budget_formula", DEFAULT_BUDGET_FORMULA),
-                is_last_of_milestone=(sg.child_index == last_child_of_ms.get(sg.milestone_index)),
-                is_terminal_milestone=(sg.milestone_index == terminal_ms),
-                milestone_text=sg.milestone_subgoal,
-                oracle_ref=oracle_refs.get(str(sg.milestone_index)))
+                is_episode_terminal=is_ep_terminal,
+                oracle_ref=oracle_refs.get(str(sg.child_index)),
+                continue_next=(subs[i + 1] if do_merge else None))
+            i += 2 if do_merge else 1   # merge consumes the retract subgoal too
 
             clean = roll.pop("_clean_frames", [])
             roll.pop("_overlay_frames", None)   # overlay video no longer used by the GUI (info is in panels)

@@ -118,40 +118,35 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
             # reset ONCE to the milestone start, then roll children continuously). The milestone
             # sim-check verdict attaches to the milestone's LAST child; other children -> unknown.
             last_cmd_grip = 0.0
-            per_child = []   # list of (sg, frames, step_records, advanced)
+            per_child = []   # list of (sg, frames, step_records, advanced, budinfo)
+            child_refs = {}  # child_index -> per-span oracle ref (oracle branch fills it)
             if is_oracle:
-                # ORACLE = STATE-DRIVEN replay per child span (exact GT, no drift), rendering + logging
-                # per-frame records so each child gets its own video/slider like policy.
-                q01s = q99s = q01a = q99a = None
-                if norm_stats is not None:
-                    q01s = np.asarray(norm_stats["state"]["q01"]); q99s = np.asarray(norm_stats["state"]["q99"])
-                    q01a = np.asarray(norm_stats["actions"]["q01"]); q99a = np.asarray(norm_stats["actions"]["q99"])
-                anchor_lean0 = lean_state_from_raw16(raw_state_from_obs(obs0), base_pos_ref, base_yaw_ref)
-                held_counts: dict[str, int] = {}
+                # ORACLE = STATE-DRIVEN replay. NO RENDER (drop images for speed — the oracle video is
+                # not used; only the per-span REF scalars are). We step recorded states per child span
+                # and CAPTURE a subtask REF at EACH MEANINGFUL span end (keyed by child_index, using
+                # that span's OWN primitive), so finestep can score every meaningful span, and
+                # milestone can score its end child. Objects held during a span resolved by contact.
+                child_refs = {}   # child_index -> ref dict (only for meaningful spans)
                 for sg in kids:
-                    frames, recs = [], []
+                    z_start = {n: MS._obj_z(env, n) for n in (getattr(env, "objects", {}) or {})}
+                    held_counts: dict[str, int] = {}
                     for fr in range(sg.start, sg.end + 1):
                         reset_to(env, dict(states=states[fr]))
-                        obs = env._get_observations(force_update=True)
-                        frames.append(SE._stacked_from_obs(obs))
-                        act = np.asarray(actions[min(fr, len(actions) - 1)], np.float64)
-                        fld = SE._frame_fields(obs, ann.instruction, sg, fr - sg.start, sg.end - sg.start + 1,
-                                               0, base_pos_ref, base_yaw_ref, anchor_lean0, None,
-                                               act, None, q01s, q99s, q01a, q99a, "act")
-                        fld["eef_pos_world"] = np.round(sim.eef_pose()["pos"], 4).tolist()
-                        fld["gripper_width"] = round(float(fld["cur_raw16"][14] - fld["cur_raw16"][15]), 4)
-                        fld["oracle_action_raw12"] = np.round(act, 4).tolist()
-                        fld["action_mse_vs_oracle"] = 0.0
-                        fld["sim_check_success"] = bool(sim.check_full_success())
-                        fld["replanned"] = False
-                        recs.append(fld)
+                        env._get_observations(force_update=True)
                         hc = MS._gripper_contact_obj(env)
                         if hc:
                             held_counts[hc] = held_counts.get(hc, 0) + 1
-                    per_child.append((sg, frames, recs, True,
-                                      {"budget": sg.end - sg.start + 1, "est_length": None}))
-                held_obj = max(held_counts, key=held_counts.get) if held_counts else None
-                start_obj_z = start_z_by_obj.get(held_obj) if held_obj else None
+                    # env is now at this span's END frame. Capture the ref for its own primitive.
+                    gp = MS.span_goal_primitive(sg.primitive)
+                    if gp is not None:
+                        hobj = max(held_counts, key=held_counts.get) if held_counts else None
+                        sz = z_start.get(hobj) if hobj else None
+                        child_refs[sg.child_index] = MS.capture_ref_state(
+                            env, sg.subgoal, gp, sz, held_obj=hobj)
+                    per_child.append((sg, [], [], True, {"budget": sg.end - sg.start + 1, "est_length": None}))
+                # milestone-level ref = the milestone-end child's ref (for /milestone scoring)
+                held_obj = None; start_obj_z = None
+                ref = None  # milestone ref set below from child_refs[last_ci] if present
             else:
                 # POLICY: roll continuously through the children (state carries over between them);
                 # keep EACH child's own frames/records (its native local frame_step) -> per-child dir.
@@ -175,23 +170,34 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
                                       {"budget": roll.get("budget"), "est_length": roll.get("est_length")}))
 
             # ---- settled milestone end: verdict (attached to the milestone's LAST child) ----
+            last_ci = kids[-1].child_index
             is_term = any(k.is_terminal for k in kids) or (ms_idx == milestones[-1][0])
-            ref = None
             if is_oracle:
-                ref = MS.capture_ref_state(env, ms_text, goal_prim, start_obj_z, held_obj=held_obj)
-                ms_verdict = {"verdict": "reference", "rule": "oracle_ref",
-                              "target": ref.get("obj") or ref.get("fixture") or "", "detail": ""}
-            elif is_term:
-                ok = bool(sim.check_full_success())   # terminal -> episode-level env _check_success
-                ms_verdict = {"verdict": "success" if ok else "failure", "rule": "episode_check_success",
-                              "target": "", "detail": f"env _check_success at terminal milestone end = {ok}"}
+                ms_verdict = {"verdict": "reference", "rule": "oracle_ref", "target": "", "detail": ""}
             else:
-                mref = (oracle_refs or {}).get(str(ms_idx))
-                ms_verdict = MS.milestone_check(env, ms_text, mref) if mref else \
+                # milestone scoring uses the milestone-END child's per-span oracle ref.
+                mref = (oracle_refs or {}).get(str(last_ci))
+                sub = MS.subtask_check(env, ms_text, mref, last_grip=last_cmd_grip) if mref else \
                     {"verdict": "unknown", "rule": "no_oracle_ref", "target": "", "detail": ""}
+                if is_term:
+                    # TERMINAL milestone: AND the (loose) subtask verdict with the episode-level env
+                    # _check_success — task-level ground truth. A span is the final SUCCESS only if
+                    # BOTH agree; either failing -> failure. (subtask unknown -> fall back to episode.)
+                    ep_ok = bool(sim.check_full_success())
+                    sv = sub.get("verdict")
+                    if sv in ("success", "failure"):
+                        v = "success" if (sv == "success" and ep_ok) else "failure"
+                        ms_verdict = {"verdict": v, "rule": "subtask_AND_episode",
+                                      "target": sub.get("target", ""),
+                                      "detail": f"subtask={sv} AND episode_check_success={ep_ok} -> {v}. {sub.get('detail','')}"}
+                    else:
+                        ms_verdict = {"verdict": "success" if ep_ok else "failure",
+                                      "rule": "episode_check_success",
+                                      "target": "", "detail": f"env _check_success at end = {ep_ok} (subtask unknown)"}
+                else:
+                    ms_verdict = sub
 
             # write one dir per CHILD; the milestone verdict lands on the LAST child, others -> unknown.
-            last_ci = kids[-1].child_index
             for sg, frames, recs, advanced, budinfo in per_child:
                 sub_dir = ep_out / f"child{sg.child_index:02d}_{sg.primitive}"
                 sub_dir.mkdir(parents=True, exist_ok=True)
@@ -226,8 +232,10 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
                     span=[sg.start, sg.end], out_dir=str(sub_dir.relative_to(out_root)),
                     is_terminal=sg.is_terminal, is_milestone_end=is_ms_end, advanced=advanced,
                     milestone_sim_check=child_verdict)
-                if is_oracle and is_ms_end and ref is not None:
-                    rec["ref"] = ref   # store oracle ref on the milestone-end child for the policy run
+                # store the PER-SPAN oracle ref on EACH meaningful child (keyed by child_index) so
+                # BOTH finestep (per-span) and milestone (end child) can load it.
+                if is_oracle and sg.child_index in child_refs:
+                    rec["ref"] = child_refs[sg.child_index]
                 records.append(rec)
 
         sim_success_final = bool(sim.check_full_success())
@@ -252,7 +260,8 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str,
 
 
 def _load_oracle_refs(out_root: Path, oracle_method: str, episode_id: str) -> dict:
-    """Load {str(milestone_index): ref} from the oracle run's episode.json for this episode."""
+    """Load {str(child_index): ref} from the oracle episode.json — PER-SPAN refs (one per meaningful
+    fine subgoal). Milestone scoring looks up the milestone-end child_index; finestep looks up each."""
     flat = episode_id.replace("/", "__")
     f = out_root / oracle_method / flat / "episode.json"
     if not f.is_file():
@@ -261,9 +270,8 @@ def _load_oracle_refs(out_root: Path, oracle_method: str, episode_id: str) -> di
         doc = json.loads(f.read_text())
     except Exception:
         return {}
-    # refs now live on the milestone-END child in subgoals[]; key by milestone_index.
-    return {str(m["milestone_index"]): m.get("ref")
-            for m in doc.get("subgoals", doc.get("milestones", [])) if m.get("ref")}
+    return {str(m["child_index"]): m.get("ref")
+            for m in doc.get("subgoals", []) if m.get("ref") and m.get("child_index") is not None}
 
 
 def main():
