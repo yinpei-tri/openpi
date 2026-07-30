@@ -409,6 +409,39 @@ def main():
         # Write incrementally after EACH episode so a crash (OOM / bad ep) keeps completed timing.
         _write_index()
     print(f"wrote {idx_path}  (total {round(time.time() - t_run, 1)}s over {len(eps)} episodes)")
+    _merge_episode_results(args.out_root, args.method, idx)
+
+
+def _merge_episode_results(out_root: Path, method: str, this_idx: list) -> None:
+    """Write a DURABLE compact summary to <root>/../episode_results/<method>.json — MERGING this
+    process's episodes into any existing file (keyed by episode_id). Multiple sharded processes each
+    call this, so we UNION rather than overwrite (a shard writing only its 250 eps must not clobber
+    the others). Survives deleting the big per-episode video dirs; /stats reads this first."""
+    try:
+        rr = out_root.parent / "episode_results"
+        rr.mkdir(parents=True, exist_ok=True)
+        f = rr / f"{method}.json"
+        by_id = {}
+        if f.is_file():
+            try:
+                for e in json.loads(f.read_text()).get("episodes", []):
+                    if e.get("episode_id"):
+                        by_id[e["episode_id"]] = e
+            except Exception:
+                pass
+        for e in this_idx:
+            if e.get("episode_id"):
+                by_id[e["episode_id"]] = e   # this run's entry wins for its episodes
+        eps = sorted(by_id.values(), key=lambda e: e.get("episode_id") or "")
+        done = [e for e in eps if e.get("seconds") is not None]
+        f.write_text(json.dumps(dict(
+            eval_kind="episode", method=method, n_episodes=len(eps),
+            total_seconds=round(sum(e["seconds"] for e in done), 1),
+            avg_seconds_per_episode=round(sum(e["seconds"] for e in done) / len(done), 1) if done else None,
+            episodes=eps), indent=1))
+        print(f"  merged {len(this_idx)} eps -> {f} (now {len(eps)} total)", flush=True)
+    except Exception as _e:
+        print(f"  [warn] episode_results merge failed: {_e!r}", flush=True)
 
 
 if __name__ == "__main__":

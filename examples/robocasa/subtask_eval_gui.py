@@ -437,22 +437,44 @@ def _target_split_map() -> dict[str, str]:
     return out
 
 
+# DURABLE per-checkpoint episode results (compact summaries extracted by
+# scripts/extract_episode_results.py). These SURVIVE deleting the big per-episode video dirs under
+# episode/<m>/, and are the PREFERRED source for /stats #2. Falls back to episode/<m>/index.json.
+EPISODE_RESULTS_DIR = Path("m0717_eval_results/episode_results")
+
+
+def _episode_index_docs() -> dict:
+    """method -> episode summary doc (episodes[]). Prefer the durable episode_results/<m>.json;
+    fall back to episode/<m>/index.json for any method not yet extracted."""
+    docs = {}
+    if EPISODE_RESULTS_DIR.is_dir():
+        for f in sorted(EPISODE_RESULTS_DIR.glob("*.json")):
+            try:
+                docs[f.stem] = json.loads(f.read_text())
+            except Exception:
+                pass
+    ep_root = _root("episode")
+    if ep_root.exists():
+        for m in _methods(ep_root):
+            if m in docs:
+                continue   # durable copy already has it
+            try:
+                docs[m] = json.loads((ep_root / m / "index.json").read_text())
+            except Exception:
+                pass
+    return docs
+
+
 def _episode_stats(root: Path) -> dict:
-    """Per-method episode-success stats (from episode_eval.py output). Breakdown by the RoboCasa
-    TARGET SPLIT: overall + atomic_seen / composite_seen / composite_unseen (from the task_name via
-    _target_split_map). Also per-task rates and per-method timing (from index.json)."""
+    """Per-method episode-success stats. Breakdown by the RoboCasa TARGET SPLIT: overall +
+    atomic_seen / composite_seen / composite_unseen (task_name via _target_split_map). Reads the
+    DURABLE episode_results/<m>.json (survives video cleanup), falling back to episode/<m>/index.json."""
     tsplit = _target_split_map()   # task_name -> atomic_seen / composite_seen / composite_unseen
     keys = ["all", "atomic_seen", "composite_seen", "composite_unseen"]
     out = {}
-    for m in _methods(root):
+    for m, idx in _episode_index_docs().items():
         succ = {k: [0, 0] for k in keys}  # [n_success, n_total]
         by_task: dict[str, list] = {}     # task_name -> [n_success, n_total, split]
-        # Read the ONE per-method index.json (episode_eval writes per-episode success + task there)
-        # instead of opening every episode.json — ~1000x fewer file reads (14s -> ~0.1s on NFS).
-        try:
-            idx = json.loads((root / m / "index.json").read_text())
-        except Exception:
-            idx = {}
         for ep in idx.get("episodes", []):
             if ep.get("episode_success") is None:
                 continue
@@ -551,6 +573,13 @@ _STATS_CACHE: dict = {"fp": None, "data": None}
 
 def _stats_fingerprint() -> tuple:
     fp = []
+    # durable episode summaries (preferred source for #2) — invalidate when re-extracted
+    if EPISODE_RESULTS_DIR.is_dir():
+        for f in EPISODE_RESULTS_DIR.glob("*.json"):
+            try:
+                fp.append((str(f), f.stat().st_mtime))
+            except OSError:
+                pass
     for root in (_root("episode"), _root("finestep"), _root("milestone")):
         if not root.exists():
             continue
