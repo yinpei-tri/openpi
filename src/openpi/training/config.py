@@ -425,6 +425,10 @@ class RoboCasaDataConfig(DataConfigFactory):
     # Prepend the whole-task goal to the subgoal prompt for disambiguating context
     # ("<task>; Current Subgoal: <subgoal>"). ON by default.
     include_task_goal: bool = True
+    # Include the subgoal at all. When OFF (tag `nosubgoal`), drop the subgoal entirely and
+    # render just "Task: <goal>" — a task-goal-only pi0.5 baseline (no System1 subgoal
+    # decomposition). Forces the task goal on. ON by default.
+    include_subgoal: bool = True
     # Emit the proprioceptive state block in the prompt at all. ON by default (pi0.5 ingests
     # state via the discretized prompt ints). When OFF, drop the ENTIRE state block — neither
     # "Initial State: …" nor "Current State: …" appears (tag token: `nostate`). This is
@@ -499,6 +503,7 @@ class RoboCasaDataConfig(DataConfigFactory):
                     include_base_pose=self.include_base_pose,
                     use_anchor_images=self.use_anchor_images,
                     include_task_goal=self.include_task_goal,
+                    include_subgoal=self.include_subgoal,
                     include_anchor_state=self.include_anchor_state,
                     include_conditioning=self.include_conditioning,
                     include_executed_step=self.include_executed_step,

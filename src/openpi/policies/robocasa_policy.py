@@ -185,6 +185,7 @@ def build_prompt(
     task_goal: str | None = None,
     *,
     include_task_goal: bool = False,
+    include_subgoal: bool = True,
     conditioning: dict | None = None,
 ) -> str:
     """Assemble the TEXT portion of the pi0.5 prompt (single prompt-assembly point).
@@ -200,6 +201,10 @@ def build_prompt(
         Quality: <q>; Estimated Length: <n>; Executed Step: <k>
 
     - ``include_task_goal`` prepends the whole-task goal as disambiguating context.
+    - ``include_subgoal`` (default True): drop the subgoal entirely (tag ``nosubgoal``) for a
+      task-goal-only pi0.5 baseline (no System1 subgoal decomposition). Requires the task
+      goal (there'd be no instruction otherwise), so it forces ``include_task_goal`` on and
+      renders just ``<task>`` as line 1.
     - ``conditioning`` (optional): offline-RL tags rendered on the SECOND line, in the
       FIXED order (quality, est_length, executed_step). At TRAINING set them to the
       OBSERVED value; at INFERENCE to the DESIRED value (decision-transformer style).
@@ -208,10 +213,14 @@ def build_prompt(
     # Strip any newlines from the raw text components so the ONLY newlines in the prompt
     # are the structural ones (the tokenizer preserves newlines for RoboCasa).
     subgoal = _as_str(subgoal).strip().lower().replace("\n", " ")
-    if include_task_goal and task_goal:
-        # Strip trailing sentence punctuation off the task goal so the join reads
-        # "make coffee; Current Subgoal: …" not "make coffee.; Current Subgoal: …".
-        task = _as_str(task_goal).strip().lower().replace("\n", " ").rstrip(".!; ")
+    # Strip trailing sentence punctuation off the task goal so the join reads
+    # "make coffee; Current Subgoal: …" not "make coffee.; Current Subgoal: …".
+    task = _as_str(task_goal).strip().lower().replace("\n", " ").rstrip(".!; ") if task_goal else ""
+    if not include_subgoal:
+        # Task-goal-only baseline: no subgoal at all. Fall back to the subgoal only if the
+        # task goal is somehow missing (never leave an empty instruction).
+        line1 = task or subgoal
+    elif include_task_goal and task:
         line1 = f"{task}; Current Subgoal: {subgoal}"
     else:
         line1 = subgoal
@@ -250,6 +259,10 @@ class RobocasaInputs(transforms.DataTransformFn):
     use_anchor_images: bool = True
     # Prepend the whole-task goal to the subgoal prompt (disambiguating context).
     include_task_goal: bool = False
+    # Drop the subgoal entirely (tag ``nosubgoal``) -> task-goal-only pi0.5 baseline (no
+    # System1 subgoal decomposition). Forces the task goal on (there'd be no instruction
+    # otherwise). Default True.
+    include_subgoal: bool = True
     # Concatenate the anchor (subgoal-start) lean state onto the current lean state, so
     # pi0.5's discretized state ints carry the proprioceptive before/after DELTA
     # (complements the anchor images). Doubles the state width (14 -> 28). Independent
@@ -368,7 +381,8 @@ class RobocasaInputs(transforms.DataTransformFn):
             inputs["prompt"] = build_prompt(
                 data["prompt"],
                 data.get("task_goal"),
-                include_task_goal=self.include_task_goal,
+                include_task_goal=self.include_task_goal or not self.include_subgoal,
+                include_subgoal=self.include_subgoal,
                 conditioning=conditioning,
             )
             # Pass the gripper flag through for TokenizePrompt (appends "Current Gripper:").

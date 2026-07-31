@@ -56,6 +56,7 @@ _ROBOCASA_PROMPT_DEVIATIONS = [
     ("include_state", True, "nostate"),
     ("include_anchor_state", True, "noanchorstate"),
     ("include_task_goal", True, "notask"),
+    ("include_subgoal", True, "nosubgoal"),  # task-goal-only pi0.5 baseline (no subgoal)
     ("use_anchor_images", True, "noanchor"),  # read from model (data mirrors it)
     ("include_gripper_flag", True, "nogrip"),
 ]
@@ -110,6 +111,10 @@ def robocasa_exp_tag(config: _config.TrainConfig) -> str:
         # `noexec`/`noestl` (drop a single conditioning field) are redundant when `nocond`
         # (drop the whole line) is already set — suppress them so the tag never shows both.
         if attr in ("include_executed_step", "include_est_length") and not getattr(data, "include_conditioning", True):
+            continue
+        # `nosubgoal` (task-goal-only baseline) FORCES the task goal on, so `notask` can't
+        # co-occur — suppress `notask` when the subgoal is dropped (else the tag lies).
+        if attr == "include_task_goal" and not getattr(data, "include_subgoal", True):
             continue
         obj = m if attr == "use_anchor_images" else data
         if getattr(obj, attr, default) != default:
