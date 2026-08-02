@@ -65,7 +65,7 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
                                 task_goal, resize, replan_steps, horizon_mult, max_steps_cap,
                                 stop_cfg: StopConfig, norm_stats, last_cmd_grip_init,
                                 do_settle: bool, settle_steps: int, zero_arm_in_base: bool = True,
-                                oracle: bool = False):
+                                oracle: bool = False, budget_formula=SE.DEFAULT_BUDGET_FORMULA):
     """Roll out ONE subgoal WITHOUT resetting the sim (state carries over from the previous
     subgoal). Terminates when the stop rule fires (advanced=True) or the budget cap is hit
     (advanced=False). Returns clean frames + step records (subtask_eval layout) + advance info.
@@ -79,8 +79,11 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
     """
     span_len = sg.end - sg.start + 1
     est_len = SE.estimated_length(span_len)
-    # Oracle replays exactly the recorded span; policy gets slack beyond it (clamped).
-    budget = span_len if oracle else int(min(max_steps_cap, max(HORIZON, round(span_len * horizon_mult))))
+    # Oracle replays exactly the recorded span; policy gets slack beyond it per the selected formula
+    # (SE.compute_budget / BUDGET_FORMULAS). Default "legacy" reproduces the v1..v12 eval; "longsafe"
+    # is long-span-safe (budget always exceeds the span).
+    budget = span_len if oracle else SE.compute_budget(span_len, est_len, horizon_mult, max_steps_cap,
+                                                        budget_formula)
 
     q01s = q99s = q01a = q99a = None
     if norm_stats is not None:
@@ -116,6 +119,18 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
     last_cmd_grip = last_cmd_grip_init
     if do_settle and not oracle:
         settle = settle_action_from_first(sim_actions[sg.start])
+        # HOLD-CURRENT gripper: force the settle to command CLOSE (+1) ONLY if the gripper is actually
+        # in CONTACT with an env object at the reset state — otherwise a child that inherits a HELD
+        # object (e.g. "return to the cup" carrying the lemon) can drop it during the zero-motion
+        # settle. Keyed on CONTACT (not finger width): an EMPTY gripper can rest at width ~0.04 and
+        # must keep the recorded GT gripper (e.g. OPEN to approach), so a width threshold misfires.
+        try:
+            import milestone_sim_check as _MS
+            _holding = _MS._gripper_contact_obj(env) is not None
+        except Exception:
+            _holding = False
+        if _holding:
+            settle = settle.copy(); settle[SIM_GRIP_IDX] = 1.0   # hold closed around the object
         last_cmd_grip = float(settle[SIM_GRIP_IDX])
         for si in range(settle_steps):
             _log_step(-settle_steps + si, "settle", settle, None, replanned=False)
@@ -245,7 +260,8 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str, n
                 replan_steps=args.replan_steps, horizon_mult=args.horizon_mult,
                 max_steps_cap=args.max_steps_cap, stop_cfg=stop_cfg, norm_stats=norm_stats,
                 last_cmd_grip_init=last_cmd_grip, do_settle=(i == 0), settle_steps=args.settle_steps,
-                zero_arm_in_base=not args.no_zero_arm_in_base, oracle=(client is None))
+                zero_arm_in_base=not args.no_zero_arm_in_base, oracle=(client is None),
+                budget_formula=getattr(args, "budget_formula", SE.DEFAULT_BUDGET_FORMULA))
             last_cmd_grip = roll["last_cmd_grip"]
 
             clean = roll.pop("_clean_frames", [])
@@ -319,7 +335,12 @@ def main():
     ap.add_argument("--resize-size", type=int, default=224)
     ap.add_argument("--replan-steps", type=int, default=16)
     ap.add_argument("--horizon-mult", type=float, default=2.0)
-    ap.add_argument("--max-steps-cap", type=int, default=400)
+    ap.add_argument("--max-steps-cap", type=int, default=400,
+                    help="budget cap ('legacy': hard cap) / additive long-span slack ('longsafe')")
+    ap.add_argument("--budget-formula", choices=SE.BUDGET_FORMULAS, default=SE.DEFAULT_BUDGET_FORMULA,
+                    help="'legacy' = min(cap, max(H, horizon_mult*span_len)) — the v1..v12 eval "
+                         "formula (default, reproducible); 'longsafe' = min(a+cap, horizon_mult*a) "
+                         "with a=max(span_len,est_len) — bounded yet always exceeds the span")
     ap.add_argument("--settle-steps", type=int, default=10)
     ap.add_argument("--no-zero-arm-in-base", action="store_true",
                     help="disable zeroing the arm eef delta in mobile/base mode (matches subtask_eval default ON)")
@@ -362,6 +383,8 @@ def main():
         idx_path.write_text(json.dumps(dict(
             eval_kind="episode", method=args.method, n_episodes=len(eps), n_done=len(idx),
             stop=dict(progress=args.stop_progress, eps=args.stop_eps, window=args.stop_window),
+            horizon_mult=args.horizon_mult, max_steps_cap=args.max_steps_cap,
+            budget_formula=args.budget_formula,
             total_seconds=total_s,
             avg_seconds_per_episode=round(total_s / len(done), 1) if done else None,
             task_timing=task_timing,
@@ -386,6 +409,39 @@ def main():
         # Write incrementally after EACH episode so a crash (OOM / bad ep) keeps completed timing.
         _write_index()
     print(f"wrote {idx_path}  (total {round(time.time() - t_run, 1)}s over {len(eps)} episodes)")
+    _merge_episode_results(args.out_root, args.method, idx)
+
+
+def _merge_episode_results(out_root: Path, method: str, this_idx: list) -> None:
+    """Write a DURABLE compact summary to <root>/../episode_results/<method>.json — MERGING this
+    process's episodes into any existing file (keyed by episode_id). Multiple sharded processes each
+    call this, so we UNION rather than overwrite (a shard writing only its 250 eps must not clobber
+    the others). Survives deleting the big per-episode video dirs; /stats reads this first."""
+    try:
+        rr = out_root.parent / "episode_results"
+        rr.mkdir(parents=True, exist_ok=True)
+        f = rr / f"{method}.json"
+        by_id = {}
+        if f.is_file():
+            try:
+                for e in json.loads(f.read_text()).get("episodes", []):
+                    if e.get("episode_id"):
+                        by_id[e["episode_id"]] = e
+            except Exception:
+                pass
+        for e in this_idx:
+            if e.get("episode_id"):
+                by_id[e["episode_id"]] = e   # this run's entry wins for its episodes
+        eps = sorted(by_id.values(), key=lambda e: e.get("episode_id") or "")
+        done = [e for e in eps if e.get("seconds") is not None]
+        f.write_text(json.dumps(dict(
+            eval_kind="episode", method=method, n_episodes=len(eps),
+            total_seconds=round(sum(e["seconds"] for e in done), 1),
+            avg_seconds_per_episode=round(sum(e["seconds"] for e in done) / len(done), 1) if done else None,
+            episodes=eps), indent=1))
+        print(f"  merged {len(this_idx)} eps -> {f} (now {len(eps)} total)", flush=True)
+    except Exception as _e:
+        print(f"  [warn] episode_results merge failed: {_e!r}", flush=True)
 
 
 if __name__ == "__main__":

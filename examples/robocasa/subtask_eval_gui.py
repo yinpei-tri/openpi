@@ -38,8 +38,8 @@ VAL_MSE_DIR: Path = Path("eval_out/val_mse")  # eval #1 curves (scripts/eval_val
 # <exp>__<step>.json = {exp_name, steps:[{step, action_mse, progress_acc, progress_mae,
 # progress_mode}]}. The /val_mse page overlays both splits with per-split + per-method toggles.
 MSE_DIRS: dict[str, Path] = {
-    "val": Path("_evallogs/valmse_results"),
-    "train": Path("_evallogs/trainmse_results"),
+    "val": Path("m0717_eval_results/valmse_results"),
+    "train": Path("m0717_eval_results/trainmse_results"),
 }
 
 
@@ -94,8 +94,88 @@ def api_episodes_r(root, method):
     rp = _root(root)
     out = []
     for ep in _episodes(rp, method):
-        out.append(json.loads((_safe(rp, method, ep) / "episode.json").read_text()))
+        out.append(_adapt_milestone_doc(json.loads((_safe(rp, method, ep) / "episode.json").read_text())))
     return jsonify(out)
+
+
+@app.route("/api/<root>/episode_list/<method>")
+def api_episode_list_r(root, method):
+    """LIGHTWEIGHT episode list for the dropdown — reads ONLY index.json (1 file) instead of every
+    episode.json (~1000 files / 10 MB). Returns just what the type/task/episode cascade needs;
+    the full per-episode doc (subgoals) is fetched lazily on click via /api/<root>/episode/..."""
+    rp = _root(root)
+    idx_f = rp / method / "index.json"
+    by_id: dict[str, dict] = {}
+    # 1) index.json entries (fast; carries n_subgoals). May be PARTIAL if a re-run overwrote it with
+    #    only its shard — so we ALWAYS also union the directory scan below.
+    if idx_f.is_file():
+        try:
+            idx = json.loads(idx_f.read_text())
+            for e in idx.get("episodes", []):
+                eid = e.get("episode_id") or ""
+                if not eid:
+                    continue   # errored/incomplete episode (no episode_id) — skip so the GUI never
+                               # fetches /episode/<method>/ with an empty id (404). The dir scan
+                               # below still surfaces any episode that produced an on-disk dir.
+                parts = eid.split("/")
+                task = parts[2] if len(parts) > 2 else eid   # RoboCasa/<Atomic|Composite>/<Task>/...
+                by_id[eid] = dict(episode_id=eid, task_name=task,
+                                  n_subgoals=e.get("n_subgoals"), error=e.get("error"))
+        except Exception:
+            pass
+    # 2) directory scan (still NO episode.json reads) — add any episode dir the index missed, so a
+    #    truncated/partial index (mid re-run) never hides episodes that exist on disk.
+    for ep in _episodes(rp, method):
+        eid = ep.replace("__", "/")
+        if eid in by_id:
+            continue
+        parts = eid.split("/")
+        by_id[eid] = dict(episode_id=eid, task_name=(parts[2] if len(parts) > 2 else eid),
+                          n_subgoals=None, error=None)
+    return jsonify(sorted(by_id.values(), key=lambda e: e["episode_id"]))
+
+
+def _adapt_milestone_doc(doc: dict) -> dict:
+    """MILESTONE episode.json stores `milestones[]` (goal_primitive / milestone_sim_check / ref), but
+    the viewer JS expects the fine-step/episode `subgoals[]` shape (child_index / primitive / subgoal
+    / span / out_dir / is_terminal). Synthesize `subgoals` from `milestones` so ONE viewer serves all
+    three roots unchanged; keep the milestone verdict on each so the panel can show it."""
+    if "subgoals" in doc or "milestones" not in doc:
+        return doc
+    subs = []
+    ms = doc.get("milestones", [])
+    ep_ss = doc.get("sim_success_final")   # episode-level env _check_success (top-level in the doc)
+    for i, m in enumerate(ms):
+        term = m.get("is_terminal", False) or (i == len(ms) - 1)
+        subs.append(dict(
+            child_index=m.get("milestone_index", i),
+            milestone_index=m.get("milestone_index", i),
+            is_terminal=term,
+            span=m.get("span", [0, 0]),
+            primitive=m.get("goal_primitive", "other"),
+            subgoal=m.get("milestone_subgoal", ""),
+            subgoal_detail="; ".join(m.get("child_subgoals", []) or []),
+            milestone_subgoal=m.get("milestone_subgoal", ""),
+            out_dir=m.get("out_dir", ""),
+            n_children=m.get("n_children"), n_advanced=m.get("n_advanced"),
+            milestone_sim_check=m.get("milestone_sim_check"),
+            # surface the episode-level env _check_success on the TERMINAL milestone so the panel's
+            # 'sim_check_success (episode)' shows SUCCESS/FAIL there (not everywhere -> only terminal).
+            sim_success_final=(ep_ss if term else None),
+        ))
+    doc = dict(doc)
+    doc["subgoals"] = subs
+    return doc
+
+
+@app.route("/api/<root>/episode/<method>/<episode>")
+def api_episode_one_r(root, method, episode):
+    """Full per-episode doc (subgoals + all fields) for ONE episode — fetched lazily when the user
+    selects an episode, so the page load doesn't read 1000 episode.json up front."""
+    f = _safe(_root(root), method, episode) / "episode.json"
+    if not f.is_file():
+        abort(404)
+    return jsonify(_adapt_milestone_doc(json.loads(f.read_text())))
 
 
 @app.route("/api/task_splits")
@@ -105,15 +185,20 @@ def api_task_splits():
     return jsonify(_target_split_map())
 
 
-# ---- legacy routes (the existing "/" subtask page uses these; keep them working) ----
+# ---- legacy non-namespaced routes (default to the finestep root) ----
 @app.route("/api/methods")
 def api_methods():
-    return api_methods_r("subtask")
+    return api_methods_r("finestep")
 
 
 @app.route("/api/episodes/<method>")
 def api_episodes(method):
-    return api_episodes_r("subtask", method)
+    return api_episodes_r("finestep", method)
+
+
+# NOTE: no non-namespaced /api/episode_list or /api/episode/<m>/<e> aliases — they COLLIDE with the
+# namespaced /api/<root>/episode_list/<method> (a URL like /api/episode/episode_list/<m> matches BOTH
+# and Werkzeug picks the wrong one -> 404). The JS always uses the namespaced /api/<root>/... forms.
 
 
 def _reconstruct_full(sub_dir: Path) -> dict | None:
@@ -208,23 +293,27 @@ def api_media_r(root, method, episode, sub, fname):
     return send_file(f, mimetype=mt)
 
 
-# legacy aliases (subtask root)
+# legacy aliases (default finestep root)
 @app.route("/api/steps/<method>/<episode>/<sub>")
 def api_steps(method, episode, sub):
-    return api_steps_r("subtask", method, episode, sub)
+    return api_steps_r("finestep", method, episode, sub)
 
 
 @app.route("/api/media/<method>/<episode>/<sub>/<path:fname>")
 def api_media(method, episode, sub, fname):
-    return api_media_r("subtask", method, episode, sub, fname)
+    return api_media_r("finestep", method, episode, sub, fname)
+
+
+_ROOT_LABEL = {"finestep": "Fine-step", "milestone": "Milestone", "episode": "Episode"}
 
 
 def _viewer_page(root_name: str) -> str:
-    """The rollout viewer page bound to a rollout root ('subtask' or 'episode'). Injects
-    window.RN so the shared gui.js hits /api/<root>/... and a small nav bar."""
+    """The rollout viewer page bound to a rollout root ('finestep' | 'milestone' | 'episode').
+    Injects window.RN so the shared gui.js hits /api/<root>/... and a small nav bar."""
     nav = ('<nav style="font-size:13px">'
            '<a href="/" style="color:#b0431c;margin-right:8px">home</a>'
-           '<a href="/subtask" style="color:#b0431c;margin-right:8px">subtask</a>'
+           '<a href="/finestep" style="color:#b0431c;margin-right:8px">finestep</a>'
+           '<a href="/milestone" style="color:#b0431c;margin-right:8px">milestone</a>'
            '<a href="/episode" style="color:#b0431c;margin-right:8px">episode</a>'
            '<a href="/val_mse" style="color:#b0431c;margin-right:8px">val_mse</a>'
            '<a href="/stats" style="color:#b0431c">stats</a></nav>')
@@ -232,8 +321,7 @@ def _viewer_page(root_name: str) -> str:
     # Put the RN global BEFORE gui.js loads, and drop the nav into the top bar.
     html = INDEX_HTML.replace("<script src=\"/gui.js\">", inject + "<script src=\"/gui.js\">")
     html = html.replace("<div id=\"top\">", f"<div id=\"top\">{nav}", 1)
-    # Per-root title + heading: /episode -> "Episode Eval", /subtask -> "Subtask Eval".
-    label = "Episode" if root_name == "episode" else "Subtask"
+    label = _ROOT_LABEL.get(root_name, "Fine-step")
     html = html.replace("<title>Subtask Eval Viewer</title>", f"<title>{label} Eval Viewer</title>")
     html = html.replace("<h1><b>Subtask</b> Eval</h1>", f"<h1><b>{label}</b> Eval</h1>")
     return html
@@ -244,9 +332,14 @@ def index():
     return HOME_HTML
 
 
-@app.route("/subtask")
-def subtask_page():
-    return _viewer_page("subtask")
+@app.route("/finestep")
+def finestep_page():
+    return _viewer_page("finestep")
+
+
+@app.route("/milestone")
+def milestone_page():
+    return _viewer_page("milestone")
 
 
 @app.route("/episode")
@@ -344,34 +437,57 @@ def _target_split_map() -> dict[str, str]:
     return out
 
 
+# DURABLE per-checkpoint episode results (compact summaries extracted by
+# scripts/extract_episode_results.py). These SURVIVE deleting the big per-episode video dirs under
+# episode/<m>/, and are the PREFERRED source for /stats #2. Falls back to episode/<m>/index.json.
+EPISODE_RESULTS_DIR = Path("m0717_eval_results/episode_results")
+
+
+def _episode_index_docs() -> dict:
+    """method -> episode summary doc (episodes[]). Prefer the durable episode_results/<m>.json;
+    fall back to episode/<m>/index.json for any method not yet extracted."""
+    docs = {}
+    if EPISODE_RESULTS_DIR.is_dir():
+        for f in sorted(EPISODE_RESULTS_DIR.glob("*.json")):
+            try:
+                docs[f.stem] = json.loads(f.read_text())
+            except Exception:
+                pass
+    ep_root = _root("episode")
+    if ep_root.exists():
+        for m in _methods(ep_root):
+            if m in docs:
+                continue   # durable copy already has it
+            try:
+                docs[m] = json.loads((ep_root / m / "index.json").read_text())
+            except Exception:
+                pass
+    return docs
+
+
 def _episode_stats(root: Path) -> dict:
-    """Per-method episode-success stats (from episode_eval.py output). Breakdown by the RoboCasa
-    TARGET SPLIT: overall + atomic_seen / composite_seen / composite_unseen (from the task_name via
-    _target_split_map). Also per-task rates and per-method timing (from index.json)."""
+    """Per-method episode-success stats. Breakdown by the RoboCasa TARGET SPLIT: overall +
+    atomic_seen / composite_seen / composite_unseen (task_name via _target_split_map). Reads the
+    DURABLE episode_results/<m>.json (survives video cleanup), falling back to episode/<m>/index.json."""
     tsplit = _target_split_map()   # task_name -> atomic_seen / composite_seen / composite_unseen
     keys = ["all", "atomic_seen", "composite_seen", "composite_unseen"]
     out = {}
-    for m in _methods(root):
+    for m, idx in _episode_index_docs().items():
         succ = {k: [0, 0] for k in keys}  # [n_success, n_total]
         by_task: dict[str, list] = {}     # task_name -> [n_success, n_total, split]
-        for ep in _episodes(root, m):
-            try:
-                doc = json.loads((_safe(root, m, ep) / "episode.json").read_text())
-            except Exception:
+        for ep in idx.get("episodes", []):
+            if ep.get("episode_success") is None:
                 continue
-            if doc.get("episode_success") is None:
-                continue
-            eid = doc.get("episode_id", "")
-            task = doc.get("task_name") or (eid.split("/")[2] if "/" in eid else eid)
+            eid = ep.get("episode_id", "")
+            task = ep.get("task_name") or (eid.split("/")[2] if "/" in eid else eid)
             cat = "atomic" if "/Atomic/" in eid else ("composite" if "/Composite/" in eid else None)
             spl = tsplit.get(task)   # atomic_seen / composite_seen / composite_unseen (or None)
-            ok = 1 if doc["episode_success"] else 0
+            ok = 1 if ep["episode_success"] else 0
             def _bump(k):
                 succ[k][0] += ok; succ[k][1] += 1
             _bump("all")
             if spl in succ:
                 _bump(spl)
-            # per-task tally (the requested per-task breakdown)
             b = by_task.setdefault(task, [0, 0, spl or cat or "?"])
             b[0] += ok; b[1] += 1
         row = {k: (v[0] / v[1] if v[1] else None) for k, v in succ.items()}
@@ -380,45 +496,71 @@ def _episode_stats(root: Path) -> dict:
         row["succ_counts"] = {k: succ[k][0] for k in keys}   # n SUCCESSFUL episodes per cell
         row["per_task"] = {t: {"rate": (b[0] / b[1] if b[1] else None), "s": b[0], "n": b[1], "split": b[2]}
                            for t, b in sorted(by_task.items())}
-        # per-method timing from the method index.json (avg s/episode + per-task table)
-        try:
-            idx = json.loads((root / m / "index.json").read_text())
-            row["avg_seconds_per_episode"] = idx.get("avg_seconds_per_episode")
-            row["total_seconds"] = idx.get("total_seconds")
-        except Exception:
-            pass
+        row["avg_seconds_per_episode"] = idx.get("avg_seconds_per_episode")
+        row["total_seconds"] = idx.get("total_seconds")
         out[m] = row
     return out
 
 
+def _prim_from_child(cd: str) -> str:
+    """child dir 'child03_close' -> primitive 'close' (the batch judge summary keys by child_dir)."""
+    p = cd.split("_", 1)
+    return p[1] if len(p) > 1 else "other"
+
+
 def _subtask_stats(root: Path) -> dict:
-    """Per-method Gemini subtask-success stats (from subtask_eval + gemini_judge): overall +
-    per primitive."""
+    """Per-method subtask-success stats from the Gemini BATCH judge. Reads the per-method
+    <method>/gemini_summary.json (ONE file — the rollup the batch judge writes) rather than
+    thousands of episode.json. THREE-WAY verdicts (success / failure / uncertain); success_rate is
+    over DECIDED spans (success/(success+failure)), uncertain reported separately. Per-primitive
+    breakdown is derived from the per_subtask child_dir keys. Falls back to scanning judge/gemini.json
+    if the summary is missing."""
     out = {}
     for m in _methods(root):
-        overall = [0, 0]
-        by_prim: dict[str, list[int]] = {}
-        for ep in _episodes(root, m):
+        summ_f = root / m / "gemini_summary.json"
+        tot = {"success": 0, "failure": 0, "uncertain": 0}
+        by_prim: dict[str, dict] = {}   # primitive -> {success, failure, uncertain}
+        def _bump(prim, v):
+            if v not in tot:
+                return
+            tot[v] += 1
+            b = by_prim.setdefault(prim, {"success": 0, "failure": 0, "uncertain": 0})
+            b[v] += 1
+        source = "gemini"
+        if summ_f.is_file():
             try:
-                doc = json.loads((_safe(root, m, ep) / "episode.json").read_text())
+                summ = json.loads(summ_f.read_text())
             except Exception:
-                continue
-            g = doc.get("gemini")
-            if not g:
-                continue
-            per = g.get("per_subtask", {})
-            for sg in doc.get("subgoals", []):
-                cd = Path(sg["out_dir"]).name
-                v = per.get(cd, {}).get("success")
-                if v is None:
+                summ = {}
+            for _ep, e in (summ.get("per_episode") or {}).items():
+                for cd, sub in (e.get("per_subtask") or {}).items():
+                    _bump(_prim_from_child(cd), sub.get("verdict"))
+        else:
+            # No Gemini summary (e.g. ORACLE — never judged; it's the sim-grounded upper-bound
+            # reference). Use the per-span SIM CHECK verdict instead: success/failure are decided,
+            # 'unknown' maps to uncertain (no high-precision rule applies). Read from episode.json.
+            source = "sim_check"
+            for ep in _episodes(root, m):
+                try:
+                    doc = json.loads((_safe(root, m, ep) / "episode.json").read_text())
+                except Exception:
                     continue
-                prim = sg.get("primitive", "other")
-                ok = 1 if v else 0
-                overall[0] += ok; overall[1] += 1
-                b = by_prim.setdefault(prim, [0, 0]); b[0] += ok; b[1] += 1
+                for sg in doc.get("subgoals", []):
+                    sc = sg.get("subtask_sim_check") or {}
+                    v = sc.get("verdict")
+                    v = "uncertain" if v in (None, "unknown", "error") else v
+                    _bump(sg.get("primitive", "other"), v)
+        decided = tot["success"] + tot["failure"]
+        n = decided + tot["uncertain"]
+        def _rate(b):
+            d = b["success"] + b["failure"]
+            return (b["success"] / d) if d else None
         out[m] = dict(
-            overall=(overall[0] / overall[1] if overall[1] else None), n=overall[1],
-            per_primitive={p: (v[0] / v[1] if v[1] else None) for p, v in sorted(by_prim.items())})
+            overall=(tot["success"] / decided if decided else None),
+            n=n, n_decided=decided, source=source,
+            n_success=tot["success"], n_failure=tot["failure"], n_uncertain=tot["uncertain"],
+            per_primitive={p: _rate(b) for p, b in sorted(by_prim.items())},
+            per_primitive_counts={p: dict(b) for p, b in sorted(by_prim.items())})
     return out
 
 
@@ -431,12 +573,25 @@ _STATS_CACHE: dict = {"fp": None, "data": None}
 
 def _stats_fingerprint() -> tuple:
     fp = []
-    for root in (_root("episode"), _root("subtask")):
+    # durable episode summaries (preferred source for #2) — invalidate when re-extracted
+    if EPISODE_RESULTS_DIR.is_dir():
+        for f in EPISODE_RESULTS_DIR.glob("*.json"):
+            try:
+                fp.append((str(f), f.stat().st_mtime))
+            except OSError:
+                pass
+    for root in (_root("episode"), _root("finestep"), _root("milestone")):
         if not root.exists():
             continue
         for idx in root.glob("*/index.json"):
             try:
                 fp.append((str(idx), idx.stat().st_mtime))
+            except OSError:
+                pass
+        # finestep Gemini verdicts land in <method>/gemini_summary.json — invalidate #3 when re-judged
+        for gs in root.glob("*/gemini_summary.json"):
+            try:
+                fp.append((str(gs), gs.stat().st_mtime))
             except OSError:
                 pass
     if VAL_MSE_DIR.is_dir():
@@ -464,7 +619,7 @@ def _compute_stats() -> dict:
                 continue
     return dict(val_mse=val,
                 episode=_episode_stats(_root("episode")),
-                subtask=_subtask_stats(_root("subtask")))
+                subtask=_subtask_stats(_root("finestep")))
 
 
 @app.route("/api/stats")
@@ -506,7 +661,7 @@ VAL_MSE_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 </style></head><body>
 <header>
   <h1>Train / Val <b>MSE</b></h1>
-  <nav><a href="/">home</a><a href="/subtask">subtask</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
+  <nav><a href="/">home</a><a href="/finestep">finestep</a><a href="/milestone">milestone</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
   <label>metric <select id="metric">
     <option value="action_mse">action_mse</option>
     <option value="progress_mae">progress_mae</option>
@@ -637,25 +792,92 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 </style></head><body>
 <header>
   <h1>Eval <b>Statistics</b></h1>
-  <nav><a href="/">home</a><a href="/subtask">subtask</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
+  <nav><a href="/">home</a><a href="/finestep">finestep</a><a href="/milestone">milestone</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
 </header>
 <div id="wrap">
-  <h2>#1 Validation MSE (final step)</h2><div id="valtab"></div>
-  <h2>#2 Episode success rate <span style="font-size:11px;color:#888;font-weight:400">— % (n episodes)</span></h2><div id="eptab"></div>
+  <div id="loading" style="padding:10px 0;color:#b0431c;font-size:14px">⏳ loading stats… (first load scans the eval results; ~a few seconds)</div>
+  <details id="tagdoc" style="margin:6px 0 14px;border:1px solid #e3e3e8;border-radius:8px;background:#fff;padding:6px 12px">
+    <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#b0431c">▸ Ablation tag legend — what each method-name token means (click to expand)</summary>
+    <div id="tagdoc-body" style="margin-top:10px;font-size:13px;line-height:1.55"></div>
+  </details>
+  <h2>#2 Episode success rate <span style="font-size:11px;color:#888;font-weight:400">— % (n episodes)</span></h2>
+  <div id="epfilter" style="margin:2px 0 8px;font-size:12px;display:flex;gap:6px;align-items:center;flex-wrap:wrap"></div>
+  <div id="eptab"></div>
   <h2>#2b Per-task episode success <span style="font-size:11px;color:#888;font-weight:400">— task × method, grouped by split · #successful / #episodes (hover for %)</span></h2><div id="tasktab" style="overflow-x:auto"></div>
-  <h2>#3 Subtask Gemini success rate</h2><div id="subtab"></div>
+  <h2>#3 Subtask Gemini success rate <span style="font-size:11px;color:#888;font-weight:400">— three-way verdict; rate = success / (success+failure), uncertain excluded; skipped (retract/low-movement) not counted</span></h2><div id="subtab" style="overflow-x:auto"></div>
   <div class="box"><canvas id="chart" height="90"></canvas></div>
 </div>
 <script>
 const COLORS=["#b0431c","#1c6bb0","#2e8b3d","#8b2eb0","#b0902e","#2eb0a3","#b02e5a","#555"];
+// Method DISPLAY name: fix up truncated/short output-dir labels to the complete ablation name.
+// (v12's rollout dir is 'v12_progact_noanchorstate' but the ckpt is '..._noanchorstate_noanchor';
+//  shown complete here until the dir is renamed post-run.)
+const _MNAME={'v12_progact_noanchorstate':'v12_progact_noanchorstate_noanchor'};
+const mName=m=>_MNAME[m]||m;
+// method row color by progress-head family: progact* light blue, progreg* light red, else default.
+const mColor=m=>{const t=m.toLowerCase();
+  if(t.includes('progact'))return '#e6f0fb'; if(t.includes('progreg'))return '#fdeaea'; return '';};
+// Ablation-tag legend: what each method-name token means. Prompt examples are the REAL assembled
+// System1 prompt (task goal + subgoal + offline-RL conditioning + discretized state + gripper).
+function renderTagDoc(){
+  const box=document.getElementById('tagdoc-body'); if(!box)return;
+  const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const FULL=[
+    'Task: boil water; Current Subgoal: grasp the kettle',
+    'Quality: Success; Estimated Length: 50; Executed Step: 7',
+    'Initial State: 48 131 0 255 …; Current State: 48 131 0 255 …; Current Gripper: Open;',
+    'Action:',
+  ].join('\n');
+  const pbox=t=>`<pre style="background:#f7f7fa;border:1px solid #ececef;border-radius:5px;padding:6px 8px;margin:4px 0;white-space:pre-wrap;font-size:11.5px">${esc(t)}</pre>`;
+  // progress predictor (exactly one per model)
+  let h='<b>Progress predictor</b> (the <code>prog*</code> prefix — exactly one per model, how the '
+       +'model represents sub-task progress):<ul style="margin:4px 0">'
+    +'<li><code>progcls</code> — progress as a 10-way <b>classification</b> head (decile buckets).</li>'
+    +'<li><code>progreg</code> — progress as a <b>continuous regression</b> head (scalar 0→1).</li>'
+    +'<li><code>progact</code> — progress as a <b>12th action dim</b> (predicted per step, no separate head).</li>'
+    +'<li><code>prognone</code> — no progress signal at all.</li></ul>';
+  h+='<div style="margin:8px 0 2px"><b>Full prompt</b> (no ablations — the default input the model sees):</div>'+pbox(FULL);
+  // language-prompt ablations, each with the concrete line it removes
+  h+='<b>Language-prompt ablations</b> (each token DROPS part of the prompt above; default = all kept):';
+  const rows=[
+    ['noexec','drops only <b>Executed Step</b> from the conditioning line',
+      'Quality: Success; Estimated Length: 50\n   (no "Executed Step: 7")'],
+    ['noestl','drops only <b>Estimated Length</b> from the conditioning line',
+      'Quality: Success; Executed Step: 7'],
+    ['nocond','drops the <b>entire conditioning line</b> (Quality / Estimated Length / Executed Step)',
+      'Task: boil water; Current Subgoal: grasp the kettle\n   (conditioning line gone) → Initial State: …'],
+    ['notask','drops the <b>whole-task goal</b>, keeping only the current subgoal',
+      'Current Subgoal: grasp the kettle\n   (no "Task: boil water")'],
+    ['nostate','drops the <b>entire discretized state block</b> (both Initial + Current State)',
+      'Quality: …; Executed Step: 7\n   (no state ints) → Current Gripper: Open;'],
+    ['noanchorstate','drops only the <b>Initial (anchor) State</b>; the current State stays (shown as "State:")',
+      'State: 48 131 0 255 …; Current Gripper: Open;\n   (no "Initial State: …" half)'],
+    ['nogrip','drops the <b>Current Gripper</b> flag line','… Current State: 48 131 0 255 …;\n   (no "Current Gripper: Open;")'],
+  ];
+  h+='<table style="margin:6px 0"><tr><th class="exp">token</th><th class="exp">effect</th><th class="exp">prompt becomes</th></tr>';
+  rows.forEach(([t,e,ex])=>{h+=`<tr><td class="exp"><code>${t}</code></td><td class="exp">${e}</td><td class="exp">${pbox(ex)}</td></tr>`;});
+  h+='</table>';
+  // non-prompt (vision/state-tensor) ablations
+  h+='<b>Vision / state-tensor ablations</b> (change the model INPUT tensors, not the text prompt):<ul style="margin:4px 0">'
+    +'<li><code>noanchor</code> — the model does <b>not</b> receive the anchor (sub-task start) camera images; only the 3 current views. Prompt text unchanged.</li>'
+    +'<li><em>(<code>noanchorstate</code> above also drops the anchor half of the proprioceptive state tensor, 28-d→14-d.)</em></li></ul>';
+  h+='<div style="color:#888;font-size:12px;margin-top:6px">granularity/verbosity (<code>granfine</code>, <code>verbsimp</code>) describe the subgoal text source; all current runs use fine+simple.</div>';
+  box.innerHTML=h;
+}
 const pct=v=>v==null?'–':(100*v).toFixed(1)+'%';
 const f4=v=>v==null?'–':(+v).toFixed(4);
 async function load(){
-  const d=await (await fetch('/api/stats')).json();
-  // #1 val table
-  let h="<table><tr><th class='exp'>exp_name</th><th>step</th><th>action_mse</th><th>flow_loss</th></tr>";
-  d.val_mse.forEach(r=>h+=`<tr><td class='exp'>${r.exp_name}</td><td>${r.final_step??'–'}</td><td>${f4(r.action_mse)}</td><td>${f4(r.flow_loss)}</td></tr>`);
-  document.getElementById('valtab').innerHTML=h+"</table>";
+  const _ld=document.getElementById('loading');
+  let d;
+  try{
+    d=await (await fetch('/api/stats')).json();
+  }catch(e){
+    if(_ld){_ld.textContent='⚠ failed to load stats: '+e; _ld.style.color='#c0392b';}
+    return;
+  }
+  if(_ld)_ld.remove();   // data in hand -> drop the loading banner
+  renderTagDoc();
+  let h;
   // #2 episode table: overall + category (atomic/composite) + split (seen/unseen) + 2x2 cross,
   // each cell "% (n)"; last column = avg wall-time per episode. Sortable: click a header.
   const cell=(v,c,cnt)=>{const n=cnt&&cnt[c]!=null?cnt[c]:null; return `<td title="${n!=null?n+' episodes':''}">${pct(v[c])}${n!=null?` <span style="color:#aaa">(${n})</span>`:''}</td>`;};
@@ -665,10 +887,35 @@ async function load(){
   const sortKeys={overall:v=>v.all, 'atomic-seen':v=>v.atomic_seen, 'composite-seen':v=>v.composite_seen,
                   'composite-unseen':v=>v.composite_unseen, 'avg s/ep':v=>v.avg_seconds_per_episode};
   window._epSort=window._epSort||{key:'overall',dir:-1};   // default: overall descending
+  // Method-type toggles: a method's name carries tag tokens (progact/progreg/progcls + deviations
+  // noexec/nocond/nostate/notask/noanchor/noanchorstate). Show only methods whose name contains
+  // AT LEAST ONE checked token; if none are checked, show all. Filters BOTH #2 and #2b.
+  const ALL_METHODS=Object.keys(d.episode);
+  const TOKENS=['progact','progreg','progcls','noexec','nocond','nostate','noanchorstate','noanchor','notask','nogrip'];
+  // only offer tokens that actually appear in the loaded methods
+  const availTokens=TOKENS.filter(tk=>ALL_METHODS.some(m=>m.toLowerCase().includes(tk)));
+  window._epTokens=window._epTokens||{};   // token -> checked
+  const methodOn=(m)=>{const ml=m.toLowerCase();
+    const on=availTokens.filter(tk=>window._epTokens[tk]);
+    if(!on.length)return true;                       // nothing checked -> show all
+    return on.some(tk=>ml.includes(tk));};           // OR across checked tokens
+  function renderEpFilter(){
+    const bar=document.getElementById('epfilter'); if(!bar)return;
+    const chip=(tk)=>{const c=!!window._epTokens[tk];
+      const col=tk.startsWith('progact')?'#e6f0fb':tk.startsWith('progreg')?'#fdeaea':'#eee';
+      return `<label style="cursor:pointer;padding:2px 8px;border-radius:10px;border:1px solid ${c?'#b0431c':'#ccc'};background:${c?col:'#fff'};font-weight:${c?'700':'400'}">`+
+             `<input type="checkbox" data-tk="${tk}" ${c?'checked':''} style="margin-right:4px">${tk}</label>`;};
+    bar.innerHTML='<span style="color:#888">show:</span>'+availTokens.map(chip).join('')+
+      `<button id="epclear" style="margin-left:6px;font-size:11px">all</button>`;
+    bar.querySelectorAll('input[data-tk]').forEach(cb=>cb.onchange=()=>{
+      window._epTokens[cb.dataset.tk]=cb.checked; renderEpTable(); renderTaskTab();});
+    const clr=document.getElementById('epclear'); if(clr)clr.onclick=()=>{
+      window._epTokens={}; renderEpFilter(); renderEpTable(); renderTaskTab();};
+  }
   function renderEpTable(){
     const {key,dir}=window._epSort;
     const getv=sortKeys[key]||sortKeys.overall;
-    const rows=Object.entries(d.episode).sort((a,b)=>{
+    const rows=Object.entries(d.episode).filter(([m])=>methodOn(m)).sort((a,b)=>{
       const va=getv(a[1]), vb=getv(b[1]);
       if(va==null&&vb==null)return 0; if(va==null)return 1; if(vb==null)return -1;
       return dir*(vb-va);});
@@ -677,13 +924,9 @@ async function load(){
     let hh="<table><tr><th class='exp'>method</th><th>n</th>"+ecols.map(c=>hdr(c[1])).join("")+hdr('avg s/ep')+"</tr>";
     // color the method cell by progress-head family: progact* = light blue, progreg* = light red
     // (progcls / other = default). Keyed on the token after the vN_ prefix.
-    const mColor=(m)=>{const t=m.toLowerCase();
-      if(t.includes('progact'))return '#e6f0fb';   // light blue
-      if(t.includes('progreg'))return '#fdeaea';   // light red
-      return '';};
     rows.forEach(([m,v])=>{
       const bg=mColor(m); const st=bg?` style="background:${bg}"`:'';
-      hh+=`<tr><td class='exp'${st}>${m}</td><td>${v.n}</td>`+ecols.map(c=>cell(v,c[0],v.counts)).join("")+
+      hh+=`<tr><td class='exp'${st}>${mName(m)}</td><td>${v.n}</td>`+ecols.map(c=>cell(v,c[0],v.counts)).join("")+
          `<td>${v.avg_seconds_per_episode!=null?(+v.avg_seconds_per_episode).toFixed(1):'–'}</td></tr>`;});
     document.getElementById('eptab').innerHTML=hh+"</table>";
     document.querySelectorAll('#eptab th.sortable').forEach(th=>th.onclick=()=>{
@@ -691,50 +934,55 @@ async function load(){
       if(window._epSort.key===k)window._epSort.dir*=-1; else window._epSort={key:k,dir:-1};
       renderEpTable();});
   }
-  renderEpTable();
-  // #2b per-task matrix: rows = tasks (grouped by split), cols = methods, cell = success % (n).
-  const emethods=Object.keys(d.episode);
-  // union of tasks + each task's split, from the per_task maps
+  // #2b per-task matrix: rows = tasks (grouped by split), cols = methods (filtered), cell = s/n.
+  // Wrapped in a function so the type-toggles re-render it alongside #2.
   const taskInfo={};
-  emethods.forEach(m=>{const pt=d.episode[m].per_task||{}; for(const t in pt){taskInfo[t]=taskInfo[t]||pt[t].split;}});
+  Object.keys(d.episode).forEach(m=>{const pt=d.episode[m].per_task||{}; for(const t in pt){taskInfo[t]=taskInfo[t]||pt[t].split;}});
   const splitOrder={atomic_seen:0,composite_seen:1,composite_unseen:2};
   const tasks=Object.keys(taskInfo).sort((a,b)=>{
     const sa=splitOrder[taskInfo[a]]??9, sb=splitOrder[taskInfo[b]]??9;
     return sa!==sb?sa-sb:a.localeCompare(b);});
-  // a cell showing SUCCESSFUL episode count / total (e.g. "7/10"), green-shaded by rate; the % is
-  // in the tooltip. rate is used only for shading.
   const cntCell=(s,n,rate,bold)=>{
     if(n==null||n===0)return '<td style="color:#ccc">–</td>';
     const w=bold?'font-weight:700;':'';
     const r=rate!=null?rate:(s/n);
     return `<td title="${(100*r).toFixed(1)}%" style="${w}background:rgba(46,139,61,${(0.10+0.5*r).toFixed(2)})">${s}<span style="color:#888">/${n}</span></td>`;};
-  // aggregate row (bold): success/total from succ_counts/counts; label spans the task col.
-  const aggRow=(label,aggKey,bg)=>`<tr><td class='exp' style="background:${bg};font-weight:700">${label}</td>`+
-      emethods.map(m=>cntCell((d.episode[m].succ_counts||{})[aggKey], (d.episode[m].counts||{})[aggKey],
-                              d.episode[m][aggKey], true)).join("")+"</tr>";
-  let th="<table><tr><th class='exp'>task</th>"+emethods.map(m=>`<th>${m.replace('_',' ')}</th>`).join("")+"</tr>";
-  // top: TOTAL over all tasks
-  th+=aggRow('TOTAL (all tasks)','all','#dfe6f5');
-  // then each split: a section 'overall' row, then its tasks (no split column)
   const splitLabel={atomic_seen:'atomic-seen',composite_seen:'composite-seen',composite_unseen:'composite-unseen'};
-  for(const sp of ['atomic_seen','composite_seen','composite_unseen']){
-    th+=aggRow(splitLabel[sp]+' — overall', sp, '#eef');
-    tasks.filter(t=>taskInfo[t]===sp).forEach(t=>{
-      th+=`<tr><td class='exp'>${t}</td>`+emethods.map(m=>{const e=(d.episode[m].per_task||{})[t];
-        return cntCell(e?e.s:null, e?e.n:null, e?e.rate:null, false);}).join("")+"</tr>";});
+  function renderTaskTab(){
+    const emethods=Object.keys(d.episode).filter(methodOn);  // respect the type-toggles
+    const aggRow=(label,aggKey,bg)=>`<tr><td class='exp' style="background:${bg};font-weight:700">${label}</td>`+
+        emethods.map(m=>cntCell((d.episode[m].succ_counts||{})[aggKey], (d.episode[m].counts||{})[aggKey],
+                                d.episode[m][aggKey], true)).join("")+"</tr>";
+    let th="<table><tr><th class='exp'>task</th>"+emethods.map(m=>`<th>${mName(m).replace(/_/g,' ')}</th>`).join("")+"</tr>";
+    th+=aggRow('TOTAL (all tasks)','all','#dfe6f5');
+    for(const sp of ['atomic_seen','composite_seen','composite_unseen']){
+      th+=aggRow(splitLabel[sp]+' — overall', sp, '#eef');
+      tasks.filter(t=>taskInfo[t]===sp).forEach(t=>{
+        th+=`<tr><td class='exp'>${t}</td>`+emethods.map(m=>{const e=(d.episode[m].per_task||{})[t];
+          return cntCell(e?e.s:null, e?e.n:null, e?e.rate:null, false);}).join("")+"</tr>";});
+    }
+    document.getElementById('tasktab').innerHTML=th+"</table>";
   }
-  document.getElementById('tasktab').innerHTML=th+"</table>";
-  // #3 subtask table (overall + primitives)
+  renderEpFilter(); renderEpTable(); renderTaskTab();
+  // #3 subtask table: THREE-WAY Gemini verdict (success/failure/uncertain). "success rate" is over
+  // DECIDED spans (success/(success+failure)); uncertain shown separately. Per-primitive = decided-rate.
   const prims=[...new Set(Object.values(d.subtask).flatMap(v=>Object.keys(v.per_primitive||{})))].sort();
-  h="<table><tr><th class='exp'>method</th><th>n</th><th>overall</th>"+prims.map(p=>`<th>${p}</th>`).join("")+"</tr>";
-  Object.entries(d.subtask).forEach(([m,v])=>{h+=`<tr><td class='exp'>${m}</td><td>${v.n}</td><td>${pct(v.overall)}</td>`+
-    prims.map(p=>`<td>${pct(v.per_primitive?.[p])}</td>`).join("")+"</tr>";});
+  h="<table><tr><th class='exp'>method</th><th>decided</th><th>✓ succ</th><th>✗ fail</th><th>? unc</th>"
+    +"<th>success rate<br><span style='font-weight:400;color:#888'>succ/decided</span></th>"
+    +prims.map(p=>`<th>${p}</th>`).join("")+"</tr>";
+  Object.entries(d.subtask).forEach(([m,v])=>{
+    h+=`<tr><td class='exp'>${mName(m)}</td><td>${v.n_decided??'-'}</td>`
+      +`<td>${v.n_success??'-'}</td><td>${v.n_failure??'-'}</td>`
+      +`<td style='color:#888'>${v.n_uncertain??'-'}</td><td><b>${pct(v.overall)}</b></td>`
+      +prims.map(p=>{const c=v.per_primitive_counts?.[p];
+        const tip=c?`✓${c.success} ✗${c.failure} ?${c.uncertain}`:'';
+        return `<td title="${tip}">${pct(v.per_primitive?.[p])}</td>`;}).join("")+"</tr>";});
   document.getElementById('subtab').innerHTML=h+"</table>";
   // grouped bar: episode-all vs subtask-overall per method
   const methods=[...new Set([...Object.keys(d.episode),...Object.keys(d.subtask)])];
   const ds=[
     {label:'episode success (all)',data:methods.map(m=>d.episode[m]?100*(d.episode[m].all||0):null),backgroundColor:COLORS[0]},
-    {label:'subtask gemini (overall)',data:methods.map(m=>d.subtask[m]?100*(d.subtask[m].overall||0):null),backgroundColor:COLORS[1]},
+    {label:'subtask gemini (decided success rate)',data:methods.map(m=>d.subtask[m]&&d.subtask[m].overall!=null?100*d.subtask[m].overall:null),backgroundColor:COLORS[1]},
   ];
   new Chart(document.getElementById('chart'),{type:'bar',data:{labels:methods,datasets:ds},
     options:{responsive:true,scales:{y:{min:0,max:100,title:{display:true,text:'%'}}}}});
@@ -768,9 +1016,13 @@ HOME_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <p>Whole-episode OPEN-LOOP rollouts: reset once to the first subgoal, then roll the policy
        continuously through the subgoal list. Per-subgoal video, prompt, anchor, action chunk, and
        the env <i>_check_success</i> task verdict. Seen (first-5) vs unseen (last-5) episodes.</p></a>
-  <a class="card" href="/subtask"><h2>Subtask Eval<span class="path">/subtask</span></h2>
-    <p>Per-subtask CLOSED-LOOP rollouts: hard-reset to each subgoal start independently. Same rich
-       per-frame panels, plus the oracle GT reference and the Gemini success verdict per subtask.</p></a>
+  <a class="card" href="/milestone"><h2>Milestone Eval<span class="path">/milestone</span></h2>
+    <p>Per-MILESTONE CLOSED-LOOP rollouts: hard-reset to each milestone start, roll through its child
+       subgoals, then an ORACLE-REFERENCED sim-check at the settled end (grasp / pick / place / open
+       / close / turn / navigate) — the reliable success/failure label for offline RL.</p></a>
+  <a class="card" href="/finestep"><h2>Fine-step Eval<span class="path">/finestep</span></h2>
+    <p>Per-child-subgoal CLOSED-LOOP rollouts: hard-reset to each subgoal start independently. Same
+       rich per-frame panels, plus the oracle GT reference and the Gemini success verdict per span.</p></a>
   <a class="card" href="/stats"><h2>Statistics<span class="path">/stats</span></h2>
     <p>Aggregate success across methods: episode success rate (all / atomic / composite / seen /
        unseen), subtask Gemini success by primitive, and final-step validation MSE.</p></a>
@@ -903,20 +1155,31 @@ def gui_js():
 
 
 GUI_JS = r"""
-const RN=window.RN||'subtask';   // rollout root: 'subtask' (#3) or 'episode' (#2)
+const RN=window.RN||'finestep';   // rollout root: 'finestep' | 'milestone' | 'episode'
 const $=s=>document.querySelector(s);
 // Gemini verdict for a subgoal (#3): episode.json.gemini.per_subtask[<child_dir>].success.
 // Map a subtask's Gemini verdict (from the prefetched cache) to true/false/null for track coloring:
 // success->true, failure->false, uncertain/skipped/absent->null.
+// Page-appropriate sim_check verdict for a span (drives the thin green/red line under the track).
+// The line spans the whole UNIT of that page, colored by the unit's sim_check:
+//   /episode   -> EVERY span gets the whole-episode env _check_success (one line over the episode)
+//   /milestone -> every span gets ITS MILESTONE's verdict (line spans the whole milestone), read
+//                 from the milestone-end child of the same milestone_index
+//   /finestep  -> the span's OWN sim_check (line only on the fine-step span itself)
+// Returns true (success) / false (failure) / null (None). No Gemini.
+function _vOf(sc){ if(!sc)return null; if(sc.verdict==='success')return true; if(sc.verdict==='failure')return false; return null; }
 function subVerdict(ep,s){
-  const cd=(s.out_dir||'').split('/').pop();
-  const g=S._verdicts&&S._verdicts[cd];
-  if(!g)return null;
-  const v=g.verdict;
-  if(v==='success')return true;
-  if(v==='failure')return false;
-  if(v===undefined&&typeof g.success==='boolean')return g.success;  // legacy schema
-  return null;   // uncertain / skipped
+  if(RN==='episode'){
+    const es = (ep.episode_success!=null)?ep.episode_success:(ep.sim_success_final!=null?ep.sim_success_final:null);
+    return es===true?true:(es===false?false:null);
+  }
+  if(RN==='milestone'){
+    // color the whole milestone by its verdict: find the milestone-end child of this milestone.
+    const end = (ep.subgoals||[]).find(x=>x.milestone_index===s.milestone_index && (x.is_milestone_end || x.is_terminal));
+    return _vOf((end||s).milestone_sim_check);
+  }
+  // finestep: the span's own sim_check.
+  return _vOf(s.milestone_sim_check || s.subtask_sim_check);
 }
 const S={method:null,eps:[],epi:0,subi:0,steps:null,fps:20,norm:true};
 const esc=s=>(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
@@ -978,7 +1241,7 @@ const LEAN_LABELS=["base_vx","base_vy","yaw_v","ctrl","eef_dx","eef_dy","eef_dz"
 // grip[6] base[7:11] ctrl[11]; lean: base_vx,base_vy(=base[0,1]=sim7,8), yaw_v(=base[3]=sim10),
 // ctrl(sim11), eef_dx..dz(sim0..2), d_roll..d_yaw(sim3..5), grip(sim6).
 function sim12ToLean11(a){return [a[7],a[8],a[10],a[11],a[0],a[1],a[2],a[3],a[4],a[5],a[6]];}
-function stateBlock(vals,groups){return groups.map(([n,s,e])=>`  ${n.padEnd(12)} ${vals.slice(s,e).map(x=>Number(x).toFixed(3).padStart(8)).join(' ')}`).join("\n");}
+function stateBlock(vals,groups){if(!vals)return '';return groups.map(([n,s,e])=>`  ${n.padEnd(12)} ${vals.slice(s,e).map(x=>Number(x).toFixed(3).padStart(8)).join(' ')}`).join("\n");}
 
 // scalar progress in [0,1] from a step's progress_raw. classes -> argmax CLASS normalized
 // (argmax/(K-1)): a faithful staircase of the classifier's discrete decile prediction, NOT the
@@ -1079,7 +1342,11 @@ async function loadEpisodes(){
   const prevType=$('#tasktype').value||null, prevTask=$('#task').value||null;
   const prevEpName=(S.eps&&S.eps[S.epi])?S.eps[S.epi].episode_id.split('/').pop():null;
   S.method=$('#method').value;
-  S.eps=await (await fetch(`/api/${RN}/episodes/`+S.method)).json();
+  // LAZY: fetch only the lightweight list (episode_id/task_name/n_subgoals) from index.json — the
+  // full per-episode doc (subgoals) is loaded on demand in selectEpisode(). Avoids reading ~1000
+  // episode.json (~10 MB) just to fill the dropdowns.
+  S.eps=await (await fetch(`/api/${RN}/episode_list/`+S.method)).json();
+  S._full={};   // cache: episode index -> full doc, populated lazily on selection
   // TYPE dropdown: the splits present among this method's tasks, in canonical order.
   const present=new Set(S.eps.map(e=>taskSplit(e.task_name)));
   const types=TYPE_ORDER.filter(t=>present.has(t)).concat([...present].filter(t=>!TYPE_ORDER.includes(t)));
@@ -1115,16 +1382,25 @@ function fillEpisodes(keepEpName){
 // Prefetch every subtask's Gemini verdict for this episode into S._verdicts (keyed by child_dir),
 // so subVerdict()/the track/the panel all read one cache instead of re-fetching. Verdicts now live
 // per-subtask in judge/gemini.json (three-way verdict/completion/confidence/reason + skip info).
-async function loadVerdicts(ep){
-  S._verdicts={};
-  const epf=ep.episode_id.replaceAll('/','__');
-  await Promise.all((ep.subgoals||[]).map(async sg=>{
-    const cd=sg.out_dir.split('/').pop();
-    try{ const g=await (await fetch(`/api/${RN}/gemini/${S.method}/${epf}/${cd}`)).json();
-         if(g) S._verdicts[cd]=g; }catch(e){}
-  }));
+// Gemini judge removed — verdicts now come from the per-span sim_check stored in the episode doc.
+async function loadVerdicts(ep){ S._verdicts={}; }
+// LAZY-LOAD the full episode doc (subgoals + fields) on selection, replacing the lightweight list
+// entry in S.eps[i] so the track/subtask panels get the real data. Cached in S._full so
+// re-selecting the same episode is instant (no refetch).
+async function selectEpisode(i){
+  S.epi=i; S.subi=0;
+  let ep=S.eps[i];
+  if(!ep.subgoals){
+    if(!S._full[i]){
+      const epf=ep.episode_id.replaceAll('/','__');
+      S._full[i]=await (await fetch(`/api/${RN}/episode/${S.method}/${epf}`)).json();
+    }
+    // merge full doc into S.eps[i] (keep list fields) so downstream code reads S.eps[S.epi].subgoals
+    S.eps[i]=Object.assign({}, ep, S._full[i]);
+    ep=S.eps[i];
+  }
+  await loadVerdicts(ep); drawTrack(); await selectSub(0);
 }
-async function selectEpisode(i){ S.epi=i; S.subi=0; await loadVerdicts(S.eps[i]); drawTrack(); await selectSub(0); }
 
 function drawTrack(){
   const ep=S.eps[S.epi]; const subs=ep.subgoals;
@@ -1135,11 +1411,12 @@ function drawTrack(){
   const pct=(x)=>100*x/T;
   const msSegs=Object.entries(ms).map(([k,v])=>`<div class="pb-seg pb-ms ${+k===curMs?'cur':''}" style="left:${pct(v.a)}%;width:${pct(v.b-v.a+1)}%" title="${esc(v.text)}" data-ms="${k}">${esc(v.text)}</div>`).join("");
   const fsSegs=subs.map((s,i)=>{
-    const v=subVerdict(ep,s);   // gemini success: true/false/null
-    const vc=v===true?'#2e8b3d':(v===false?'#b0431c':'');   // green / red / default
-    const adv=(s.advanced===true)?' ✓':(s.advanced===false?' ⧗':'');  // #2: stop fired / timeout
+    const v=subVerdict(ep,s);   // sim_check success: true/false/null (page-appropriate)
+    const vc=v===true?'#2e8b3d':(v===false?'#b0431c':'');   // green / red / default (None)
+    const adv=(s.advanced===true)?' ✓':(s.advanced===false?' ⧗':'');  // self-stop fired / timeout
     const style=`left:${pct(s.span[0])}%;width:${pct(s.span[1]-s.span[0]+1)}%`+(vc?`;box-shadow:inset 0 -3px 0 ${vc}`:'');
-    return `<div class="pb-seg pb-fs ${i===S.subi?'cur':''}" style="${style}" title="[${s.primitive}] ${esc(s.subgoal)}${v===null?'':' | gemini:'+(v?'PASS':'FAIL')}" data-sub="${i}">${esc(s.subgoal)}${adv}</div>`;
+    const vt=v===null?'':' | sim_check:'+(v?'SUCCESS':'FAIL');
+    return `<div class="pb-seg pb-fs ${i===S.subi?'cur':''}" style="${style}" title="[${s.primitive}] ${esc(s.subgoal)}${vt}" data-sub="${i}">${esc(s.subgoal)}${adv}</div>`;
   }).join("");
   $('#track').innerHTML=`<div class="pb-row"><div class="pb-lab">milestones</div><div class="pb-lane">${msSegs}</div></div>
     <div class="pb-row"><div class="pb-lab">subgoals</div><div class="pb-lane">${fsSegs}</div></div>`;
@@ -1153,21 +1430,12 @@ async function selectSub(i){
   S.fps=S.steps.fps||20;
   $('#subpos').textContent=`subtask ${i} / ${ep.subgoals.length-1}`;
   $('#prevSub').disabled=i<=0; $('#nextSub').disabled=i>=ep.subgoals.length-1;
-  // primchip: primitive + subgoal, plus (#3) the Gemini verdict, plus (#2) episode success banner.
-  const cd0=(sg.out_dir||'').split('/').pop();
-  const g0=S._verdicts&&S._verdicts[cd0];
-  const vtxt = g0 ? ('  · gemini: '+ (g0.skipped?'SKIPPED':(g0.verdict||(g0.success===true?'success':g0.success===false?'failure':'—')).toUpperCase())) : '';
-  const reset=(RN==='episode')?'  · reset: first-only':'  · reset: hard (GT)';
-  $('#primchip').textContent=`[${sg.primitive}] ${sg.subgoal}${vtxt}${reset}`;
+  // primchip: primitive + subgoal + the reset mode for this page.
+  const reset=(RN==='episode')?'  · reset: first-only':(RN==='milestone')?'  · reset: per-milestone (GT)':'  · reset: per-subgoal (GT)';
+  $('#primchip').textContent=`[${sg.primitive}] ${sg.subgoal}${reset}`;
   let ms=`milestone: ${sg.milestone_subgoal||sg.milestone_index}`;
   if(ep.episode_success!=null)ms+=`  ·  EPISODE: ${ep.episode_success?'SUCCESS':'fail'} (advanced ${ep.n_advanced}/${ep.n_subgoals})`;
-  else if(S._verdicts){
-    // episode gemini task rate = success / (success+failure) over judged (non-skipped) subtasks.
-    let s=0,d=0; for(const k in S._verdicts){const g=S._verdicts[k]; if(g.skipped)continue;
-      const v=g.verdict||(g.success===true?'success':g.success===false?'failure':null);
-      if(v==='success'){s++;d++;} else if(v==='failure'){d++;}}
-    if(d)ms+=`  ·  gemini task rate: ${(100*s/d).toFixed(0)}% (${s}/${d})`;
-  }
+  else if(ep.sim_success_final!=null)ms+=`  ·  EPISODE _check_success: ${ep.sim_success_final?'SUCCESS':'fail'}`;
   $('#mschip').textContent=ms;
   buildSeries();
   drawTrack();
@@ -1177,51 +1445,37 @@ async function selectSub(i){
   $('#slider').max=S.steps.steps.length-1; $('#slider').value=0; showFrame(0);
 }
 
-// TASK SUCCESS panel: episode success (#2) OR subtask Gemini verdict + reasoning (#3),
-// plus the model's self-stop info and the current progress readout.
+// TASK SUCCESS panel — TWO signals only (no Gemini):
+//   (1) sim_check — page-appropriate: /episode = env _check_success (only decisive at the terminal
+//       span, else None); /milestone + /finestep = the milestone criterion (decisive only at each
+//       milestone's ENDING span, with a rollout-vs-oracle explanation of WHY on failure).
+//   (2) self-stopped — did the policy self-terminate (progress+quiescence) or hit the budget cap.
 async function renderSuccess(){
   const el=$('#success'); if(!el)return;
   const ep=S.eps[S.epi], sg=ep.subgoals[S.subi];
-  const cd=(sg.out_dir||'').split('/').pop();
   const rows=[];
   const row=(k,v,cls)=>`<div class="pf"><span class="pfk">${k}</span><span class="pfv ${cls||''}">${v}</span></div>`;
-  const yn=b=>b===true?'<b style="color:#2e8b3d">SUCCESS</b>':(b===false?'<b style="color:#b0431c">FAIL</b>':'—');
-  if(RN==='episode' || ep.episode_success!=null){
-    // Whole-episode ground truth: the RoboCasa env's own _check_success() at the end of the
-    // open-loop rollout. THIS is the task-success verdict.
-    rows.push(row('TASK SUCCESS &nbsp;<span style="font-weight:400;color:#888">(env _check_success @ end)</span>',
-                  yn(ep.episode_success), 'hl'));
-    // How far the policy got: how many subgoals it self-terminated ("advanced past") before
-    // either finishing or hitting a budget cap. NOT a per-subgoal success signal.
-    rows.push(row('subgoals reached', `${ep.n_advanced} of ${ep.n_subgoals} self-advanced`));
-    // This subgoal: did the policy DECIDE it was done and move on, or did it run out of budget?
-    // (advanced = self-stopped & moved to next; NOT "this subgoal succeeded".)
-    const adv = (sg.advanced===true) ? '<b style="color:#2e8b3d">advanced → moved to next</b>'
-              : (sg.advanced===false) ? '<b style="color:#b0431c">timed out (budget cap)</b>' : '—';
-    rows.push(row('this subgoal', adv));
-    if(sg.stop_reason&&sg.stop_reason.timeout)rows.push(row('why it stopped', 'budget cap reached — policy never self-stopped'));
-    else if(sg.advanced)rows.push(row('why it stopped', 'progress ≥ threshold AND motion quiescent'));
+  const lab=v=>v==='success'?'<b style="color:#2e8b3d">SUCCESS</b>':v==='failure'?'<b style="color:#b0431c">FAIL</b>':'<span style="color:#999">None</span>';
+
+  if(RN==='episode'){
+    // whole-episode env _check_success (decisive only at the terminal span).
+    const es = (sg.is_terminal||sg.sim_success_final!=null) ? (ep.episode_success??sg.sim_success_final) : null;
+    rows.push(row('sim_check (episode) <span style="font-weight:400;color:#888">env _check_success @ end</span>',
+                  lab(es===true?'success':es===false?'failure':null), 'hl'));
+    if(ep.n_advanced!=null)rows.push(row('subgoals reached', `${ep.n_advanced} of ${ep.n_subgoals} self-advanced`));
   } else {
-    // subtask (#3): env auxiliary + Gemini three-way verdict + completion + confidence + reasoning
-    // (from the prefetched judge/gemini.json cache).
-    rows.push(row('sim _check_success (aux)', yn(sg.sim_success_final)));
-    rows.push(row('self-stopped', sg.stopped==null?'—':(sg.stopped?'yes (progress+quiescence)':'no (budget cap)')));
-    const g=S._verdicts&&S._verdicts[cd];
-    // verdict label: color success/failure/uncertain; SKIPPED (low-movement gate) shown distinctly.
-    const vlabel=(g)=>{
-      if(g.skipped)return '<b style="color:#999">SKIPPED</b> <span style="color:#999;font-weight:400">(low movement — not judged)</span>';
-      const v=g.verdict||(g.success===true?'success':g.success===false?'failure':null);
-      if(v==='success')return '<b style="color:#2e8b3d">SUCCESS</b>';
-      if(v==='failure')return '<b style="color:#b0431c">FAILURE</b>';
-      if(v==='uncertain')return '<b style="color:#b08a1c">UNCERTAIN</b>';
-      return '—';
-    };
-    // Gemini reason FIRST (the analysis), then the verdict/completion/confidence it concludes.
-    if(g&&g.reason)rows.push(`<div class="pf stack"><span class="pfk">gemini reason</span><span class="pfv">${esc(g.reason)}</span></div>`);
-    rows.push(row('GEMINI verdict', g?vlabel(g):'(not judged)', 'hl'));
-    if(g&&!g.skipped&&g.completion!=null)rows.push(row('completion', g.completion));
-    if(g&&g.confidence!=null)rows.push(row('confidence', (+g.confidence).toFixed(2)));
+    // milestone / finestep: the span's own sim_check verdict + the WHY (rollout vs oracle numbers).
+    const sc = sg.milestone_sim_check || sg.subtask_sim_check || {};
+    const lbl = sc.verdict==='reference' ? '<span style="color:#1c6bb0">REFERENCE (oracle)</span>' : lab(sc.verdict);
+    const tag = (RN==='milestone') ? 'sim_check (milestone)' : 'sim_check (finestep = milestone criterion)';
+    rows.push(row(tag+(sc.rule?` <span style="font-weight:400;color:#888">${sc.rule}</span>`:''), lbl, 'hl'));
+    // detail: the rollout-vs-oracle comparison + why it failed (only meaningful for milestone check).
+    if(sc.detail)rows.push(`<div class="pf stack"><span class="pfk">why</span><span class="pfv">${esc(sc.detail)}</span></div>`);
   }
+  // (2) self-stopped — same for all pages.
+  const adv = (sg.advanced===true||sg.stopped===true) ? '<b style="color:#2e8b3d">yes → self-stopped (progress+quiescence)</b>'
+            : (sg.advanced===false||sg.stopped===false) ? '<b style="color:#b0431c">no → timed out (budget cap)</b>' : '—';
+  rows.push(row('self-stopped', adv));
   // current-step progress readout (argmax class for progcls) — id'd so showFrame can refresh it
   const cur=S._curStep||(S.steps&&S.steps.steps?S.steps.steps[0]:null);
   rows.push(`<div class="pf"><span class="pfk">progress @ frame</span><span class="pfv hl" id="succ-prog">${cur?progLabel(cur.progress_raw):'—'}</span></div>`);
@@ -1246,10 +1500,10 @@ function renderStatic(){
           <div><span class="key">subgoal</span><span class="val">${esc(d.subgoal)}</span></div>
           <div><span class="key">detail</span><span class="val">${esc(d.subgoal_detail||'—')}</span></div>
           <div><span class="key">milestone</span><span class="val">${esc(d.milestone_subgoal||'—')}</span></div>
-          <div><span class="key">span</span><span class="val">[${d.span.join(', ')}] (len ${d.summary.span_len}) · est_len ${d.summary.est_length}</span></div>
-          <div><span class="key">budget</span><span class="val">${d.budget} steps (settle ${d.settle_steps})</span></div>
-          <div><span class="key">1st-chunk mse</span><span class="val">${(d.summary.first_chunk_action_mse??0).toFixed(4)} · mean-step ${(d.summary.mean_step_action_mse??0).toFixed(4)}</span></div>
-          <div><span class="key">sim_success</span><span class="val">final ${d.summary.sim_success_final} · any ${d.summary.sim_success_any}</span></div>
+          <div><span class="key">span</span><span class="val">[${(d.span||[]).join(', ')}]${d.summary?` (len ${d.summary.span_len}) · est_len ${d.summary.est_length}`:''}</span></div>
+          <div><span class="key">budget</span><span class="val">${d.budget!=null?d.budget+' steps':'—'}${d.settle_steps!=null?' (settle '+d.settle_steps+')':''}</span></div>
+          ${d.summary?`<div><span class="key">1st-chunk mse</span><span class="val">${(d.summary.first_chunk_action_mse??0).toFixed(4)} · mean-step ${(d.summary.mean_step_action_mse??0).toFixed(4)}</span></div>`:''}
+          ${d.summary?`<div><span class="key">sim_success</span><span class="val">final ${d.summary.sim_success_final} · any ${d.summary.sim_success_any}</span></div>`:''}
           <div><span class="key">base_pos_ref</span><span class="val">[${(d.base_pos_ref||[]).map(x=>x.toFixed(3)).join(', ')}] yaw ${(d.base_yaw_ref??0).toFixed(4)}</span></div>
         </div>
       </div>
@@ -1265,7 +1519,7 @@ function renderStatic(){
     <div class="col">
       <div class="card">
         <h3>rollout — clean video (subtask ${d.child_index}: ${esc(d.subgoal)})</h3>
-        <video id="vid" class="half" muted></video>
+        <video id="vid" class="half" muted preload="metadata"></video>
         <div class="vidnav">
           <button id="play">▶ play</button>
           <button id="bb">‹ frame</button><button id="ff">frame ›</button>
@@ -1359,6 +1613,10 @@ function resetVideoForClip(srcUrl){
     S._rvfc=null;
   }
   $('#play').textContent='▶ play';
+  // preload only metadata: these clips are full-res GOP=1 and can be 1-15 MB; eagerly buffering the
+  // whole file on load() is what made big composite milestones slow. metadata + Range streaming lets
+  // the browser fetch just the header, then seek/play on demand.
+  v.preload='metadata';
   v.src=srcUrl;
   v.load();            // ensure the new source is actually loaded (some browsers keep the old buffer)
 }
@@ -1472,6 +1730,9 @@ function renderNormable(){
 
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT')return;
+  // Shift+Left/Right jumps SUBTASK (same as Up/Down); plain Left/Right steps one video FRAME.
+  if(e.key==='ArrowRight'&&e.shiftKey){e.preventDefault();selectSub(S.subi+1);return;}
+  if(e.key==='ArrowLeft'&&e.shiftKey){e.preventDefault();selectSub(S.subi-1);return;}
   if(e.key==='ArrowRight'){e.preventDefault();stepFrame(1);}
   if(e.key==='ArrowLeft'){e.preventDefault();stepFrame(-1);}
   if(e.key==='ArrowDown'){e.preventDefault();selectSub(S.subi+1);}
@@ -1491,8 +1752,11 @@ loadMethods();
 def main():
     global ROOT, ROOTS, VAL_MSE_DIR
     p = argparse.ArgumentParser()
-    p.add_argument("--rollout-root", type=Path, required=True,
-                   help="SUBTASK rollout tree (subtask_eval.py output) -> /subtask")
+    # --finestep-root is the primary; --rollout-root kept as a back-compat alias for the same tree.
+    p.add_argument("--finestep-root", "--rollout-root", dest="finestep_root", type=Path, default=None,
+                   help="FINE-STEP rollout tree (subtask_eval.py output) -> /finestep")
+    p.add_argument("--milestone-root", type=Path, default=None,
+                   help="MILESTONE rollout tree (milestone_eval.py output) -> /milestone")
     p.add_argument("--episode-root", type=Path, default=None,
                    help="EPISODE rollout tree (episode_eval.py output) -> /episode")
     p.add_argument("--val-mse-dir", type=Path, default=Path("eval_out/val_mse"),
@@ -1500,12 +1764,18 @@ def main():
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8092)
     args = p.parse_args()
-    ROOT = args.rollout_root.resolve()
-    ROOTS = {"subtask": ROOT}
+    if args.finestep_root is None:
+        raise SystemExit("--finestep-root (or --rollout-root) is required")
+    ROOT = args.finestep_root.resolve()          # legacy default root = finestep
+    ROOTS = {"finestep": ROOT}
+    if args.milestone_root is not None:
+        ROOTS["milestone"] = args.milestone_root.resolve()
     if args.episode_root is not None:
         ROOTS["episode"] = args.episode_root.resolve()
     VAL_MSE_DIR = args.val_mse_dir.resolve()
-    print(f"Serving subtask rollouts from {ROOT}  ->  http://{args.host}:{args.port}/subtask")
+    print(f"Serving finestep rollouts from {ROOT}  ->  http://{args.host}:{args.port}/finestep")
+    if "milestone" in ROOTS:
+        print(f"  milestone rollouts from {ROOTS['milestone']}  ->  /milestone")
     if "episode" in ROOTS:
         print(f"  episode rollouts from {ROOTS['episode']}  ->  /episode")
     print(f"  val_mse curves from {VAL_MSE_DIR}  ->  /val_mse")

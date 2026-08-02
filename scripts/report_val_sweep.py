@@ -16,7 +16,7 @@ import re
 import time
 
 OPENPI = pathlib.Path("/home/yinpei.dai/openpi")
-OUT_DIR = OPENPI / "_evallogs" / "valmse_results"
+OUT_DIR = OPENPI / "m0717_eval_results" / "valmse_results"
 JOBLOG_DIR = OUT_DIR / "joblogs"
 MASTER = OPENPI / "_evallogs" / "sweep_master.log"
 TOTAL_JOBS = 40

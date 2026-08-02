@@ -3,14 +3,15 @@
 A subgoal is considered "done" when BOTH signals fire (user-specified AND, not OR):
 
   1. PROGRESS at threshold — per progress method (see `_read_progress` in subtask_eval.py):
-       - "action"     (progress-as-action): the model's per-horizon progress chunk end
-                        value ``progress_end >= progress_thresh``.
+       - "action"     (progress-as-action): ``progress_now >= progress_thresh`` (chunk[0], the
+                        current progress — NOT progress_end/chunk[-1], which is the model's forecast
+                        for the chunk end and fires too early since a gripper open/close takes time).
        - "classes"    (10-way): argmax bucket == last class (K-1), i.e. "class 10".
        - "continuous" (regression scalar): ``progress_now >= progress_thresh``.
-  2. QUIESCENCE — the last ``window`` executed steps all have a near-zero *commanded*
-     end-effector + base action (the EEF/base action norm below ``eps``). This is the
-     "the model has clearly stopped moving" signal that distinguishes a settle/hold from
-     ordinary motion.
+  2. QUIESCENCE — the last ``window`` executed steps all have a near-zero *commanded* motion:
+     EEF (pos+rot) + base + |Δgripper| (change in the open/close command) below ``eps``. Including
+     the gripper DELTA means a place/release where the arm is still but the fingers are actively
+     opening/closing counts as MOVING (not quiescent); a steady "hold closed" (Δ=0) stays quiescent.
 
 Both #2 (episode-level) and #3 (subtask-level) eval use this so their stop behavior is
 identical and tunable from one place. Thresholds are conservative defaults; expose them as
@@ -45,7 +46,11 @@ def progress_complete(prog: dict | None, cfg: StopConfig) -> bool:
         return False
     kind = prog.get("progress_kind")
     if kind == "action":
-        return float(prog.get("progress_end", 0.0)) >= cfg.progress_thresh
+        # Use progress_NOW (chunk[0]), NOT progress_end (chunk[-1]). progress_end is the model's
+        # forecast for the END of the action chunk, which fires too EARLY: e.g. it predicts 1.0 while
+        # progress_now is still ~0.86, but a gripper open/close (place/release) takes real time the
+        # forecast skips. Gating on progress_now waits until the subgoal is ACTUALLY near-complete.
+        return float(prog.get("progress_now", 0.0)) >= cfg.progress_thresh
     if kind == "classes":
         k = prog.get("progress_num_classes")
         last = cfg.complete_class if cfg.complete_class is not None else (int(k) - 1 if k else None)
@@ -58,18 +63,25 @@ def progress_complete(prog: dict | None, cfg: StopConfig) -> bool:
     return False
 
 
-def action_eef_base_norm(action_sim: np.ndarray) -> float:
-    """L2 norm of the EEF (pos+rot) + base motion components of a robosuite-native 12-d
-    action, i.e. everything that moves the robot EXCEPT the gripper open/close + control_mode.
+def action_eef_base_norm(action_sim: np.ndarray, prev_grip: float | None = None) -> float:
+    """L2 norm of the motion components of a robosuite-native 12-d action, INCLUDING the gripper
+    DELTA (change in the open/close command since the previous step).
 
     Robosuite-native 12-d layout (see subtask_eval.py SIM_*_IDX + lerobot_action_to_sim):
         [0:3] eef_pos, [3:6] eef_rot, [6] gripper_close, [7:11] base_motion, [11] control_mode.
-    "Motion" = eef_pos+rot ([0:6]) + base ([7:11]); gripper ([6]) and control_mode ([11]) are
-    excluded (a hold/settle commands zero motion but may still hold the gripper closed).
+    "Motion" = eef_pos+rot ([0:6]) + base ([7:11]) + |Δgripper| (|a[6] − prev_grip|). The gripper
+    command is an ABSOLUTE open/close target, so we use its DELTA: a place/release where the arm is
+    still but the gripper is actively opening/closing IS moving (the fingers take real time), and the
+    old rule (gripper excluded) wrongly read it as quiescent. Once the gripper command HOLDS constant
+    (Δ=0) the term vanishes, so a steady "hold closed" still counts as quiescent — as intended.
+    control_mode ([11]) is excluded. prev_grip=None -> gripper term omitted (first step).
     """
     a = np.asarray(action_sim, dtype=np.float64).reshape(-1)
     if a.size >= 12:
-        motion = np.concatenate([a[0:6], a[7:11]])
+        parts = [a[0:6], a[7:11]]
+        if prev_grip is not None:
+            parts.append(np.array([a[6] - float(prev_grip)]))
+        motion = np.concatenate(parts)
     elif a.size >= 6:
         motion = a[0:6]  # at least the EEF part
     else:
@@ -85,12 +97,16 @@ class StopTracker:
     cfg: StopConfig
     _norms: deque = field(init=False)
     _last_progress: dict | None = field(default=None, init=False)
+    _prev_grip: float | None = field(default=None, init=False)   # previous gripper command (for Δ)
 
     def __post_init__(self):
         self._norms = deque(maxlen=max(1, self.cfg.window))
 
     def update(self, action_sim: np.ndarray, prog: dict | None) -> None:
-        self._norms.append(action_eef_base_norm(action_sim))
+        a = np.asarray(action_sim, dtype=np.float64).reshape(-1)
+        self._norms.append(action_eef_base_norm(a, prev_grip=self._prev_grip))
+        if a.size >= 7:
+            self._prev_grip = float(a[6])   # remember for next step's gripper delta
         if prog:  # progress is only produced on replan steps; keep the latest
             self._last_progress = prog
 
