@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Extract compact, DURABLE episode-eval results per checkpoint into
-m0717_eval_results/episode_results/<method>.json — so the eval results survive deleting the big
-per-episode video/steps dirs under m0717_eval_results/episode/<method>/.
+eval_results/episode_results/<method>.json — so the eval results survive deleting the big
+per-episode video/steps dirs under eval_results/episode/<method>/.
 
 Each method's episode/<method>/index.json is already the compact summary (~200 KB: per-episode
 episode_success / task_name / seconds + totals) vs. ~9 GB of videos. This copies that index into
@@ -17,8 +17,8 @@ import glob
 import shutil
 from pathlib import Path
 
-EP_ROOT = Path("m0717_eval_results/episode")
-OUT = Path("m0717_eval_results/episode_results")
+EP_ROOT = Path("eval_results/episode")
+OUT = Path("eval_results/episode_results")
 
 
 def _rebuild_from_disk(mdir: Path) -> dict:
@@ -28,11 +28,17 @@ def _rebuild_from_disk(mdir: Path) -> dict:
             d = json.loads(Path(f).read_text())
         except Exception:
             continue
+        # episode.json persists its own `seconds` (newer runs), so a rebuild keeps per-episode
+        # timing even when the parallel-shard index.json race lost it. Older docs -> None.
         eps.append(dict(episode_id=d.get("episode_id"), task_name=d.get("task_name"),
                         episode_success=d.get("episode_success", d.get("sim_success_final")),
                         n_advanced=d.get("n_advanced"), n_subgoals=d.get("n_subgoals"),
-                        seconds=None))
+                        seconds=d.get("seconds")))
+    done = [e["seconds"] for e in eps if e.get("seconds") is not None]
+    total_s = round(sum(done), 1) if done else None
     return dict(eval_kind="episode", method=mdir.name, n_episodes=len(eps),
+                total_seconds=total_s,
+                avg_seconds_per_episode=round(total_s / len(done), 1) if done else None,
                 episodes=sorted(eps, key=lambda e: e.get("episode_id") or ""))
 
 

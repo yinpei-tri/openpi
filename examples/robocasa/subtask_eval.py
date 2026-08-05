@@ -572,7 +572,7 @@ def rollout_subgoal(env, sim, client, sim_states, sim_actions, sg: Subgoal, *,
 def _load_oracle_milestone_refs(out_root: Path, oracle_method: str, episode_id: str) -> dict:
     """Load {str(milestone_index): ref} from the MILESTONE oracle run's episode.json. finestep reuses
     the milestone oracle refs (the milestone dir is a SIBLING of the finestep dir under the shared
-    m0717_eval_results root — out_root here is .../finestep, so hop to .../milestone)."""
+    eval_results root — out_root here is .../finestep, so hop to .../milestone)."""
     ms_root = out_root.parent / "milestone" / oracle_method
     f = ms_root / episode_id.replace("/", "__") / "episode.json"
     if not f.is_file():

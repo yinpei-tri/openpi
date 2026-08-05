@@ -76,7 +76,7 @@ def launch_eval(exp):
     env = dict(os.environ)
     env.update(
         SWEEP_EXP_GLOB=exp,                 # exact dir name = target only this exp
-        SWEEP_OUT_DIR=f"{OPENPI}/m0717_eval_results/valmse_results",
+        SWEEP_OUT_DIR=f"{OPENPI}/eval_results/valmse_results",
         SWEEP_SHARDS=f"{OPENPI}/robocasa_training_data/system1_midset_0717_val/shards",
         SWEEP_N_GPUS="1", SWEEP_SLOTS_PER_GPU="1", SWEEP_GPUS=EVAL_GPU,
         SWEEP_XLA_FRAC=XLA_FRAC, SWEEP_MIN_STEP="20000",

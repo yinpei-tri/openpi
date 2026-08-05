@@ -28,7 +28,7 @@ CKPT_ROOT = OPENPI / "checkpoints"
 # the train-set sweep (same 40 ckpts, same 32768-sample eval). Defaults = the val sweep.
 VAL_SHARDS = os.environ.get(
     "SWEEP_SHARDS", str(OPENPI / "robocasa_training_data" / "system1_midset_0717_val" / "shards"))
-OUT_DIR = pathlib.Path(os.environ.get("SWEEP_OUT_DIR", str(OPENPI / "m0717_eval_results" / "valmse_results")))
+OUT_DIR = pathlib.Path(os.environ.get("SWEEP_OUT_DIR", str(OPENPI / "eval_results" / "valmse_results")))
 JOBLOG_DIR = OUT_DIR / "joblogs"
 
 NUM_BATCHES = 512          # 512 * 64 = 32768 samples/ckpt

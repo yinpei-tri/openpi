@@ -178,3 +178,6 @@ cython_debug/
 robocasa_training_data/
 openpi_pretrained_model
 eval_out/
+eval_results/
+_evallogs/
+interactive_eps.txt

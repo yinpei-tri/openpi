@@ -38,8 +38,8 @@ VAL_MSE_DIR: Path = Path("eval_out/val_mse")  # eval #1 curves (scripts/eval_val
 # <exp>__<step>.json = {exp_name, steps:[{step, action_mse, progress_acc, progress_mae,
 # progress_mode}]}. The /val_mse page overlays both splits with per-split + per-method toggles.
 MSE_DIRS: dict[str, Path] = {
-    "val": Path("m0717_eval_results/valmse_results"),
-    "train": Path("m0717_eval_results/trainmse_results"),
+    "val": Path("eval_results/valmse_results"),
+    "train": Path("eval_results/trainmse_results"),
 }
 
 
@@ -440,7 +440,7 @@ def _target_split_map() -> dict[str, str]:
 # DURABLE per-checkpoint episode results (compact summaries extracted by
 # scripts/extract_episode_results.py). These SURVIVE deleting the big per-episode video dirs under
 # episode/<m>/, and are the PREFERRED source for /stats #2. Falls back to episode/<m>/index.json.
-EPISODE_RESULTS_DIR = Path("m0717_eval_results/episode_results")
+EPISODE_RESULTS_DIR = Path("eval_results/episode_results")
 
 
 def _episode_index_docs() -> dict:

@@ -24,11 +24,11 @@ Run (robocasa micromamba env):
     PY=/home/yinpei.dai/micromamba/envs/robocasa/bin/python
     # 1) oracle reference (no server):
     $PY examples/robocasa/milestone_eval.py --episode-list eps.txt --oracle \
-        --out-root m0717_eval_results/milestone --method oracle
+        --out-root eval_results/milestone --method oracle
     # 2) policy (reads the oracle refs):
     $PY examples/robocasa/milestone_eval.py --episode-list eps.txt --host 127.0.0.1 --port 8020 \
         --norm-stats checkpoints/<exp>/49999/assets/robocasa_system1/norm_stats.json \
-        --out-root m0717_eval_results/milestone --method v4_progreg_noexec --oracle-method oracle
+        --out-root eval_results/milestone --method v4_progreg_noexec --oracle-method oracle
 """
 
 from __future__ import annotations
@@ -279,7 +279,7 @@ def main():
     ap.add_argument("--episode-list", required=True)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8010)
-    ap.add_argument("--out-root", type=Path, default=Path("m0717_eval_results/milestone"))
+    ap.add_argument("--out-root", type=Path, default=Path("eval_results/milestone"))
     ap.add_argument("--method", required=True)
     ap.add_argument("--oracle", action="store_true",
                     help="ORACLE mode: replay GT actions + CAPTURE the per-milestone reference "

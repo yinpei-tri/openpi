@@ -221,6 +221,7 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
 
 
 def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str, norm_stats=None) -> dict:
+    _ep_t0 = time.time()
     ann = load_subgoals(episode_dir, args.subgoal_method)
     env = make_camera_env(ann.lerobot_dir)
     flat = ann.episode_id.replace("/", "__")
@@ -307,7 +308,10 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str, n
         ep_doc = dict(method=method, episode_id=ann.episode_id, task_name=ann.task_name,
                       instruction=ann.instruction, n_subgoals=len(ann.subgoals),
                       eval_kind="episode", episode_success=episode_success,
-                      n_advanced=n_advanced, subgoals=records, error=None)
+                      n_advanced=n_advanced, subgoals=records, error=None,
+                      # Persist per-episode wall-time IN the episode.json too (not just the index),
+                      # so a rebuild-from-disk (when parallel shards race index.json) keeps timing.
+                      seconds=round(time.time() - _ep_t0, 2))
         (ep_out / "episode.json").write_text(json.dumps(ep_doc, indent=1))
         print(f"  {ann.task_name}: success={episode_success}  advanced={n_advanced}/{len(records)}")
         return ep_doc

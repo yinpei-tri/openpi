@@ -10,11 +10,11 @@ and talk to a policy served from the **openpi `.venv`** via `scripts/serve_polic
 Ground-truth episodes + dense subgoal annotations come from
 `/home/yinpei.dai/RoboAnnotator/data_annotation/` (subgoal method `g_subgoal_gemini3_final_batch`).
 
-Results for the current target-split run live under **`m0717_eval_results/`**:
-- `m0717_eval_results/episode/<method>/`    — episode-level open-loop
-- `m0717_eval_results/finestep/<method>/`   — fine-step (per-child-subgoal) eval + Gemini/sim-check
-- `m0717_eval_results/milestone/<method>/`  — milestone-level (oracle-referenced sim-check)
-- `m0717_eval_results/valmse_results/`, `.../trainmse_results/` — offline MSE curves
+Results for the current target-split run live under **`eval_results/`**:
+- `eval_results/episode/<method>/`    — episode-level open-loop
+- `eval_results/finestep/<method>/`   — fine-step (per-child-subgoal) eval + Gemini/sim-check
+- `eval_results/milestone/<method>/`  — milestone-level (oracle-referenced sim-check)
+- `eval_results/valmse_results/`, `.../trainmse_results/` — offline MSE curves
 - each also has an `oracle` method = the ground-truth reference rollout.
 
 ---
@@ -77,7 +77,7 @@ Two servers per 80GB GPU is fine. The eval clients take
 
 **Measures** pure action-prediction error (predicted vs recorded GT action chunk) on val + train
 shards. No env, no rollout. **No success signal** — an MSE proxy only; a low-MSE model can still fail
-the task. **From** `m0717_eval_results/{valmse,trainmse}_results/*.json` (sweep
+the task. **From** `eval_results/{valmse,trainmse}_results/*.json` (sweep
 `scripts/run_val_sweep.py` + `run_train_after_val.sh`; `SWEEP_OUT_DIR` overrides). **GUI:** `/val_mse`
 curves; `/stats` final-step MSE.
 
@@ -102,7 +102,7 @@ CUDA_VISIBLE_DEVICES=0 MUJOCO_EGL_DEVICE_ID=0 \
   $PY examples/robocasa/episode_eval.py \
     --episode-list eps.txt --host 127.0.0.1 --port 8060 \
     --norm-stats checkpoints/<exp>/49999/assets/robocasa_system1/norm_stats.json \
-    --out-root m0717_eval_results/episode --method v4_progreg_noexec
+    --out-root eval_results/episode --method v4_progreg_noexec
 # --oracle replays recorded actions as a reference (NOTE: action-replay, superseded by state-replay
 # in milestone eval; for episode-level the env _check_success is what matters).
 ```
@@ -115,7 +115,7 @@ Flags: `--replan-steps 16 --horizon-mult 2.0 --max-steps-cap 400 --settle-steps 
   span capped at 400 → guaranteed spurious timeout).
 - `longsafe` = `max(HORIZON, min(a + cap, round(mult × a)))`, `a = max(span_len, est_len)` — 2× for
   short/normal spans, `+cap` slack for long spans so budget always exceeds the span.
-Recorded in each run's `index.json` (`budget_formula`). **Existing `m0717_eval_results` used `legacy`.**
+Recorded in each run's `index.json` (`budget_formula`). **Existing `eval_results` used `legacy`.**
 
 **Output** `episode/<method>/<episode_flat>/` per-subgoal `clean.mp4` + `steps.npz` +
 `steps_meta.json`; `episode.json` (`episode_success`, per-subgoal `advanced`/`stop_reason`);
@@ -167,12 +167,12 @@ PY=/home/yinpei.dai/micromamba/envs/robocasa/bin/python
 # 1) oracle reference (state-driven, no server) — CAPTURES per-milestone REF into episode.json:
 CUDA_VISIBLE_DEVICES=0 MUJOCO_EGL_DEVICE_ID=0 \
   $PY examples/robocasa/milestone_eval.py --episode-list eps.txt --oracle \
-    --out-root m0717_eval_results/milestone --method oracle
+    --out-root eval_results/milestone --method oracle
 # 2) policy (LOADS the oracle refs by episode_id, compares):
 CUDA_VISIBLE_DEVICES=0 MUJOCO_EGL_DEVICE_ID=0 \
   $PY examples/robocasa/milestone_eval.py --episode-list eps.txt --host 127.0.0.1 --port 8060 \
     --norm-stats checkpoints/<exp>/49999/assets/robocasa_system1/norm_stats.json \
-    --out-root m0717_eval_results/milestone --method v4_progreg_noexec --oracle-method oracle
+    --out-root eval_results/milestone --method v4_progreg_noexec --oracle-method oracle
 ```
 **Output** `milestone/<method>/<episode_flat>/m<NN>_<goalprim>/` (`clean.mp4` + `steps.npz`);
 `episode.json` per-milestone `milestone_sim_check` (verdict/rule/target/detail) + `ref` (oracle only)
@@ -207,10 +207,10 @@ limitations). This is a narrowing of the current `subtask_sim_check`, not a new 
 # rollouts (writes fine-step tree):
 $PY examples/robocasa/subtask_eval.py --episode-list eps.txt --host 127.0.0.1 --port 8060 \
     --norm-stats <ckpt>/assets/robocasa_system1/norm_stats.json \
-    --out-root m0717_eval_results/finestep --method v4_progreg_noexec
+    --out-root eval_results/finestep --method v4_progreg_noexec
 # Gemini batch judge (Vertex GCS batch, 50% price, gemini-3.6-flash):
 ROBOANNOTATOR=/home/yinpei.dai/RoboAnnotator \
-  $PY scripts/gemini_judge_subtasks_batch.py --rollout-root m0717_eval_results/finestep \
+  $PY scripts/gemini_judge_subtasks_batch.py --rollout-root eval_results/finestep \
     --oracle-method oracle --methods v4_progreg_noexec,v9_progact_noexec \
     --model gemini-3.6-flash --chunk-size 2000 --skip-existing
 ```
@@ -228,9 +228,9 @@ token, not just ADC; an expired token fails the upload before any job/cost). **G
 `/episode` `/val_mse` `/stats`, plus `/` landing. Launch:
 ```bash
 $PY examples/robocasa/subtask_eval_gui.py \
-    --finestep-root m0717_eval_results/finestep \
-    --milestone-root m0717_eval_results/milestone \
-    --episode-root  m0717_eval_results/episode --port 9091
+    --finestep-root eval_results/finestep \
+    --milestone-root eval_results/milestone \
+    --episode-root  eval_results/episode --port 9091
 ```
 Lazy loading: the episode dropdown reads only `index.json` (∪ dir-scan) — full per-episode doc loads
 on click. `/stats` #3 reads per-method `gemini_summary.json` (three-way: success rate =
