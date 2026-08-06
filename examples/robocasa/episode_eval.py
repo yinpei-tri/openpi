@@ -65,7 +65,8 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
                                 task_goal, resize, replan_steps, horizon_mult, max_steps_cap,
                                 stop_cfg: StopConfig, norm_stats, last_cmd_grip_init,
                                 do_settle: bool, settle_steps: int, zero_arm_in_base: bool = True,
-                                oracle: bool = False, budget_formula=SE.DEFAULT_BUDGET_FORMULA):
+                                oracle: bool = False, budget_formula=SE.DEFAULT_BUDGET_FORMULA,
+                                subgoal_text: str | None = None):
     """Roll out ONE subgoal WITHOUT resetting the sim (state carries over from the previous
     subgoal). Terminates when the stop rule fires (advanced=True) or the budget cap is hit
     (advanced=False). Returns clean frames + step records (subtask_eval layout) + advance info.
@@ -77,6 +78,9 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
     policy (client is None). Reproduces the ground-truth episode as a reference: budget = span_len,
     no stop rule (advance exactly at the recorded span boundary), no settle. Same log/video layout.
     """
+    # Text that drives "Current Subgoal": terse sg.subgoal by default, or the verbose
+    # sg.subgoal_detail for verbrich ckpts (v17/v18) — chosen by --prompt-source upstream.
+    _sg_text = subgoal_text if subgoal_text else sg.subgoal
     span_len = sg.end - sg.start + 1
     est_len = SE.estimated_length(span_len)
     # Oracle replays exactly the recorded span; policy gets slack beyond it per the selected formula
@@ -163,7 +167,7 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
                 element = SE._obs_dict(
                     env, base_pos_ref=base_pos_ref, base_yaw_ref=base_yaw_ref,
                     anchor_imgs=anchor_imgs, anchor_state=anchor_state,
-                    subgoal_text=sg.subgoal, task_goal=task_goal, est_length=est_len,
+                    subgoal_text=_sg_text, task_goal=task_goal, est_length=est_len,
                     executed_step=executed, gripper_flag=gripper_flag, resize=resize)
                 result = client.infer(element)
                 chunk = np.asarray(result["actions"])          # (H,12) LeRobot order, unnormalized
@@ -177,7 +181,7 @@ def _rollout_subgoal_continuous(env, sim, client, sim_states, sim_actions, sg, *
             # Prefer the REAL assembled prompt the server tokenized (real discretized state
             # ints); fall back to the placeholder template only if absent.
             real_prompt = (result.get("prompt_text") if isinstance(result, dict) else None) \
-                or build_prompt_text(task_goal, sg.subgoal, "Success", est_len, executed, gripper_flag)
+                or build_prompt_text(task_goal, _sg_text, "Success", est_len, executed, gripper_flag)
             query = dict(
                 prompt=real_prompt,
                 gripper_flag=gripper_flag, executed_step=int(executed),
@@ -262,7 +266,9 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str, n
                 max_steps_cap=args.max_steps_cap, stop_cfg=stop_cfg, norm_stats=norm_stats,
                 last_cmd_grip_init=last_cmd_grip, do_settle=(i == 0), settle_steps=args.settle_steps,
                 zero_arm_in_base=not args.no_zero_arm_in_base, oracle=(client is None),
-                budget_formula=getattr(args, "budget_formula", SE.DEFAULT_BUDGET_FORMULA))
+                budget_formula=getattr(args, "budget_formula", SE.DEFAULT_BUDGET_FORMULA),
+                subgoal_text=(sg.subgoal_detail if getattr(args, "prompt_source", "subgoal") == "subgoal_detail"
+                              and sg.subgoal_detail else sg.subgoal))
             last_cmd_grip = roll["last_cmd_grip"]
 
             clean = roll.pop("_clean_frames", [])
@@ -298,7 +304,8 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str, n
             records.append(dict(
                 child_index=sg.child_index, milestone_index=sg.milestone_index,
                 is_terminal=sg.is_terminal, span=[sg.start, sg.end], primitive=sg.primitive,
-                subgoal=sg.subgoal, out_dir=str(sub_dir.relative_to(out_root)),
+                subgoal=sg.subgoal, subgoal_detail=sg.subgoal_detail,
+                out_dir=str(sub_dir.relative_to(out_root)),
                 steps=roll["steps"], budget=roll["budget"], advanced=roll["advanced"],
                 stop_reason=roll["stop_reason"]))
 
@@ -308,6 +315,8 @@ def eval_episode(episode_dir: Path, client, args, out_root: Path, method: str, n
         ep_doc = dict(method=method, episode_id=ann.episode_id, task_name=ann.task_name,
                       instruction=ann.instruction, n_subgoals=len(ann.subgoals),
                       eval_kind="episode", episode_success=episode_success,
+                      # which text drove the policy prompt (GUI shows subgoal_detail for verbrich runs)
+                      prompt_source=getattr(args, "prompt_source", "subgoal"),
                       n_advanced=n_advanced, subgoals=records, error=None,
                       # Persist per-episode wall-time IN the episode.json too (not just the index),
                       # so a rebuild-from-disk (when parallel shards race index.json) keeps timing.
@@ -336,6 +345,9 @@ def main():
     ap.add_argument("--norm-stats", type=Path, default=None,
                     help="ckpt norm_stats.json (required for a policy run; omit for --oracle)")
     ap.add_argument("--subgoal-method", default=DEFAULT_SUBGOAL_METHOD)
+    ap.add_argument("--prompt-source", choices=["subgoal", "subgoal_detail"], default="subgoal",
+                    help="text driving 'Current Subgoal': 'subgoal' (terse, verbsimp ckpts) or "
+                         "'subgoal_detail' (verbose, verbrich ckpts e.g. v17/v18)")
     ap.add_argument("--resize-size", type=int, default=224)
     ap.add_argument("--replan-steps", type=int, default=16)
     ap.add_argument("--horizon-mult", type=float, default=2.0)

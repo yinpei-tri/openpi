@@ -1183,6 +1183,9 @@ function subVerdict(ep,s){
 }
 const S={method:null,eps:[],epi:0,subi:0,steps:null,fps:20,norm:true};
 const esc=s=>(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+// Text that drove the policy prompt: subgoal_detail for verbrich runs (episode.prompt_source==
+// 'subgoal_detail', e.g. v17/v18), else the terse subgoal. Falls back to subgoal if detail is empty.
+function sgText(ep,s){return (ep&&ep.prompt_source==='subgoal_detail'&&s.subgoal_detail)?s.subgoal_detail:s.subgoal;}
 const fmt=(a,p=3)=>(a||[]).map(v=>(v>=0?'+':'')+Number(v).toFixed(p)).join(' ');
 
 function promptHTML(p){return esc(p).replace(/(Task:|Current Subgoal:|Quality:|Estimated Length:|Executed Step:|Initial State:|Current State:|Current Gripper:|Action:)/g,'<span class="k">$1</span>');}
@@ -1416,7 +1419,8 @@ function drawTrack(){
     const adv=(s.advanced===true)?' ✓':(s.advanced===false?' ⧗':'');  // self-stop fired / timeout
     const style=`left:${pct(s.span[0])}%;width:${pct(s.span[1]-s.span[0]+1)}%`+(vc?`;box-shadow:inset 0 -3px 0 ${vc}`:'');
     const vt=v===null?'':' | sim_check:'+(v?'SUCCESS':'FAIL');
-    return `<div class="pb-seg pb-fs ${i===S.subi?'cur':''}" style="${style}" title="[${s.primitive}] ${esc(s.subgoal)}${vt}" data-sub="${i}">${esc(s.subgoal)}${adv}</div>`;
+    const st=sgText(ep,s);
+    return `<div class="pb-seg pb-fs ${i===S.subi?'cur':''}" style="${style}" title="[${s.primitive}] ${esc(st)}${vt}" data-sub="${i}">${esc(st)}${adv}</div>`;
   }).join("");
   $('#track').innerHTML=`<div class="pb-row"><div class="pb-lab">milestones</div><div class="pb-lane">${msSegs}</div></div>
     <div class="pb-row"><div class="pb-lab">subgoals</div><div class="pb-lane">${fsSegs}</div></div>`;
@@ -1432,7 +1436,7 @@ async function selectSub(i){
   $('#prevSub').disabled=i<=0; $('#nextSub').disabled=i>=ep.subgoals.length-1;
   // primchip: primitive + subgoal + the reset mode for this page.
   const reset=(RN==='episode')?'  · reset: first-only':(RN==='milestone')?'  · reset: per-milestone (GT)':'  · reset: per-subgoal (GT)';
-  $('#primchip').textContent=`[${sg.primitive}] ${sg.subgoal}${reset}`;
+  $('#primchip').textContent=`[${sg.primitive}] ${sgText(ep,sg)}${reset}`;
   let ms=`milestone: ${sg.milestone_subgoal||sg.milestone_index}`;
   if(ep.episode_success!=null)ms+=`  ·  EPISODE: ${ep.episode_success?'SUCCESS':'fail'} (advanced ${ep.n_advanced}/${ep.n_subgoals})`;
   else if(ep.sim_success_final!=null)ms+=`  ·  EPISODE _check_success: ${ep.sim_success_final?'SUCCESS':'fail'}`;
