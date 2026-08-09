@@ -104,15 +104,21 @@ def _short_method_name(s1_dir: str | None, s2_dir: str | None) -> str:
     always traceable back to a checkpoint.
     """
     def s1_short(d: str | None) -> str:
+        """progress head + training scale + the ablation tags that still carry information.
+
+        ``-noexec`` is dropped: every current checkpoint has it, so it distinguishes nothing.
+        ``-noanchor``/``-noanchorstate`` (they always co-occur) collapse to a single ``-noanchor``.
+        """
         if not d:
             return "s1-unknown"
         pp = Path(d)
         exp = pp.parent.name if pp.name.isdigit() else pp.name
         head = next((h for h in ("progreg", "progact", "progcls") if h in exp), None)
         scale = re.search(r"-(\d+k)-", exp)
-        if head:
-            return f"s1-{head}{scale.group(1) if scale else ''}"
-        return f"s1-{exp}"
+        if not head:
+            return f"s1-{exp}"
+        tags = "-noanchor" if ("noanchor" in exp or "noanchorstate" in exp) else ""
+        return f"s1-{head}{scale.group(1) if scale else ''}{tags}"
 
     def s2_short(d: str | None) -> str:
         if not d:
@@ -367,6 +373,26 @@ def max_turns_for(task_name: str, flat_max: int, *, dynamic: bool = True) -> tup
         return flat_max, "flat (task not in budget table)"
     return (n + TURN_HEADROOM + TURN_DEF_OFFSET,
             f"max_subgoal_turns {n} + {TURN_HEADROOM} headroom + {TURN_DEF_OFFSET} def-offset")
+
+
+def _episode_done(method_dir: Path, lerobot_dir: Path, ep_index: int) -> bool:
+    """True if this episode already has a COMPLETE result under ``method_dir``.
+
+    Complete means episode.json exists, carries a ``termination``, and has no ``error`` -- so a
+    crashed or half-written episode is re-run rather than silently kept. Used by --resume to make a
+    killed sweep restartable without redoing finished work.
+    """
+    task = _task_name_from_lerobot_dir(lerobot_dir)
+    split = _split_from_lerobot_dir(lerobot_dir)
+    flat = f"{task}/{split}/episode_{ep_index:06d}".replace("/", "__")
+    f = method_dir / flat / "episode.json"
+    if not f.exists():
+        return False
+    try:
+        doc = json.loads(f.read_text())
+    except Exception:  # noqa: BLE001 - torn write: treat as not done
+        return False
+    return bool(doc.get("termination")) and not doc.get("error")
 
 
 def _parse_episodes(spec: str) -> list[int]:
@@ -1007,6 +1033,9 @@ def main():
     ap.add_argument("--max-turns", type=int, default=20,
                     help="fallback turn cap; by default the cap is PER TASK from "
                          "robocasa_target_maxturns.json (max_subgoal_turns + headroom + offset)")
+    ap.add_argument("--resume", action="store_true",
+                    help="skip episodes already finished under --out-root/<method> (episode.json "
+                         "present with a termination and no error). Makes a killed sweep restartable.")
     ap.add_argument("--flat-max-turns", action="store_true",
                     help="ignore the per-task table and use --max-turns for every task")
     ap.add_argument("--horizon-mult", type=float, default=2.0,
@@ -1049,6 +1078,10 @@ def main():
     out_root = Path(args.out_root)
     results = []
     for i, ep_idx in enumerate(ep_indices):
+        if args.resume and _episode_done(out_root / args.method, Path(args.lerobot_dir), ep_idx):
+            print(f"=== [{i+1}/{len(ep_indices)}] episode {ep_idx}: SKIP (already done) ===",
+                  flush=True)
+            continue
         print(f"=== [{i+1}/{len(ep_indices)}] {args.lerobot_dir} episode {ep_idx} ===", flush=True)
         args.episode_index = ep_idx
         results.append(eval_episode(Path(args.lerobot_dir), s1, s2, args, out_root,

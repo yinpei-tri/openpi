@@ -37,6 +37,7 @@ MAX_TURNS=${MAX_TURNS:-20}
 DATA_ROOT=${DATA_ROOT:-/home/ec2-user/data/robocasa_dataset/v1.0/target}
 S2_CKPT=${S2_CKPT:-/home/ec2-user/sys2_train_eval/data/sys2_ckpts/system2-full-0804-qwen35-4b-gb192-full-vitfull-lr1e5-vitlr2e6-alignerlr1e5-zero2-2n-ep3/checkpoint-11416}
 SKIP_SERVERS=${SKIP_SERVERS:-0}            # 1 = reuse servers already listening
+RESUME=${RESUME:-0}                        # 1 = skip episodes already finished (restartable)
 ROBOCASA_PY=${ROBOCASA_PY:-/home/ec2-user/micromamba/envs/robocasa/bin/python}
 
 case "$METHOD" in
@@ -185,6 +186,7 @@ for i in "${!GPULIST[@]}"; do
           --s1-port $((S1_BASE+g)) --s2-port $((S2_BASE+g)) --s2-model system2-full \
           --norm-stats "$S1_CKPT/assets/robocasa_system1/norm_stats.json" \
           --out-root eval_results/combine --max-turns "$MAX_TURNS" \
+          $([[ "$RESUME" == 1 ]] && echo --resume) \
         || echo "[fleet] gpu$g FAILED $ld ep$ep" >&2
     done < "$LOG/shard-gpu$g.txt"
     echo "[fleet] gpu$g SHARD COMPLETE"

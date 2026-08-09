@@ -665,7 +665,7 @@ VAL_MSE_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 </style></head><body>
 <header>
   <h1>Train / Val <b>MSE</b></h1>
-  <nav><a href="/">home</a><a href="/finestep">finestep</a><a href="/milestone">milestone</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
+  <nav><a href="/">home</a><a class="hi" href="/combine">combine</a><a href="/finestep">finestep</a><a href="/milestone">milestone</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
   <label>metric <select id="metric">
     <option value="action_mse">action_mse</option>
     <option value="progress_mae">progress_mae</option>
@@ -793,10 +793,16 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   th,td{border:1px solid #ddd;padding:3px 8px;text-align:right}th{background:#f0f0f0}
   td.exp,th.exp{text-align:left;font-family:ui-monospace,monospace}
   .box{background:#fff;border:1px solid #ddd;border-radius:6px;padding:12px;margin-top:10px}
+  /* per-task matrix: wrap the long s1_/s2_ method names instead of stretching the table */
+  table.cmbtask th{white-space:normal;max-width:150px;line-height:1.25;font-size:11px;vertical-align:bottom}
+  table.cmbtask td.exp{white-space:nowrap}
+  /* the combined S2+S1 rollout browser is the main drill-down from these tables */
+  nav a.hi{background:#b0431c;color:#fff;border-radius:4px;padding:1px 8px;font-weight:700}
+  nav a.hi:hover{background:#8f3616}
 </style></head><body>
 <header>
   <h1>Eval <b>Statistics</b></h1>
-  <nav><a href="/">home</a><a href="/finestep">finestep</a><a href="/milestone">milestone</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
+  <nav><a href="/">home</a><a class="hi" href="/combine">combine</a><a href="/finestep">finestep</a><a href="/milestone">milestone</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
 </header>
 <div id="wrap">
   <div id="loading" style="padding:10px 0;color:#b0431c;font-size:14px">⏳ loading stats… (first load scans the eval results; ~a few seconds)</div>
@@ -807,6 +813,8 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   <h2>#0 COMBINED System2+System1 <span style="font-size:11px;color:#888;font-weight:400">— closed-loop hierarchical rollouts (/combine) · success, wall-clock, and full-benchmark ETA</span></h2>
   <div id="cmbtab" style="overflow-x:auto"></div>
   <div id="cmbsplit" style="overflow-x:auto;margin-top:8px"></div>
+  <h2>#0b Per-task COMBINED success <span style="font-size:11px;color:#888;font-weight:400">— task × method, grouped by split · #successful / #episodes (hover for % and s/ep)</span></h2>
+  <div id="cmbtask" style="overflow-x:auto"></div>
   <h2>#2 Episode success rate <span style="font-size:11px;color:#888;font-weight:400">— % (n episodes)</span></h2>
   <div id="epfilter" style="margin:2px 0 8px;font-size:12px;display:flex;gap:6px;align-items:center;flex-wrap:wrap"></div>
   <div id="eptab"></div>
@@ -826,6 +834,22 @@ const mColor=m=>{const t=m.toLowerCase();
   if(t.includes('progact'))return '#e6f0fb'; if(t.includes('progreg'))return '#fdeaea'; return '';};
 // Ablation-tag legend: what each method-name token means. Prompt examples are the REAL assembled
 // System1 prompt (task goal + subgoal + offline-RL conditioning + discretized state + gripper).
+// Long combined method names ("s1-progact270k_s2-qwen35-4b-full-ep3-11416") blow out the per-task
+// table's column widths. Split on the s1_/s2_ boundary and stack the halves so the header wraps to
+// two short lines; the full name stays in the title tooltip.
+// Shorten a System1 tag for display: -noexec is on for every current ckpt so it carries no
+// information, and -noanchor-noanchorstate (either order) is reported as just -noanchor.
+function s1Short(t){
+  return (t||'')
+    .replace(/-noexec/g,'')
+    .replace(/-noanchorstate-noanchor|-noanchor-noanchorstate/g,'-noanchor')
+    .replace(/-noanchorstate/g,'-noanchor');
+}
+function mName2(m){
+  const x=/^s1-(.+?)_s2-(.+)$/.exec(m||'');
+  if(!x)return `<span title="${m}">${mName(m)}</span>`;
+  return `<span title="${m}"><b>${s1Short(x[1])}</b><br><span style="font-weight:400;color:#666">${x[2]}</span></span>`;
+}
 function renderTagDoc(){
   const box=document.getElementById('tagdoc-body'); if(!box)return;
   const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -977,10 +1001,10 @@ async function load(){
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
       '<span style="color:#888">No combined runs yet — see /combine.</span>';return;}
     let h="<table><tr><th class='exp'>method</th><th>episodes</th><th>success</th><th>rate</th>"
-      +"<th>avg s/ep</th><th>avg turns</th><th>total</th><th>ETA serial</th><th>ETA 8 GPU</th><th>terminations</th></tr>";
+      +"<th>avg s/ep</th><th>avg turns</th><th>errors</th><th>total</th><th>ETA serial</th><th>ETA 8 GPU</th><th>terminations</th></tr>";
     ms.sort().forEach(m=>{const v=C[m], b=v.bench||{};
       const tt=Object.entries(v.terminations||{}).map(([k,n])=>`${k}:${n}`).join(' ');
-      h+=`<tr><td class='exp'>${mName(m)}</td><td>${v.n}</td><td>${v.n_success}</td>`
+      h+=`<tr><td class='exp'>${mName2(m)}</td><td>${v.n}</td><td>${v.n_success}</td>`
         +`<td><b>${pct(v.rate)}</b></td><td>${v.avg_seconds??'–'}</td><td>${v.avg_turns??'–'}</td>`
         +`<td>${v.total_seconds!=null?(v.total_seconds/60).toFixed(1)+' min':'–'}</td>`
         +`<td>${b.eta_serial_h!=null?b.eta_serial_h+' h':'–'}</td>`
@@ -988,16 +1012,44 @@ async function load(){
         +`<td style="font-family:ui-monospace,monospace;font-size:10px">${tt}</td></tr>`;});
     h+="</table><div style='color:#888;font-size:11px;margin-top:3px'>ETA extrapolates the measured "
       +"mean episode time to all "+(ms.length?(C[ms[0]].bench||{}).episodes:0)+" benchmark episodes "
-      +"(50 tasks × ~506); 8-GPU column assumes one full stack per GPU.</div>";
+      +"(50 tasks × ~506); 8-GPU column assumes one full stack per GPU. "
+      +"errors = episodes that threw (counted in n, never successful). "
+      +"Source: eval_results/combine_results/*.json via scripts/extract_combine_results.py.</div>";
     document.getElementById('cmbtab').innerHTML=h;
     // per-split breakdown
     const sp=['atomic_seen','composite_seen','composite_unseen','other'];
     let h2="<table><tr><th class='exp'>method</th>"+sp.map(x=>`<th>${x.replace('_','-')}</th>`).join('')+"</tr>";
     ms.sort().forEach(m=>{const P=C[m].per_split||{};
-      h2+=`<tr><td class='exp'>${mName(m)}</td>`+sp.map(x=>{const b=P[x];
-        return b?`<td title="${b.avg_seconds}s/ep">${b.s}<span style="color:#888">/${b.n}</span> ${pct(b.rate)}</td>`
+      h2+=`<tr><td class='exp'>${mName2(m)}</td>`+sp.map(x=>{const b=P[x];
+        const ok=(b&&(b.n_success??b.s));
+        return b?`<td title="${b.avg_seconds??'?'}s/ep">${ok??0}<span style="color:#888">/${b.n}</span> ${pct(b.rate)}</td>`
                 :'<td style="color:#ccc">–</td>';}).join('')+`</tr>`;});
     document.getElementById('cmbsplit').innerHTML=h2+"</table>";
+    // #0b per-task matrix: rows = tasks grouped by split, cols = methods.
+    const order={atomic_seen:0,composite_seen:1,composite_unseen:2,other:3};
+    const info={};
+    ms.forEach(m=>{const pt=C[m].per_task||{};
+      for(const t in pt) info[t]=info[t]||pt[t].split||'other';});
+    const tasks=Object.keys(info).sort((a,b)=>
+      (order[info[a]]??9)-(order[info[b]]??9) || a.localeCompare(b));
+    const cell=(b)=>{
+      if(!b||!b.n)return '<td style="color:#ccc">–</td>';
+      const r=b.rate!=null?b.rate:(b.n_success/b.n);
+      return `<td title="${(100*r).toFixed(1)}% · ${b.avg_seconds??'?'}s/ep" `
+        +`style="background:rgba(46,139,61,${(0.10+0.5*r).toFixed(2)})">`
+        +`${b.n_success}<span style="color:#888">/${b.n}</span></td>`;};
+    let h3="<table class=cmbtask><tr><th class='exp'>task</th>"
+      +ms.map(m=>`<th>${mName2(m)}</th>`).join('')+"</tr>";
+    // split-total rows so a whole split reads at a glance
+    ['atomic_seen','composite_seen','composite_unseen','other'].forEach(sp=>{
+      const rows=tasks.filter(t=>info[t]===sp);
+      if(!rows.length)return;
+      h3+=`<tr><td class='exp' style="background:#dfe6f5;font-weight:700">${sp.replace('_','-')}</td>`
+        +ms.map(m=>cell((C[m].per_split||{})[sp])).join('')+`</tr>`;
+      rows.forEach(t=>{h3+=`<tr><td class='exp' style="padding-left:14px">${t}</td>`
+        +ms.map(m=>cell((C[m].per_task||{})[t])).join('')+`</tr>`;});
+    });
+    document.getElementById('cmbtask').innerHTML=h3+"</table>";
   })();
   // #3 subtask table: THREE-WAY Gemini verdict (success/failure/uncertain). "success rate" is over
   // DECIDED spans (success/(success+failure)); uncertain shown separately. Per-primitive = decided-rate.
@@ -1807,6 +1859,9 @@ loadMethods();
 # + anchor image, the raw 20-fps rollout video, the condensed 4-fps clip that was actually fed
 # back, and a per-frame table showing which frames the condenser kept or dropped and why.
 COMBINE_ROOT: Path = Path("eval_results/combine")
+# Precomputed per-method summaries (scripts/extract_combine_results.py). /stats reads these
+# instead of aggregating raw rollout output.
+COMBINE_RESULTS_DIR: Path = Path("eval_results/combine_results")
 
 
 
@@ -1817,64 +1872,79 @@ COMBINE_BENCH_EPISODES = 25307
 
 
 def _combine_stats() -> dict:
-    """Per-method COMBINED-eval summary: success rate, per-split breakdown, and wall-clock cost.
+    """Per-method COMBINED-eval summary, read from PRECOMPUTED per-method JSONs.
 
-    Reads only each method's aggregate index.json (not the per-episode docs), so this stays cheap
-    as the sweep grows. ``eta_*`` extrapolates the measured mean episode time to the full 25,307
-    episode benchmark -- both serially and across 8 parallel GPU stacks.
+    ``scripts/extract_combine_results.py`` aggregates each method's index.json once into
+    ``eval_results/combine_results/<method>.json`` (~10 KB vs the 217 KB index at 1000 episodes,
+    and ~5 MB at the full 25,307-episode benchmark). /stats then renders with NO aggregation.
+
+    Falls back to aggregating index.json in-process when a method has no extracted file yet -- so a
+    sweep still in flight is visible immediately, and the page never silently shows nothing.
     """
     out: dict = {}
-    if not COMBINE_ROOT.is_dir():
-        return out
-    splits = _target_split_map()
-    for md in sorted(p for p in COMBINE_ROOT.iterdir() if p.is_dir()):
-        f = md / "index.json"
-        if not f.exists():
-            continue
-        try:
-            doc = json.loads(f.read_text())
-        except Exception:  # noqa: BLE001
-            continue
-        eps = doc.get("episodes") or []
-        if not eps:
-            continue
-        per_split: dict = {}
-        per_task: dict = {}
-        for e in eps:
-            task = e.get("task_name") or ""
-            sp = splits.get(task, "other")
-            for bucket, key in ((per_split, sp), (per_task, task)):
-                b = bucket.setdefault(key, {"n": 0, "s": 0, "secs": []})
-                b["n"] += 1
-                b["s"] += 1 if e.get("episode_success") else 0
-                if isinstance(e.get("seconds"), (int, float)):
-                    b["secs"].append(e["seconds"])
-        def finish(b):
-            secs = b.pop("secs")
-            b["rate"] = b["s"] / b["n"] if b["n"] else None
-            b["avg_seconds"] = round(sum(secs) / len(secs), 2) if secs else None
-            return b
-        secs = [e["seconds"] for e in eps if isinstance(e.get("seconds"), (int, float))]
-        mean = (sum(secs) / len(secs)) if secs else None
-        turns = [e["n_turns"] for e in eps if isinstance(e.get("n_turns"), int)]
-        terms: dict = {}
-        for e in eps:
-            terms[e.get("termination") or "?"] = terms.get(e.get("termination") or "?", 0) + 1
-        out[md.name] = {
-            "n": len(eps), "n_success": sum(1 for e in eps if e.get("episode_success")),
-            "rate": doc.get("success_rate"),
-            "avg_seconds": round(mean, 2) if mean else None,
-            "total_seconds": doc.get("total_seconds"),
-            "avg_turns": round(sum(turns) / len(turns), 2) if turns else None,
-            "terminations": terms,
-            "per_split": {k: finish(v) for k, v in sorted(per_split.items())},
-            "per_task": {k: finish(v) for k, v in sorted(per_task.items())},
-            "bench": {
-                "episodes": COMBINE_BENCH_EPISODES, "tasks": COMBINE_BENCH_TASKS,
-                "eta_serial_h": round(mean * COMBINE_BENCH_EPISODES / 3600, 1) if mean else None,
-                "eta_8gpu_h": round(mean * COMBINE_BENCH_EPISODES / 3600 / 8, 1) if mean else None,
-            },
-        }
+    # 1) precomputed files (preferred)
+    if COMBINE_RESULTS_DIR.is_dir():
+        for f in sorted(COMBINE_RESULTS_DIR.glob("*.json")):
+            if f.name == "SUMMARY.json":
+                continue
+            try:
+                rec = json.loads(f.read_text())
+            except Exception:  # noqa: BLE001
+                continue
+            o = rec.get("overall") or {}
+            out[rec.get("method", f.stem)] = {
+                "n": o.get("n"), "n_success": o.get("n_success"), "rate": o.get("rate"),
+                "avg_seconds": o.get("avg_seconds"), "total_seconds": o.get("total_seconds"),
+                "avg_turns": o.get("avg_turns"), "n_error": rec.get("n_error"),
+                "terminations": rec.get("terminations") or {},
+                "per_split": rec.get("per_split") or {},
+                "per_task": rec.get("per_task") or {},
+                "bench": rec.get("bench") or {},
+                "src": "extracted",
+            }
+    # 2) live fallback for methods not extracted yet (a sweep still running)
+    if COMBINE_ROOT.is_dir():
+        splits = _target_split_map()
+        for md in sorted(p for p in COMBINE_ROOT.iterdir() if p.is_dir()):
+            if md.name in out:
+                continue
+            f = md / "index.json"
+            if not f.exists():
+                continue
+            try:
+                doc = json.loads(f.read_text())
+            except Exception:  # noqa: BLE001
+                continue
+            eps = doc.get("episodes") or []
+            if not eps:
+                continue
+            def blk(group):
+                n = len(group)
+                s_ = sum(1 for e in group if e.get("episode_success"))
+                secs = [e["seconds"] for e in group if isinstance(e.get("seconds"), (int, float))]
+                return {"n": n, "n_success": s_, "rate": (s_ / n) if n else None,
+                        "avg_seconds": round(sum(secs) / len(secs), 2) if secs else None}
+            per_split: dict = {}
+            per_task: dict = {}
+            for e in eps:
+                t = e.get("task_name") or ""
+                per_split.setdefault(splits.get(t, "other"), []).append(e)
+                per_task.setdefault(t, []).append(e)
+            terms: dict = {}
+            for e in eps:
+                k = e.get("termination") or "error"
+                terms[k] = terms.get(k, 0) + 1
+            o = blk(eps)
+            out[md.name] = {
+                **o, "total_seconds": doc.get("total_seconds"),
+                "avg_turns": None,
+                "n_error": sum(1 for e in eps if e.get("error")),
+                "terminations": terms,
+                "per_split": {k: blk(v) for k, v in sorted(per_split.items())},
+                "per_task": {k: {**blk(v), "split": splits.get(k, "other")}
+                             for k, v in sorted(per_task.items())},
+                "bench": {}, "src": "live (not extracted yet)",
+            }
     return out
 
 
