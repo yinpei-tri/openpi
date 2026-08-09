@@ -22,8 +22,10 @@ import subprocess
 import time
 
 # --- config ---
-OPENPI = pathlib.Path("/home/yinpei.dai/openpi")
-CKPT_ROOT = OPENPI / "checkpoints"
+# Repo root + ckpt root are env-overridable so the sweep runs on any box (the default is the
+# original workstation layout). SWEEP_CKPT_ROOT lets the ckpts live outside the repo entirely.
+OPENPI = pathlib.Path(os.environ.get("SWEEP_OPENPI_ROOT", "/home/yinpei.dai/openpi"))
+CKPT_ROOT = pathlib.Path(os.environ.get("SWEEP_CKPT_ROOT", str(OPENPI / "checkpoints")))
 # Shards + output dir are overridable via env so the SAME scheduler runs both the val sweep and
 # the train-set sweep (same 40 ckpts, same 32768-sample eval). Defaults = the val sweep.
 VAL_SHARDS = os.environ.get(

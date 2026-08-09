@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import time
 
-OPENPI = pathlib.Path("/home/yinpei.dai/openpi")
-OUT_DIR = OPENPI / "eval_results" / "valmse_results"
+# Paths + job count are env-overridable so the reporter follows whatever the sweep was pointed at
+# (SWEEP_OPENPI_ROOT / SWEEP_OUT_DIR mirror run_val_sweep.py; SWEEP_TOTAL_JOBS sizes the ETA).
+OPENPI = pathlib.Path(os.environ.get("SWEEP_OPENPI_ROOT", "/home/yinpei.dai/openpi"))
+OUT_DIR = pathlib.Path(os.environ.get("SWEEP_OUT_DIR", str(OPENPI / "eval_results" / "valmse_results")))
 JOBLOG_DIR = OUT_DIR / "joblogs"
 MASTER = OPENPI / "_evallogs" / "sweep_master.log"
-TOTAL_JOBS = 40
+TOTAL_JOBS = int(os.environ.get("SWEEP_TOTAL_JOBS", "40"))
 BATCHES_PER_JOB = 512
 
 _BATCH_RE = re.compile(r"batch (\d+)/(\d+)")

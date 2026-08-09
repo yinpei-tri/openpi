@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -422,7 +424,8 @@ def _target_split_map() -> dict[str, str]:
     if _TARGET_SPLIT_CACHE is not None:
         return _TARGET_SPLIT_CACHE
     out: dict[str, str] = {}
-    reg = Path("/home/yinpei.dai/robocasa/robocasa/utils/dataset_registry.py")
+    # ROBOCASA_REPO lets a different box point at its own robocasa checkout (default unchanged).
+    reg = Path(os.environ.get("ROBOCASA_REPO", "/home/yinpei.dai/robocasa")) / "robocasa/utils/dataset_registry.py"
     try:
         import re
         src = reg.read_text()
@@ -619,7 +622,8 @@ def _compute_stats() -> dict:
                 continue
     return dict(val_mse=val,
                 episode=_episode_stats(_root("episode")),
-                subtask=_subtask_stats(_root("finestep")))
+                subtask=_subtask_stats(_root("finestep")),
+                combine=_combine_stats())
 
 
 @app.route("/api/stats")
@@ -800,6 +804,9 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#b0431c">▸ Ablation tag legend — what each method-name token means (click to expand)</summary>
     <div id="tagdoc-body" style="margin-top:10px;font-size:13px;line-height:1.55"></div>
   </details>
+  <h2>#0 COMBINED System2+System1 <span style="font-size:11px;color:#888;font-weight:400">— closed-loop hierarchical rollouts (/combine) · success, wall-clock, and full-benchmark ETA</span></h2>
+  <div id="cmbtab" style="overflow-x:auto"></div>
+  <div id="cmbsplit" style="overflow-x:auto;margin-top:8px"></div>
   <h2>#2 Episode success rate <span style="font-size:11px;color:#888;font-weight:400">— % (n episodes)</span></h2>
   <div id="epfilter" style="margin:2px 0 8px;font-size:12px;display:flex;gap:6px;align-items:center;flex-wrap:wrap"></div>
   <div id="eptab"></div>
@@ -964,6 +971,34 @@ async function load(){
     document.getElementById('tasktab').innerHTML=th+"</table>";
   }
   renderEpFilter(); renderEpTable(); renderTaskTab();
+  // #0 COMBINED: per-method success + timing + extrapolated cost for the full 50-task benchmark.
+  (function(){
+    const C=d.combine||{}; const ms=Object.keys(C);
+    if(!ms.length){document.getElementById('cmbtab').innerHTML=
+      '<span style="color:#888">No combined runs yet — see /combine.</span>';return;}
+    let h="<table><tr><th class='exp'>method</th><th>episodes</th><th>success</th><th>rate</th>"
+      +"<th>avg s/ep</th><th>avg turns</th><th>total</th><th>ETA serial</th><th>ETA 8 GPU</th><th>terminations</th></tr>";
+    ms.sort().forEach(m=>{const v=C[m], b=v.bench||{};
+      const tt=Object.entries(v.terminations||{}).map(([k,n])=>`${k}:${n}`).join(' ');
+      h+=`<tr><td class='exp'>${mName(m)}</td><td>${v.n}</td><td>${v.n_success}</td>`
+        +`<td><b>${pct(v.rate)}</b></td><td>${v.avg_seconds??'–'}</td><td>${v.avg_turns??'–'}</td>`
+        +`<td>${v.total_seconds!=null?(v.total_seconds/60).toFixed(1)+' min':'–'}</td>`
+        +`<td>${b.eta_serial_h!=null?b.eta_serial_h+' h':'–'}</td>`
+        +`<td><b>${b.eta_8gpu_h!=null?b.eta_8gpu_h+' h':'–'}</b></td>`
+        +`<td style="font-family:ui-monospace,monospace;font-size:10px">${tt}</td></tr>`;});
+    h+="</table><div style='color:#888;font-size:11px;margin-top:3px'>ETA extrapolates the measured "
+      +"mean episode time to all "+(ms.length?(C[ms[0]].bench||{}).episodes:0)+" benchmark episodes "
+      +"(50 tasks × ~506); 8-GPU column assumes one full stack per GPU.</div>";
+    document.getElementById('cmbtab').innerHTML=h;
+    // per-split breakdown
+    const sp=['atomic_seen','composite_seen','composite_unseen','other'];
+    let h2="<table><tr><th class='exp'>method</th>"+sp.map(x=>`<th>${x.replace('_','-')}</th>`).join('')+"</tr>";
+    ms.sort().forEach(m=>{const P=C[m].per_split||{};
+      h2+=`<tr><td class='exp'>${mName(m)}</td>`+sp.map(x=>{const b=P[x];
+        return b?`<td title="${b.avg_seconds}s/ep">${b.s}<span style="color:#888">/${b.n}</span> ${pct(b.rate)}</td>`
+                :'<td style="color:#ccc">–</td>';}).join('')+`</tr>`;});
+    document.getElementById('cmbsplit').innerHTML=h2+"</table>";
+  })();
   // #3 subtask table: THREE-WAY Gemini verdict (success/failure/uncertain). "success rate" is over
   // DECIDED spans (success/(success+failure)); uncertain shown separately. Per-primitive = decided-rate.
   const prims=[...new Set(Object.values(d.subtask).flatMap(v=>Object.keys(v.per_primitive||{})))].sort();
@@ -1006,12 +1041,23 @@ HOME_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   a.card h2{margin:0 0 4px;font-size:16px;color:#b0431c}
   a.card .path{font-family:ui-monospace,monospace;font-size:12px;color:#999;font-weight:400;margin-left:6px}
   a.card p{margin:0;font-size:13px;color:#444;line-height:1.5}
+  /* the combined S2+S1 view is the headline entry point */
+  a.card.hero{border-color:#b0431c;border-left-width:4px;background:linear-gradient(#fff,#fffaf8)}
 </style></head><body>
 <header>
-  <h1>RoboCasa <b>System1</b> Eval</h1>
-  <p>Browse rollouts and aggregate metrics for the subgoal-conditioned pi0.5 System1 policies.</p>
+  <h1>RoboCasa <b>System2 + System1</b> Eval</h1>
+  <p>Browse rollouts and aggregate metrics for the Qwen3.5 System2 planner and the
+     subgoal-conditioned pi0.5 System1 policies.</p>
 </header>
 <div id="wrap">
+  <a class="card hero" href="/combine"><h2>Combined System2 + System1<span class="path">/combine</span></h2>
+    <p>CLOSED-LOOP hierarchical rollouts: System2 plans the milestones, then each turn issues a
+       <i>subgoal</i> + <i>estimated_step</i> that System1 executes until its progress/quiescence
+       stop rule fires; the condensed 4-fps clip of that segment goes back to System2 to pick the
+       next subgoal. Every intermediate result is inspectable per turn — both System2 prompts, its
+       raw response and parsed tags, the System1 prompt + anchor image, the raw 20-fps rollout and
+       the condensed clip actually fed back (with a per-frame keep/drop audit), plus per-component
+       wall-clock timings.</p></a>
   <a class="card" href="/episode"><h2>Episode Eval<span class="path">/episode</span></h2>
     <p>Whole-episode OPEN-LOOP rollouts: reset once to the first subgoal, then roll the policy
        continuously through the subgoal list. Per-subgoal video, prompt, anchor, action chunk, and
@@ -1753,8 +1799,900 @@ loadMethods();
 """
 
 
+# ---------------------------------------------------------------------------
+# /combine — COMBINED System2+System1 closed-loop rollouts (combined_eval.py output).
+#
+# Every intermediate artifact is exposed so a run can be audited turn by turn: the System2
+# system+user prompt, its raw response and parsed tags, the exact media it saw, the System1 prompt
+# + anchor image, the raw 20-fps rollout video, the condensed 4-fps clip that was actually fed
+# back, and a per-frame table showing which frames the condenser kept or dropped and why.
+COMBINE_ROOT: Path = Path("eval_results/combine")
+
+
+
+# Benchmark scale: 50 target tasks x ~506 episodes each (from the LeRobot meta/info.json totals).
+# Used only to extrapolate a wall-clock estimate from the episodes actually run.
+COMBINE_BENCH_TASKS = 50
+COMBINE_BENCH_EPISODES = 25307
+
+
+def _combine_stats() -> dict:
+    """Per-method COMBINED-eval summary: success rate, per-split breakdown, and wall-clock cost.
+
+    Reads only each method's aggregate index.json (not the per-episode docs), so this stays cheap
+    as the sweep grows. ``eta_*`` extrapolates the measured mean episode time to the full 25,307
+    episode benchmark -- both serially and across 8 parallel GPU stacks.
+    """
+    out: dict = {}
+    if not COMBINE_ROOT.is_dir():
+        return out
+    splits = _target_split_map()
+    for md in sorted(p for p in COMBINE_ROOT.iterdir() if p.is_dir()):
+        f = md / "index.json"
+        if not f.exists():
+            continue
+        try:
+            doc = json.loads(f.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        eps = doc.get("episodes") or []
+        if not eps:
+            continue
+        per_split: dict = {}
+        per_task: dict = {}
+        for e in eps:
+            task = e.get("task_name") or ""
+            sp = splits.get(task, "other")
+            for bucket, key in ((per_split, sp), (per_task, task)):
+                b = bucket.setdefault(key, {"n": 0, "s": 0, "secs": []})
+                b["n"] += 1
+                b["s"] += 1 if e.get("episode_success") else 0
+                if isinstance(e.get("seconds"), (int, float)):
+                    b["secs"].append(e["seconds"])
+        def finish(b):
+            secs = b.pop("secs")
+            b["rate"] = b["s"] / b["n"] if b["n"] else None
+            b["avg_seconds"] = round(sum(secs) / len(secs), 2) if secs else None
+            return b
+        secs = [e["seconds"] for e in eps if isinstance(e.get("seconds"), (int, float))]
+        mean = (sum(secs) / len(secs)) if secs else None
+        turns = [e["n_turns"] for e in eps if isinstance(e.get("n_turns"), int)]
+        terms: dict = {}
+        for e in eps:
+            terms[e.get("termination") or "?"] = terms.get(e.get("termination") or "?", 0) + 1
+        out[md.name] = {
+            "n": len(eps), "n_success": sum(1 for e in eps if e.get("episode_success")),
+            "rate": doc.get("success_rate"),
+            "avg_seconds": round(mean, 2) if mean else None,
+            "total_seconds": doc.get("total_seconds"),
+            "avg_turns": round(sum(turns) / len(turns), 2) if turns else None,
+            "terminations": terms,
+            "per_split": {k: finish(v) for k, v in sorted(per_split.items())},
+            "per_task": {k: finish(v) for k, v in sorted(per_task.items())},
+            "bench": {
+                "episodes": COMBINE_BENCH_EPISODES, "tasks": COMBINE_BENCH_TASKS,
+                "eta_serial_h": round(mean * COMBINE_BENCH_EPISODES / 3600, 1) if mean else None,
+                "eta_8gpu_h": round(mean * COMBINE_BENCH_EPISODES / 3600 / 8, 1) if mean else None,
+            },
+        }
+    return out
+
+
+def _combine_methods() -> list[str]:
+    r = COMBINE_ROOT
+    return sorted([d.name for d in r.iterdir() if d.is_dir()]) if r.exists() else []
+
+
+@app.route("/api/combine/methods")
+def api_combine_methods():
+    out = []
+    for m in _combine_methods():
+        idx = COMBINE_ROOT / m / "index.json"
+        doc = {}
+        if idx.exists():
+            try:
+                doc = json.loads(idx.read_text())
+            except Exception:  # noqa: BLE001
+                doc = {}
+        out.append({"method": m, "n_episodes": doc.get("n_episodes"),
+                    "n_success": doc.get("n_success"), "success_rate": doc.get("success_rate")})
+    return jsonify(out)
+
+
+@app.route("/api/combine/episodes/<method>")
+def api_combine_episodes(method):
+    """LIGHTWEIGHT episode list for the dropdowns (task, task type, episode number).
+
+    Reads the per-method ``index.json`` (one small aggregate file) rather than every per-episode
+    ``episode.json`` -- at benchmark scale (25k episodes) the latter is thousands of multi-KB reads
+    just to fill a dropdown. The FULL doc is fetched lazily by
+    ``/api/combine/episode/<method>/<episode>`` only when an episode is actually selected.
+
+    Each row is enriched with ``task_split`` (atomic_seen / composite_seen / composite_unseen, from
+    robocasa's TARGET_TASKS registry) and ``episode_index``, so the GUI can group and label without
+    parsing ids in JS.
+    """
+    md = COMBINE_ROOT / method
+    splits = _target_split_map()
+
+    def enrich(rec: dict) -> dict:
+        ep_id = rec.get("episode_id") or ""
+        task = rec.get("task_name") or (ep_id.split("/")[0] if ep_id else "")
+        m = re.search(r"episode_(\d+)", ep_id) or re.search(r"episode_(\d+)", rec.get("dir") or "")
+        rec["task_name"] = task
+        rec["episode_index"] = int(m.group(1)) if m else None
+        rec["task_split"] = splits.get(task, "other")
+        return rec
+
+    idx = md / "index.json"
+    if idx.exists():
+        try:
+            doc = json.loads(idx.read_text())
+            out = []
+            for e in doc.get("episodes", []):
+                ep_id = e.get("episode_id") or ""
+                flat = ep_id.replace("/", "__")
+                if flat and not (md / flat).is_dir():
+                    continue          # listed but no longer on disk
+                out.append(enrich({"dir": flat, **e}))
+            if out:
+                return jsonify(out)
+        except Exception:  # noqa: BLE001 - fall through to the directory scan
+            pass
+
+    eps = []
+    if md.exists():
+        for d in sorted(p for p in md.iterdir() if p.is_dir()):
+            f = d / "episode.json"
+            if not f.exists():
+                continue
+            try:
+                doc = json.loads(f.read_text())
+            except Exception:  # noqa: BLE001
+                continue
+            eps.append(enrich({
+                "dir": d.name, "episode_id": doc.get("episode_id"),
+                "task_name": doc.get("task_name"),
+                "episode_success": doc.get("episode_success"),
+                "n_turns": doc.get("n_turns"), "termination": doc.get("termination"),
+                "error": doc.get("error")}))
+    return jsonify(eps)
+
+
+@app.route("/api/combine/episode/<method>/<episode>")
+def api_combine_episode(method, episode):
+    f = COMBINE_ROOT / method / episode / "episode.json"
+    if not f.exists():
+        return jsonify({"error": "not found"}), 404
+    return jsonify(json.loads(f.read_text()))
+
+
+@app.route("/api/combine/turn/<method>/<episode>/<turn>")
+def api_combine_turn(method, episode, turn):
+    """Full per-turn doc: S2 prompts/response + S1 segment + clip stats (incl. per-frame table)."""
+    base = COMBINE_ROOT / method / episode / turn
+    out = {}
+    for name, key in (("turn.json", "turn"), ("s1_steps.json", "s1_steps"), ("plan.json", "plan")):
+        f = base / name
+        if f.exists():
+            try:
+                out[key] = json.loads(f.read_text())
+            except Exception as e:  # noqa: BLE001
+                out[key] = {"error": str(e)}
+    if not out:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(out)
+
+
+@app.route("/api/combine/media/<method>/<episode>/<turn>/<path:fname>")
+def api_combine_media(method, episode, turn, fname):
+    """Serve any artifact under a turn dir (mp4 / png), including clip_frames/*.png."""
+    base = (COMBINE_ROOT / method / episode / turn).resolve()
+    p = (base / fname).resolve()
+    if not str(p).startswith(str(base)) or not p.exists():   # no path traversal
+        return jsonify({"error": "not found"}), 404
+    return send_file(str(p))
+
+COMBINE_HTML = """<!doctype html><meta charset=utf-8>
+<title>System2+System1 combined eval</title>
+<style>
+ *{box-sizing:border-box}
+ body{font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;color:#1a1a1a;
+      background:#fafafb;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+ a{color:#0a58ca}
+ select,button{font:13px inherit;padding:3px 8px}
+ /* ---- sticky top: selectors + turn nav + track ---- */
+ #top{flex:0 0 auto;background:#fff;border-bottom:1px solid #ddd;padding:7px 12px}
+ .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+ h1{font-size:14px;margin:0 6px 0 0}h1 b{color:#b0431c}
+ .nav button{border:1px solid #bbb;background:#fff;border-radius:6px;cursor:pointer;padding:3px 11px}
+ .nav button:disabled{opacity:.4;cursor:default}
+ .nav button:not(:disabled):hover{background:#f0f3fa}
+ .pos{font-family:ui-monospace,monospace;font-size:12px;color:#555;min-width:96px}
+ .epsum{font-size:12px;color:#666;margin-left:auto;font-family:ui-monospace,monospace}
+ /* ---- track: one segment per turn, width ~ steps executed ---- */
+ #track{margin-top:6px}
+ .lane{display:flex;align-items:center;gap:8px;margin-top:3px}
+ .lab{flex:0 0 74px;font-size:10px;color:#999;text-align:right;text-transform:uppercase;letter-spacing:.04em}
+ .bar{position:relative;flex:1;height:24px;background:#f1f1f4;border:1px solid #e3e3e8;border-radius:4px}
+ .seg{position:absolute;top:1px;bottom:1px;border-radius:3px;cursor:pointer;padding:0 5px;font-size:10px;
+      line-height:20px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;
+      font-family:ui-monospace,monospace;box-sizing:border-box;border:1px solid}
+ .seg:hover{filter:brightness(.95)}
+ .seg.cur{font-weight:700;z-index:3;box-shadow:0 0 0 2px #1a1a1a inset}
+ .s-plan{background:#e9e2f8;border-color:#a98fd8;color:#3f2a6b}
+ .s-begin{background:#e8e8ec;border-color:#bbb;color:#444}
+ .s-complete{background:#cfe0ff;border-color:#7fa8f0;color:#1c3a6b}
+ .s-incomplete{background:#fff1cf;border-color:#dcae4a;color:#6b4a12}
+ .s-failed{background:#fbdcdc;border-color:#d07070;color:#7a1f1f}
+ .s-finish{background:#d3f0d8;border-color:#5fa96b;color:#1d4b26}
+ /* ---- body: 2 columns ---- */
+ #body{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:2fr 4fr;gap:9px;padding:9px}
+ #body.single{grid-template-columns:minmax(0,900px)}
+ .col{min-height:0;display:flex;flex-direction:column;gap:8px;overflow-y:auto;overflow-x:hidden}
+ .card{background:#fff;border:1px solid #e3e3e8;border-radius:7px;padding:8px 10px}
+ .card h3{margin:0 0 6px;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:#8a8a92;
+          border-bottom:1px solid #f0f0f3;padding-bottom:4px}
+ .card h3 span{float:right;text-transform:none;letter-spacing:0;color:#b0431c;font-weight:700}
+ pre{white-space:pre-wrap;word-break:break-word;background:#fafafa;border:1px solid #eee;border-radius:4px;
+     padding:7px;margin:3px 0;font:12px/1.45 ui-monospace,Menlo,monospace}
+ .k{color:#999;font-size:11px}
+ .kv{margin:2px 0}
+ .tag{display:inline-block;padding:1px 7px;border-radius:9px;font-size:11px;border:1px solid #bbb;margin-right:4px}
+ .j-task_finish{background:#d3f0d8;border-color:#5fa96b}
+ .j-subgoal_complete{background:#cfe0ff;border-color:#7fa8f0}
+ .j-subgoal_incomplete{background:#fff1cf;border-color:#dcae4a}
+ .j-subgoal_failed{background:#fbdcdc;border-color:#d07070}
+ .j-task_begin{background:#e8e8ec}
+ .sg{font-size:15px;font-weight:700;color:#0a4a9c;margin:3px 0}
+ /* visual inputs at 2/3 width: the tiled 3-cam frames are very wide, so shrinking them frees
+    horizontal space for the text/number panels beside them */
+ video,img.tile{width:66%;max-width:100%;border:1px solid #ccc;border-radius:4px;background:#000;display:block}
+ video.full,img.tile.full{width:100%}
+ table{border-collapse:collapse;font-size:11px;width:100%} td,th{border:1px solid #e6e6ea;padding:1px 5px}
+ th{background:#f5f5f8;position:sticky;top:0;z-index:1}
+ .drop{color:#c0c0c0} .keep{background:rgba(46,139,61,.13);font-weight:600}
+ /* condensed-clip thumbnails: the strip is capped at the same 2/3 width as every other visual
+    input so it lines up with the videos above it instead of running the full column. */
+ .frames{display:flex;gap:3px;flex-wrap:wrap;width:66%;max-width:100%}
+ .frames img{height:46px;border:1px solid #ccc}
+ .muted{color:#888;font-size:12px}
+ details>summary{cursor:pointer;font-size:11px;color:#666;padding:2px 0}
+ .scroll{max-height:230px;overflow:auto}
+ .pill{display:inline-block;background:#f0f0f4;border:1px solid #ddd;border-radius:4px;padding:1px 6px;
+       font-family:ui-monospace,monospace;font-size:11px;margin-right:4px}
+ /* maintained task plan (aggregated from System2 <plan_update>s) — fixed height, scrollable so the
+    full history of milestones AND fine steps stays reachable without pushing the panels down */
+ .plangrid{display:flex;flex-direction:column;gap:1px;padding:5px 7px;background:#fcfcfd;
+           border:1px solid #e6e6ea;border-radius:5px;height:190px;overflow:auto}
+ .pl{font-family:ui-monospace,monospace;font-size:11.5px;padding:1px 5px;border-radius:3px;
+     border-left:3px solid transparent;white-space:pre}
+ .pl-child{margin-left:16px;font-size:11px;opacity:.92}
+ .pl-todo{color:#666;border-left-color:#ddd}
+ .pl-doing{color:#7a4a10;background:#fff8e8;border-left-color:#dcae4a;font-weight:600}
+ .pl-done{color:#2b6b36;background:#f0f9f1;border-left-color:#5fa96b}
+ .pl-new{box-shadow:0 0 0 1px #b0431c inset}
+ /* step scrubber: drag to walk the segment; prompt + action-chunk pointer follow */
+ .scrub{display:flex;align-items:center;gap:8px;margin:5px 0 2px}
+ .scrub input[type=range]{flex:1}
+ .scrub .cnt{font-family:ui-monospace,monospace;font-size:11px;color:#555;min-width:96px}
+ .chunkrow.at{background:#ffe9d6;box-shadow:0 0 0 1px #b0431c inset;font-weight:700}
+ .chunkrow.exec{background:rgba(46,139,61,.10)}
+ .ptr{color:#b0431c;font-weight:700}
+ /* video player + synchronized curves, same interaction model as /episode */
+ .player{display:flex;align-items:center;gap:7px;margin:4px 0}
+ .player input[type=range]{flex:1;min-width:120px}
+ .player button{border:1px solid #bbb;background:#fff;border-radius:5px;cursor:pointer;padding:2px 8px}
+ .fld{margin-top:5px}
+ .fld .cap{font-size:10px;color:#999;text-transform:uppercase;letter-spacing:.04em;display:flex;
+           justify-content:space-between}
+ canvas.curve{width:100%;height:82px;display:block;border:1px solid #eee;border-radius:4px;background:#fff}
+ .lg{font-size:10px;color:#666} .lg i{display:inline-block;width:9px;height:3px;margin:0 3px 2px 6px}
+ .tcost{font-size:11px;color:#555;font-family:ui-monospace,monospace;margin-top:3px}
+ /* two minipage columns inside the System1 output card: video+curves stacked on the left, the
+    predicted action chunk beside them on the right so the pointer is visible while the video plays */
+ .mini{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start}
+ .minicol{min-width:0}
+ .minicol .scroll{max-height:none}
+ /* the action chunk is short (one H-step chunk), so show it in full — no inner scroll */
+ #chunkbody .scroll{max-height:none;overflow:visible}
+ .stopwhy{margin-top:7px;padding:5px 8px;border:1px solid;border-radius:5px;font-size:12px}
+ .stopwhy code{font-family:ui-monospace,monospace;background:rgba(0,0,0,.05);padding:0 3px;border-radius:2px}
+</style>
+<div id=top>
+  <div class=row>
+    <h1>RoboCasa <b>S2+S1</b></h1>
+    <label>method <select id=method></select></label>
+    <label>type <select id=tasktype></select></label>
+    <label>task <select id=task></select></label>
+    <label>episode <select id=episode></select></label>
+    <span class=nav>
+      <button id=prev>&lsaquo; prev</button>
+      <span class=pos id=pos></span>
+      <button id=next>next &rsaquo;</button>
+    </span>
+    <span class=epsum id=epsum></span>
+  </div>
+  <div id=track></div>
+</div>
+<div id=body>
+  <div class=col id=left></div>
+  <div class=col id=right></div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const S={method:null,ep:null,doc:null,ti:0,turns:[]};   // ti = index into S.turns (0 = plan)
+const esc=s=>(s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const jtag=j=>j?`<span class="tag j-${esc(j)}">${esc(j)}</span>`:'';
+const nn=v=>(v==null?'&ndash;':v);
+
+// Judge -> track segment class. The synthetic "plan" turn gets its own colour.
+function segClass(t){
+  if(t.kind==='plan')return 's-plan';
+  const j=t.judge||'';
+  if(j==='task_finish')return 's-finish';
+  if(j==='subgoal_complete')return 's-complete';
+  if(j==='subgoal_incomplete')return 's-incomplete';
+  if(j==='subgoal_failed')return 's-failed';
+  return 's-begin';
+}
+
+async function loadMethods(){
+  const ms=await (await fetch('/api/combine/methods')).json();
+  $('#method').innerHTML=ms.map(m=>`<option value="${m.method}">${m.method} (${m.n_success??'?'}/${m.n_episodes??'?'})</option>`).join('');
+  if(!ms.length){$('#left').innerHTML='<div class=card><span class=muted>No combined runs under eval_results/combine yet.</span></div>';return;}
+  S.method=ms[0].method; await loadEpisodes();
+}
+const SPLIT_LABEL={atomic_seen:'atomic-seen',composite_seen:'composite-seen',
+                   composite_unseen:'composite-unseen',other:'other'};
+const SPLIT_ORDER=['atomic_seen','composite_seen','composite_unseen','other'];
+// Only the LIGHTWEIGHT list is fetched here (from the method's index.json). The full per-episode
+// doc — every turn, prompt and clip_stats — is loaded lazily in selectEpisode().
+async function loadEpisodes(){
+  const eps=await (await fetch(`/api/combine/episodes/${S.method}`)).json();
+  window._eps=eps;
+  const present=new Set(eps.map(e=>e.task_split||'other'));
+  const types=SPLIT_ORDER.filter(t=>present.has(t));
+  const keep=$('#tasktype').value;
+  $('#tasktype').innerHTML=types.map(t=>{
+    const n=eps.filter(e=>(e.task_split||'other')===t).length;
+    return `<option value="${t}">${SPLIT_LABEL[t]||t} (${n})</option>`;}).join('');
+  $('#tasktype').value=(keep&&types.includes(keep))?keep:(types[0]||'');
+  fillTasks();
+}
+// TYPE -> TASK -> EPISODE cascade. Each level filters the next and tries to preserve the current
+// selection, so switching type/task doesn't lose your place when the same task/episode still exists.
+function fillTasks(){
+  const t=$('#tasktype').value, eps=window._eps||[];
+  const tasks=[...new Set(eps.filter(e=>(e.task_split||'other')===t).map(e=>e.task_name))].sort();
+  const keep=$('#task').value;
+  $('#task').innerHTML=tasks.map(n=>{
+    const rows=eps.filter(e=>e.task_name===n);
+    const ok=rows.filter(e=>e.episode_success).length;
+    return `<option value="${n}">${n} (${ok}/${rows.length})</option>`;}).join('');
+  // Set the value EXPLICITLY: don't rely on innerHTML implicitly selecting option 0, otherwise a
+  // stale value from the previous type can survive and leave the episode list empty.
+  $('#task').value=(keep&&tasks.includes(keep))?keep:(tasks[0]||'');
+  fillEpisodes();
+}
+function fillEpisodes(){
+  const task=$('#task').value, eps=window._eps||[];
+  // Keep the ORIGINAL index so selectEpisode() still addresses window._eps directly.
+  const rows=eps.map((e,i)=>({e,i})).filter(({e})=>e.task_name===task)
+                .sort((a,b)=>(a.e.episode_index??0)-(b.e.episode_index??0));
+  const keep=+$('#episode').value;
+  $('#episode').innerHTML=rows.map(({e,i})=>{
+    const ep=e.episode_index!=null?`ep${e.episode_index}`:'ep?';
+    return `<option value="${i}">${e.episode_success?'\u2713':'\u2717'} ${ep}</option>`;}).join('');
+  const first=rows.length?String(rows[0].i):'';
+  $('#episode').value=rows.some(r=>r.i===keep)?String(keep):first;
+  const sel=+$('#episode').value;
+  if(rows.length)selectEpisode(Number.isNaN(sel)?rows[0].i:sel);
+  else{$('#left').innerHTML='<div class=card><span class=muted>no episodes</span></div>';
+       $('#right').innerHTML='';$('#track').innerHTML='';}
+}
+async function selectEpisode(i){
+  const e=window._eps[i]; S.ep=e.dir;
+  S.doc=await (await fetch(`/api/combine/episode/${S.method}/${S.ep}`)).json();
+  const d=S.doc;
+  // Turn list = a synthetic PLAN turn (System2 only) + every execution turn from episode.json.
+  S.turns=[{kind:'plan'}].concat((d.turns||[]).map(t=>({kind:'exec',...t})));
+  $('#epsum').textContent=`${d.task_name} · ${d.episode_success?'SUCCESS':'FAIL'} · ${d.n_turns} turns · ${d.termination} · ${d.seconds}s`;
+  drawTrack();
+  selectTurn(0);
+}
+// Track: segment width proportional to steps executed (plan/finish turns get a fixed slice), so
+// the bar reads as a timeline of where the episode actually spent its control steps.
+function drawTrack(){
+  const ts=S.turns;
+  const w=ts.map(t=>Math.max(t.kind==='plan'?26:(t.n_steps||0),26));
+  const tot=w.reduce((a,b)=>a+b,0)||1;
+  let acc=0;
+  const segs=ts.map((t,i)=>{
+    const L=100*acc/tot, W=100*w[i]/tot; acc+=w[i];
+    const lab=t.kind==='plan'?'PLAN':`t${t.turn} ${(t.judge||'?').replace('subgoal_','sg_')}`;
+    const tip=t.kind==='plan'?'plan mode (System2 only)'
+      :`turn ${t.turn}: ${t.judge||'?'}\\n${t.subgoal||'(no subgoal)'}\\nsteps=${t.n_steps??0} est=${t.estimated_step??'-'} stop=${t.stop_reason||'-'}`;
+    return `<div class="seg ${segClass(t)}${i===S.ti?' cur':''}" data-i="${i}" title="${esc(tip)}"
+              style="left:${L}%;width:${W}%">${esc(lab)}</div>`;
+  }).join('');
+  $('#track').innerHTML=`<div class=lane><div class=lab>turns</div><div class=bar>${segs}</div></div>`;
+  document.querySelectorAll('#track .seg').forEach(s=>s.onclick=()=>selectTurn(+s.dataset.i));
+}
+function setNav(){
+  $('#prev').disabled=S.ti<=0;
+  $('#next').disabled=S.ti>=S.turns.length-1;
+  const t=S.turns[S.ti];
+  $('#pos').textContent=`${S.ti+1}/${S.turns.length}  ${t.kind==='plan'?'plan':'turn '+t.turn}`;
+  document.querySelectorAll('#track .seg').forEach(s=>s.classList.toggle('cur',+s.dataset.i===S.ti));
+}
+
+// ---- MAINTAINED TASK PLAN ----
+// The live two-level checklist AS OF the selected turn: System2 returns only the changed milestone
+// block each turn (<plan_update>), which combined_eval merges into the running plan and saves as
+// plan_after. We show that merged state, marking lines the CURRENT turn changed so you can watch
+// the plan evolve turn by turn. Marks: [ ] todo, [~] doing, [x] done.
+function planAsOf(i){
+  const t=S.turns[i];
+  if(!t)return '';
+  if(t.kind==='plan')return (S.doc.plan||{}).plan||'';
+  return t.plan_after||planBefore(t);
+}
+function planCard(){
+  const cur=planAsOf(S.ti), before=S.ti>0?planAsOf(S.ti-1):'';
+  if(!cur)return '';
+  const changed=new Set(cur.split('\\n').filter(l=>l.trim()&&!before.split('\\n').includes(l)));
+  const rows=cur.split('\\n').filter(l=>l.trim()).map(l=>{
+    const m=l.match(/\\[(.)\\]/), mark=m?m[1]:' ';
+    const isChild=/^\\s*\\*/.test(l);
+    const cls=mark==='x'?'pl-done':(mark==='~'?'pl-doing':'pl-todo');
+    const ch=changed.has(l)?' pl-new':'';
+    return `<div class="pl ${cls}${ch}${isChild?' pl-child':''}">${esc(l.trim())}</div>`;
+  }).join('');
+  const t=S.turns[S.ti];
+  const label=t.kind==='plan'?'initial plan':`merged through turn ${t.turn}`;
+  return `<div class=card><h3>Maintained task plan<span>${label}</span></h3>
+    <div class=muted style="margin-bottom:3px">aggregated from every System2 &lt;plan_update&gt;;
+      outlined = changed this turn. Scroll for full history.</div>
+    <div class=plangrid>${rows}</div></div>`;
+}
+
+// ---- PLAN turn (turn 0): System2 only, single wide column. ----
+async function renderPlan(){
+  const d=S.doc;
+  const j=await (await fetch(`/api/combine/turn/${S.method}/${S.ep}/plan`)).json();
+  const P=j.plan||{};
+  const M=f=>`/api/combine/media/${S.method}/${S.ep}/plan/${f}`;
+  $('#body').classList.add('single'); $('#right').innerHTML='';
+  $('#left').innerHTML=
+   planCard()+
+   `<div class=card><h3>Plan mode &mdash; System2 input<span>cold / no memory</span></h3>
+      <div class=kv><span class=k>goal</span> <b>${esc(d.instruction)}</b></div>
+      <div class=kv><span class=k>opening scene (3 cams tiled 256&times;768)</span></div>
+      <img class=tile src="${M('scene.png')}">
+      <details><summary>system prompt</summary><pre>${esc(P.s2_system_prompt)}</pre></details>
+      <details open><summary>user prompt</summary><pre>${esc(P.s2_user_prompt)}</pre></details>
+    </div>
+    <div class=card><h3>Plan mode &mdash; System2 output<span>vLLM ${P.latency_s ?? '-'}s</span></h3>
+      <div class=k>&lt;thought&gt;</div><pre>${esc(P.thought)}</pre>
+      <div class=k>&lt;plan&gt; (milestone checklist handed to execution mode)</div>
+      <pre>${esc(P.plan)}</pre>
+      <details><summary>raw response</summary><pre>${esc(P.s2_response_raw)}</pre></details>
+      <div class=tcost>time cost &mdash; vLLM request ${nn(P.latency_s)}s</div>
+    </div>`;
+}
+
+
+// ---- EXECUTION turn: System2 left, System1 right. Terminal turns have no System1. ----
+async function renderExec(t){
+  const dir=`turn${String(t.turn).padStart(2,'0')}`;
+  const j=await (await fetch(`/api/combine/turn/${S.method}/${S.ep}/${dir}`)).json();
+  const T=j.turn||{}, s2=T.s2||{}, s1=T.s1;
+  const M=f=>`/api/combine/media/${S.method}/${S.ep}/${dir}/${f}`;
+  const priv=s2.privileged||{};
+  const cm=s2.media||{};
+  // System2 watches the clip PRODUCED BY THE PREVIOUS turn, so serve it from that turn's dir.
+  const clipFrom=(cm.clip_from_turn!=null)?`turn${String(cm.clip_from_turn).padStart(2,'0')}`:null;
+  const clipUrl=clipFrom?`/api/combine/media/${S.method}/${S.ep}/${clipFrom}/s2_input_clip.mp4`:null;
+  let inMedia;
+  if(t.turn===0) inMedia=`<div class=k>opening scene (no step has run yet)</div><img class=tile src="${M('s2_input_scene.png')}">`;
+  else if(clipUrl){
+    const ci=cm.video||{};
+    inMedia=`<div class=k>clip of the segment System1 just ran &mdash; from ${clipFrom}
+      (${ci.n_frames??'?'} frames @${ci.fps??4}fps${s2.nframes_requested!=null?`, ${s2.nframes_requested} sampled by the model`:''})</div>
+      <video controls loop src="${clipUrl}"></video>`;
+  }
+  else inMedia='<span class=muted>no input media recorded</span>';
+
+  $('#body').classList.toggle('single', !s1);
+  $('#left').innerHTML=
+   planCard()+
+   `<div class=card><h3>System2 input &mdash; execution<span>turn ${t.turn}</span></h3>
+      <div class=kv><span class=k>goal</span> ${esc(S.doc.instruction)}</div>
+      <div class=kv><span class=k>privileged from env</span>
+        <span class=pill>task status: ${esc(priv.task_status)}</span>
+        <span class=pill>gripper: ${esc(priv.gripper_status)}</span></div>
+      ${inMedia}
+      <div class=kv style="margin-top:6px"><span class=k>plan handed in</span></div>
+      <pre>${esc(planBefore(t))}</pre>
+      <details><summary>system prompt</summary><pre>${esc(s2.system_prompt)}</pre></details>
+      <details><summary>full user prompt</summary><pre>${esc(s2.user_prompt)}</pre></details>
+    </div>
+    <div class=card><h3>System2 output<span>vLLM ${s2.latency_s ?? '-'}s</span></h3>
+      <div>${jtag(s2.judge)}<span class=k>estimated_step</span> <b>${nn(s2.estimated_step)}</b></div>
+      ${s2.subgoal?`<div class=sg>&rarr; ${esc(s2.subgoal)}</div>
+        <div class=muted>${esc(s2.subgoal_detail)}</div>`
+        :'<div class=muted style="margin:4px 0">no subgoal issued (terminal turn)</div>'}
+      <div class=k>&lt;thought&gt;</div><pre>${esc(s2.thought)}</pre>
+      <div class=k>&lt;plan_update&gt;</div><pre>${esc(s2.plan_update)}</pre>
+      <details><summary>plan after this turn</summary><pre>${esc(T.plan_after)}</pre></details>
+      <details><summary>raw response</summary><pre>${esc(s2.response_raw)}</pre></details>
+      <div class=tcost>time cost &mdash; request ${nn(s2.latency_s)}s
+        &middot; +media prep ${nn(s2.t_total_s)}s
+        &middot; ${s2.nframes_requested!=null?s2.nframes_requested+' frames sampled':'image input'}</div>
+    </div>`;
+
+  if(!s1){
+    $('#right').innerHTML='';
+    return;
+  }
+  const st=s1.clip_stats||{};
+  // The condensed frames are no longer dumped as PNGs (they were a ~2 MB/episode duplicate of the
+  // clip mp4). The strip is gone; the clip video above IS the frame-by-frame record.
+  const frames='';
+  let pf='';
+  if(st.per_frame&&st.per_frame.length){
+    pf=`<details><summary>per-frame condensing audit (${st.per_frame.length} steps &rarr; ${st.n_final} clip frames, eps=${st.eps??'n/a'})</summary>`+
+       `<div class=scroll><table><tr><th>step</th><th>motion</th><th>&ge;eps</th><th>in clip</th></tr>`+
+       st.per_frame.map(r=>`<tr class="${r.in_clip?'keep':(r.moving?'':'drop')}"><td>${r.i}</td><td>${r.motion}</td><td>${r.moving?'yes':'no'}</td><td>${r.in_clip?'KEPT':''}</td></tr>`).join('')+
+       `</table></div></details>`;
+  }
+  const x=T.timings||{};
+  const steps=(j.s1_steps?.steps||[]);
+  window._steps=steps;
+  S._s1=s1; S._turn=T;      // the stop-reason panel reads these
+  // Build the plot series once per turn (progress + the three action-delta channels), mirroring
+  // /episode: the video, slider, curves, prompt and action-chunk pointer all key off ONE step index.
+  S.series={
+    // Progress is only returned on REPLAN steps (the policy is queried once per chunk), so hold the
+    // last reading forward — otherwise the curve is a row of isolated dots and the readout reads n/a
+    // on the steps in between. Held values are the model's most recent estimate, not interpolation.
+    // PER-STEP progress. For progact ('action' head) the policy predicts progress for EVERY step of
+    // the chunk, so index chunk[offset] where offset = steps consumed since the replan — the same
+    // value the stop rule now uses. That makes the curve genuinely continuous instead of a staircase
+    // of chunk[0] readings. progreg ('continuous') returns one scalar per replan, so it is held
+    // forward; progIsFresh marks which points are model readings vs held.
+    prog: (()=>{
+      let chunk=null, off=0, last=null;
+      return steps.map(v=>{
+        const q=v.query, p=v.progress_raw||{};
+        if(v.replanned&&q&&q.chunk_progress&&q.chunk_progress.length){chunk=q.chunk_progress;off=0;}
+        else if(v.replanned){chunk=null;off=0;}
+        else off++;
+        if(chunk&&off<chunk.length){last=+chunk[off];}
+        else if(p.progress_now!=null){last=+p.progress_now;}
+        return last;});})(),
+    // A point is "fresh" when it comes from a per-step chunk entry or a replan scalar (progreg).
+    progIsFresh: (()=>{
+      let chunk=null, off=0;
+      return steps.map(v=>{
+        const q=v.query;
+        if(v.replanned&&q&&q.chunk_progress&&q.chunk_progress.length){chunk=q.chunk_progress;off=0;return true;}
+        if(v.replanned){chunk=null;off=0;return (v.progress_raw||{}).progress_now!=null;}
+        off++;
+        return !!(chunk&&off<chunk.length);});})(),
+    motion: steps.map(v=>v.motion_norm??0),
+    // Gripper STATE delta (finger pad distance, m) -- its own series, NOT folded into |da|, which
+    // is eef_pos+eef_rot+base only. A grasp shows up here as a ~0.005 spike settling to ~0.0006.
+    gripd: steps.map(v=>v.grip_width_delta??0),
+    gripw: steps.map(v=>v.grip_width??null),
+    eef_pos: steps.map(v=>v.action_eef_pos_norm??0),
+    eef_rot: steps.map(v=>v.action_eef_rot_norm??0),
+    base: steps.map(v=>v.action_base_norm??0),
+    replan: steps.map(v=>!!v.replanned),
+  };
+  S.fps=(s1.video_raw&&s1.video_raw.fps)||20;
+  $('#right').innerHTML=
+   `<div class=card><h3>System1 input<span id=promptpos>${esc(s1.stop_reason)}</span></h3>
+      <div class=sg>${esc(s1.prompt_text)}</div>
+      <div class=kv>
+        <span class=pill>est_length ${s1.est_length}</span>
+        <span class=pill>budget ${s1.budget}</span>
+        <span class=pill>steps ${s1.n_steps}</span>
+        <span class=pill>progress_done ${s1.progress_done}</span>
+        <span class=pill>quiescent ${s1.quiescent}</span></div>
+      <div id=promptbody></div>
+    </div>
+    <div class=card><h3>System1 output &mdash; play the rollout<span id=scrubpos></span></h3>
+      <div class=mini>
+        <div class=minicol>
+          <div class=k>raw rollout, every executed step
+            (${(s1.video_raw&&s1.video_raw.n_frames)??s1.n_steps} frames @${S.fps}fps)</div>
+          <video id=vid class=full preload=metadata src="${M('s1_rollout_raw.mp4')}"></video>
+          <div class=player>
+            <button id=play>&#9654; play</button>
+            <button id=bb>&lsaquo;</button>
+            <input type=range id=srange min=0 max="${Math.max(0,steps.length-1)}" value=0>
+            <button id=ff>&rsaquo;</button>
+            <span class=cnt id=scnt></span>
+          </div>
+          <div id=scrubbody></div>
+          <div class=fld><div class=cap><span>progress</span><span class=lg id=proglab></span></div>
+            <canvas class=curve id=curveP></canvas></div>
+          <div class=fld><div class=cap><span>action &Delta; magnitude &mdash; eef + base only</span>
+            <span class=lg><i style="background:#e5484d"></i>eef_pos<i style="background:#f59e0b"></i>eef_rot<i style="background:#16a34a"></i>base<i style="background:#6b7280"></i>|&Delta;a|</span></div>
+            <canvas class=curve id=curveA></canvas></div>
+          <div class=fld><div class=cap><span>gripper state &Delta; (pad distance)</span>
+            <span class=lg id=griplab></span></div>
+            <canvas class=curve id=curveG></canvas></div>
+          <div class=muted>dashed grey = replans &middot; <span style="color:#2b8a3e">green</span> = step where
+        _check_success() fired (checked every step) &middot; <span style="color:#b0431c">orange</span> = current step</div>
+        </div>
+        <div class=minicol>
+          <div id=chunkbody></div>
+        </div>
+      </div>
+      <div class=tcost>time cost &mdash; policy ${nn(x.s1_infer_total_s)}s over ${x.s1_infer_calls??0} calls
+        (mean ${nn(x.s1_infer_mean_s)}s) &middot; env step ${nn(x.env_step_total_s)}s
+        &middot; render ${nn(x.env_render_total_s)}s &middot; obs build ${nn(x.obs_build_total_s)}s
+        &middot; video encode ${nn(x.video_encode_s)}s</div>
+    </div>
+
+    <div class=card><h3>Segment endpoints &mdash; anchor in, condensed clip out</h3>
+      <div class=mini>
+        <div class=minicol>
+          <div class=k>ANCHOR &mdash; first frame of this segment; the subgoal-start views
+            System1 is conditioned on</div>
+          <img class="tile full" src="${M('s1_anchor.png')}">
+        </div>
+        <div class=minicol>
+          <div class=k>CONDENSED CLIP &mdash; what System2 receives on the NEXT turn
+            (${(s1.video_clip&&s1.video_clip.n_frames)??st.n_final} frames @${(s1.video_clip&&s1.video_clip.fps)??4}fps)${st.wait_subgoal?' &middot; WAIT subgoal: static frames KEPT':''}</div>
+          <video class=full controls loop src="${M('s2_input_clip.mp4')}"></video>
+          <div class=muted style="margin-top:3px">mode=${esc(st.mode)} · raw=${st.n_raw} · moving=${nn(st.n_moving)}
+            · dropped=${st.frac_static_dropped!=null?(100*st.frac_static_dropped).toFixed(1)+'%':'-'} · stride=${st.stride}</div>
+        </div>
+      </div>
+      ${frames}${pf}
+    </div>
+    <div class=card><h3>Per-step trace<span>${steps.length} steps</span></h3>
+      <div class=scroll><table><tr><th>step</th><th>progress</th><th>|&Delta;a|</th><th>grip</th><th>eef_pos</th><th>eef_rot</th><th>base</th><th>rp</th><th>S1 s</th><th>step s</th></tr>`+
+      steps.map((v,i)=>`<tr class=trow data-i="${i}" style="cursor:pointer"><td>${v.frame_step}</td><td>${esc(v.progress)}</td><td>${v.motion_norm}</td><td>${esc(v.gripper_flag)}</td><td>${v.action_eef_pos_norm}</td><td>${v.action_eef_rot_norm}</td><td>${v.action_base_norm}</td><td>${v.replanned?'*':''}</td><td>${(v.query&&v.query.s1_infer_s)??''}</td><td>${v.t_env_step_s??''}</td></tr>`).join('')+
+      `</table></div>
+    </div>
+    `;
+  wireVideo();
+}
+// ---- STEP SCRUBBER ----
+// Drag through a segment's executed steps. System1 re-plans every `replan_steps`, so BOTH the
+// language prompt (its state ints + Executed Step change per replan) and the predicted action
+// chunk are rolling quantities. For any step we find the replan that produced it, show that exact
+// prompt, and point at WHICH action inside the chunk is being executed at this step.
+function renderScrub(i){
+  const steps=window._steps||[];
+  if(!steps.length){$('#scrubbody').innerHTML='<span class=muted>no steps</span>';return;}
+  i=Math.max(0,Math.min(i,steps.length-1));
+  window._si=i;
+  const st=steps[i];
+  // the most recent replan at or before this step = the chunk currently being consumed
+  let ri=i; while(ri>0 && !steps[ri].replanned) ri--;
+  const rq=(steps[ri]||{}).query||{};
+  const off=i-ri;                                  // index inside that chunk
+  const ch=rq.chunk_raw12||[], mo=rq.chunk_motion||[], ex=rq.replan_steps||0;
+  const rng=$('#srange'); if(rng&&+rng.value!==i)rng.value=i;
+  const sp=document.getElementById('scrubpos');
+  if(sp)sp.textContent=`step ${st.frame_step} / ${steps.length-1}`;
+  const sc=document.getElementById('scnt');
+  if(sc)sc.textContent=`${i+1}/${steps.length} · replan@${steps[ri].frame_step} +${off}`;
+  drawCurves(i);
+
+  const prog=st.progress_raw||{};
+  const head=`<div class=kv>
+      <span class=pill>progress ${(()=>{
+        // The policy only returns progress on REPLAN steps, so st.progress is the literal "-" in
+        // between. Use the hold-forward series (same values the curve draws) and mark held readings.
+        // Read the SERIES (per-step for progact, held-forward for progreg) so the pill always
+        // agrees with the curve and the stop rule.
+        const v=(S.series&&S.series.prog)?S.series.prog[i]:null;
+        const fresh=!!(S.series&&S.series.progIsFresh&&S.series.progIsFresh[i]);
+        return v==null?'n/a':v.toFixed(4)+(fresh?'':' (held)');
+      })()}</span>
+      <span class=pill>|&Delta;a| ${st.motion_norm}</span>
+      <span class=pill>grip ${esc(st.gripper_flag)}</span>
+      <span class=pill>eef_pos ${st.action_eef_pos_norm}</span>
+      <span class=pill>eef_rot ${st.action_eef_rot_norm}</span>
+      <span class=pill>base ${st.action_base_norm}</span>
+      ${st.replanned?'<span class=pill style="background:#ffe9d6;border-color:#b0431c">REPLAN</span>':''}
+    </div>`;
+  const prompt=rq.prompt?`<div class=k>language prompt in force at this step (from the replan at step ${steps[ri].frame_step})</div>
+      <pre>${esc(rq.prompt)}</pre>`
+    :'<div class=muted>no prompt recorded for this replan</div>';
+  // WHY this segment ended — only meaningful on the LAST step, so it is shown there (and greyed
+  // out earlier). Three outcomes, matching what the loop records:
+  //   stop_rule   -> progress >= thresh AND the arm stopped moving (quiescence) -> subgoal done
+  //   budget      -> timeout: the step budget (estimated_step * horizon_mult, capped) ran out
+  //   env_success -> the simulator's own _check_success() went true, so the TASK is finished
+  const atEnd=(i===steps.length-1);
+  const sr=S._s1||{};
+  const why=(()=>{
+    // _check_success() is evaluated EVERY step and breaks immediately (RoboCasa benchmark
+    // semantics), so stop_reason==='env_success' means the task was solved AT success_step.
+    if(sr.stop_reason==='env_success')return ['task finished',
+      `the simulator's _check_success() returned true at step ${sr.success_step} \u2014 the rollout stopped there`,'#d3f0d8','#5fa96b'];
+    if(sr.stop_reason==='stop_rule')return ['progress reached &amp; arm stopped',
+      `progress ${sr.progress_done?'\u2265 threshold':'below threshold'} AND commanded motion quiescent over the last steps \u2014 subgoal judged complete`,'#cfe0ff','#7fa8f0'];
+    if(sr.stop_reason==='budget')return ['timeout',
+      `hit the step budget (${sr.budget} = est_length ${sr.est_length} \u00d7 horizon_mult) without the stop rule firing`,'#fff1cf','#dcae4a'];
+    return [esc(sr.stop_reason||'unknown'),'',' #eee','#bbb'];
+  })();
+  const stopPanel=`<div class=stopwhy style="opacity:${atEnd?1:.45};background:${why[2]};border-color:${why[3]}">
+      <b>segment ended: ${why[0]}</b>${atEnd?'':' <span class=muted>(fires at the last step)</span>'}
+      ${why[1]?`<div class=muted style="margin-top:2px">${why[1]}</div>`:''}
+      <div class=muted style="margin-top:2px">stop_reason=<code>${esc(sr.stop_reason)}</code>
+        &middot; progress_done=${sr.progress_done} &middot; quiescent=${sr.quiescent}
+        &middot; steps ${sr.n_steps}/${sr.budget}</div>
+    </div>`;
+  const act=`<div class=k>executed action (robosuite 12-d)</div>
+      <pre>${(st.action_raw12||[]).map(v=>(+v).toFixed(3)).join('  ')}</pre>`;
+  let chunk='';
+  if(ch.length){
+    chunk=`<div class=k>predicted action chunk &mdash; replan@${steps[ri].frame_step}, ${ch.length} steps,
+        first ${ex} executed (shaded); <span class=ptr>&#9654;</span> = running at this step (+${off})</div>
+      <div class=scroll id=chunkscroll><table>
+        <tr><th></th><th>i</th><th>|&Delta;a|</th><th>eef_pos xyz</th><th>eef_rot rpy</th><th>grip</th><th>base</th></tr>`+
+      ch.map((a,k)=>`<tr class="chunkrow${k===off?' at':''}${k<ex?' exec':''}" ${k===off?'id=atrow':''}>
+          <td>${k===off?'<span class=ptr>&#9654;</span>':''}</td><td>${k}</td><td>${mo[k]??''}</td>
+          <td>${a.slice(0,3).map(v=>v.toFixed(3)).join(' ')}</td>
+          <td>${a.slice(3,6).map(v=>v.toFixed(3)).join(' ')}</td>
+          <td>${a[6].toFixed(2)}</td>
+          <td>${a.slice(7,11).map(v=>v.toFixed(3)).join(' ')}</td></tr>`).join('')+
+      `</table></div>`;
+  } else {
+    chunk='<div class=muted>action chunk not recorded in this run (re-run with the current combined_eval.py to capture it)</div>';
+  }
+  // Left minipage keeps the video+curves; the per-step readout and prompt go under them, while the
+  // action chunk renders in the RIGHT minipage so the moving pointer stays visible during playback.
+  // readout line lives under the video; the rolling language prompt lives in the System1 input card
+  $('#scrubbody').innerHTML=head;
+  const pb=document.getElementById('promptbody');
+  if(pb)pb.innerHTML=prompt;
+  const pp=document.getElementById('promptpos');
+  if(pp)pp.textContent=`step ${st.frame_step} · replan@${steps[ri].frame_step}`;
+  // executed action sits directly UNDER the chunk table: it's the row the pointer marks, so
+  // reading "predicted chunk -> what actually got sent" top-to-bottom keeps them adjacent.
+  const cb=document.getElementById('chunkbody');
+  if(cb)cb.innerHTML=chunk+act+stopPanel;
+  const at=document.getElementById('atrow');
+  if(at&&at.scrollIntoView)at.scrollIntoView({block:'nearest'});
+}
+// ---- CURVES (same canvas approach as /episode) ----
+// One canvas per field; a vertical cursor marks the current step and dashed lines mark replans.
+function _curve(cvId, lines, ymax, cur, yTicks){
+  const cv=document.getElementById(cvId); if(!cv||!S.series)return;
+  const W=cv.clientWidth||600, H=cv.clientHeight||82; cv.width=W; cv.height=H;
+  const ctx=cv.getContext('2d'); ctx.clearRect(0,0,W,H);
+  const n=S.series.motion.length; if(n<2)return;
+  const pad={l:34,r:8,t:6,b:12}, gw=W-pad.l-pad.r, gh=H-pad.t-pad.b;
+  const X=i=>pad.l+gw*i/(n-1), Y=v=>pad.t+gh*(1-(v==null?0:v)/ymax);
+  ctx.strokeStyle='#eee';ctx.lineWidth=1;ctx.fillStyle='#aaa';ctx.font='9px monospace';
+  (yTicks||[0,ymax]).forEach(t=>{const y=Y(t);ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(W-pad.r,y);ctx.stroke();ctx.fillText(String(t),2,y+3);});
+  ctx.strokeStyle='#d8d8e0';ctx.setLineDash([3,3]);
+  S.series.replan.forEach((r,i)=>{if(!r||i===0)return;const xx=X(i);ctx.beginPath();ctx.moveTo(xx,pad.t);ctx.lineTo(xx,H-pad.b);ctx.stroke();});
+  ctx.setLineDash([]);
+  lines.forEach(({arr,color,w})=>{ctx.strokeStyle=color;ctx.lineWidth=w||1.5;ctx.beginPath();let go=false;
+    arr.forEach((v,i)=>{if(v==null)return;const xx=X(i),yy=Y(v);if(!go){ctx.moveTo(xx,yy);go=true;}else ctx.lineTo(xx,yy);});ctx.stroke();});
+  // green marker at the step where _check_success() first fired (dense per-step benchmark check)
+  const ss=(S._s1||{}).success_step;
+  if(ss!=null&&ss<n){const xs=X(ss);ctx.strokeStyle='#2b8a3e';ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(xs,pad.t);ctx.lineTo(xs,H-pad.b);ctx.stroke();}
+  if(cur!=null){const xx=X(cur);ctx.strokeStyle='#b0431c';ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(xx,pad.t);ctx.lineTo(xx,H-pad.b);ctx.stroke();}
+}
+function drawCurves(cur){
+  if(!S.series)return;
+  _curve('curveP',[{arr:S.series.prog,color:'#2d5bd7',w:1.8}],1.0,cur,[0,0.5,1]);
+  const nm=Math.max(0.05,...S.series.eef_pos,...S.series.eef_rot,...S.series.base,...S.series.motion);
+  _curve('curveA',[{arr:S.series.eef_pos,color:'#e5484d'},{arr:S.series.eef_rot,color:'#f59e0b'},
+                   {arr:S.series.base,color:'#16a34a'},{arr:S.series.motion,color:'#6b7280',w:1}],
+         nm,cur,[0,+(nm/2).toFixed(2),+nm.toFixed(2)]);
+  // gripper STATE delta on its own axis; the dashed line is grip_eps (0.001), the settle bar.
+  const gm=Math.max(0.002,...S.series.gripd);
+  _curve('curveG',[{arr:S.series.gripd,color:'#8b5cf6',w:1.6}],gm,cur,[0,0.001,+gm.toFixed(4)]);
+  const gl=document.getElementById('griplab');
+  if(gl){const w=S.series.gripw[cur];
+    gl.textContent=`width ${w!=null?w.toFixed(4):'n/a'} m · |Δ| ${(S.series.gripd[cur]??0).toFixed(5)} (settle < 0.001)`;}
+  const p=S.series.prog[cur];
+  const fresh=S.series.progIsFresh&&S.series.progIsFresh[cur];
+  const pl=document.getElementById('proglab');
+  if(pl)pl.textContent=(p!=null?p.toFixed(4):'n/a')+(fresh?' (fresh)':' (held from last replan)')+'  ·  stop ≥ 0.95';
+}
+
+// ---- VIDEO PLAYER (mirrors /episode: rVFC follow-loop, slider is the source of truth) ----
+function wireVideo(){
+  const v=$('#vid'), rng=$('#srange');
+  if(!v||!rng)return;
+  if(S._rvfc!=null){
+    if('cancelVideoFrameCallback' in HTMLVideoElement.prototype){try{v.cancelVideoFrameCallback(S._rvfc);}catch(e){}}
+    else{cancelAnimationFrame(S._rvfc);}
+    S._rvfc=null;
+  }
+  const nSteps=()=>(window._steps||[]).length;
+  const hasRVFC='requestVideoFrameCallback' in HTMLVideoElement.prototype;
+  // Follow per PRESENTED frame so the panel + chunk pointer advance one step at a time.
+  const follow=(now,meta)=>{
+    if(v.paused){S._rvfc=null;return;}
+    const t=(meta&&meta.mediaTime!=null)?meta.mediaTime:v.currentTime;
+    const i=Math.min(nSteps()-1,Math.round(t*S.fps));
+    if(i!==(+rng.value)){rng.value=i;renderScrub(i);}
+    S._rvfc=v.requestVideoFrameCallback(follow);
+  };
+  const raf=()=>{if(v.paused){S._rvfc=null;return;}
+    const i=Math.min(nSteps()-1,Math.round(v.currentTime*S.fps));
+    if(i!==(+rng.value)){rng.value=i;renderScrub(i);}
+    S._rvfc=requestAnimationFrame(raf);};
+  v.addEventListener('play',()=>{if(S._rvfc)return;
+    S._rvfc=hasRVFC?v.requestVideoFrameCallback(follow):requestAnimationFrame(raf);});
+  v.addEventListener('play', ()=>{$('#play').innerHTML='&#10074;&#10074; pause';});
+  v.addEventListener('pause',()=>{$('#play').innerHTML='&#9654; play';});
+  v.addEventListener('ended',()=>{$('#play').innerHTML='&#9654; play';});
+  $('#play').onclick=()=>{if(v.paused)v.play().catch(()=>{});else v.pause();};
+  rng.oninput=e=>{v.pause();gotoStep(+e.target.value);};
+  $('#ff').onclick=()=>{v.pause();gotoStep((+rng.value)+1);};
+  $('#bb').onclick=()=>{v.pause();gotoStep((+rng.value)-1);};
+  document.querySelectorAll('#right .trow').forEach(r=>r.onclick=()=>{v.pause();gotoStep(+r.dataset.i);});
+  renderScrub(0);
+}
+// Seek the video AND update panel+curves to step i (slider index is authoritative).
+function gotoStep(i){
+  const n=(window._steps||[]).length; if(!n)return;
+  i=Math.max(0,Math.min(i,n-1));
+  const rng=$('#srange'); if(rng)rng.value=i;
+  const v=$('#vid'); if(v)v.currentTime=(i+0.5)/S.fps;   // land inside frame i, not on its edge
+  renderScrub(i);
+}
+
+
+// The plan a turn was HANDED (i.e. the previous turn's plan_after, or the initial plan for turn 0).
+function planBefore(t){
+  if(t.turn===0)return (S.doc.plan||{}).plan||'';
+  const prev=(S.doc.turns||[]).find(x=>x.turn===t.turn-1);
+  return prev?(prev.plan_after||''):'';
+}
+
+async function selectTurn(i){
+  S.ti=Math.max(0,Math.min(i,S.turns.length-1));
+  setNav();
+  const t=S.turns[S.ti];
+  $('#left').innerHTML='<div class=card><span class=muted>loading…</span></div>';
+  $('#right').innerHTML='';
+  if(t.kind==='plan')await renderPlan(); else await renderExec(t);
+  $('#left').scrollTop=0; $('#right').scrollTop=0;
+}
+
+$('#method').onchange=async e=>{S.method=e.target.value; await loadEpisodes();};
+$('#episode').onchange=e=>selectEpisode(+e.target.value);
+$('#tasktype').onchange=()=>fillTasks();
+$('#task').onchange=()=>fillEpisodes();
+$('#prev').onclick=()=>selectTurn(S.ti-1);
+$('#next').onclick=()=>selectTurn(S.ti+1);
+// Arrow keys / j,k walk the turns (ignored while typing in a control).
+window.addEventListener('keydown',e=>{
+  if(/^(INPUT|SELECT|TEXTAREA)$/.test(document.activeElement.tagName))return;
+  if(e.key==='ArrowRight'||e.key==='j'){selectTurn(S.ti+1);e.preventDefault();}
+  if(e.key==='ArrowLeft' ||e.key==='k'){selectTurn(S.ti-1);e.preventDefault();}
+});
+// keep the canvases crisp when the window resizes
+window.addEventListener('resize',()=>{const r=document.getElementById('srange');if(S.series&&r)drawCurves(+r.value||0);});
+loadMethods();
+</script>
+"""
+
+
+@app.route("/combine")
+def combine_page():
+    return COMBINE_HTML
+
+
 def main():
-    global ROOT, ROOTS, VAL_MSE_DIR
+    global ROOT, ROOTS, VAL_MSE_DIR, COMBINE_ROOT
     p = argparse.ArgumentParser()
     # --finestep-root is the primary; --rollout-root kept as a back-compat alias for the same tree.
     p.add_argument("--finestep-root", "--rollout-root", dest="finestep_root", type=Path, default=None,
@@ -1765,6 +2703,8 @@ def main():
                    help="EPISODE rollout tree (episode_eval.py output) -> /episode")
     p.add_argument("--val-mse-dir", type=Path, default=Path("eval_out/val_mse"),
                    help="dir of scripts/eval_val_mse.py output JSONs (the /val_mse curves)")
+    p.add_argument("--combine-root", type=Path, default=None,
+                   help="COMBINED System2+System1 tree (combined_eval.py output) -> /combine")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8092)
     args = p.parse_args()
@@ -1777,7 +2717,10 @@ def main():
     if args.episode_root is not None:
         ROOTS["episode"] = args.episode_root.resolve()
     VAL_MSE_DIR = args.val_mse_dir.resolve()
+    if args.combine_root is not None:
+        COMBINE_ROOT = args.combine_root.resolve()
     print(f"Serving finestep rollouts from {ROOT}  ->  http://{args.host}:{args.port}/finestep")
+    print(f"  combined S2+S1 rollouts from {COMBINE_ROOT}  ->  /combine")
     if "milestone" in ROOTS:
         print(f"  milestone rollouts from {ROOTS['milestone']}  ->  /milestone")
     if "episode" in ROOTS:
