@@ -41,9 +41,8 @@ needs comes from the raw LeRobot dataset and the env itself:
 The recorded ACTIONS are never used; System1 generates every action.
 
 Run (robocasa micromamba env; needs a System2 vLLM server AND a System1 policy server):
-    MUJOCO_GL=egl /home/ec2-user/micromamba/envs/robocasa/bin/python \
-      examples/robocasa/combined_eval.py \
-        --lerobot-dir /home/ec2-user/data/robocasa_dataset/v1.0/target/atomic/CloseFridge/20250816/lerobot \
+    MUJOCO_GL=egl "$ROBOCASA_PY" examples/robocasa/combined_eval.py \
+        --lerobot-dir "$ROBOCASA_LEROBOT_ROOT/v1.0/target/atomic/CloseFridge/20250816/lerobot" \
         --episodes 0 --method s2s1_progreg \
         --s1-port 8060 --s2-port 8100 \
         --norm-stats <ckpt>/assets/robocasa_system1/norm_stats.json \
@@ -83,11 +82,57 @@ SIM_CTRL_IDX = SE.SIM_CTRL_IDX
 import robocasa.utils.lerobot_utils as LU
 
 
+# ---------------------------------------------------------------------------
+# PATHS. Nothing here is hardcoded to one machine's layout. Resolution order:
+#
+#   1. explicit env var  -- REPO_ROOT / DATA_DIR / SYS1_CKPT_DIR / SYS1_RESULTS_DIR /
+#                           ROBOCASA_LEROBOT_ROOT (exported by 05b-shared-bashrc.sh on the
+#                           shared-filesystem setup)
+#   2. derived from THIS FILE's location -- the repo is <repo_root>/openpi, so REPO_ROOT is the
+#      parent of the openpi checkout. Works for /shared/openpi, ~/openpi, or anywhere else.
+#   3. DATA_DIR: the first existing candidate of <repo_root>/data, <repo_root>/../data,
+#      ~/data -- so the classic "repo + sibling data dir" layout keeps working untouched.
+#
+# Nothing assumes a shared filesystem, a particular mount name, or where venvs live: the
+# interpreter running this file is whatever the caller chose (repo-local .venv, ~/venvs, conda).
+_OPENPI_REPO = Path(__file__).resolve().parents[2]      # <repo_root>/openpi/examples/robocasa/..
+
+
+def env_path(var: str, default: str | Path) -> Path:
+    """Path from ``$var``, else ``default``. Empty string counts as unset."""
+    return Path(os.environ.get(var) or default).expanduser()
+
+
+def _first_existing(*cands: Path, fallback: Path) -> Path:
+    for c in cands:
+        if c.is_dir():
+            return c
+    return fallback
+
+
+OPENPI_REPO = env_path("OPENPI_REPO", _OPENPI_REPO)
+REPO_ROOT = env_path("REPO_ROOT", OPENPI_REPO.parent)
+DATA_DIR = env_path("DATA_DIR", _first_existing(
+    REPO_ROOT / "data", OPENPI_REPO.parent / "data", Path.home() / "data",
+    fallback=REPO_ROOT / "data"))
+SYS1_CKPT_DIR = env_path("SYS1_CKPT_DIR", DATA_DIR / "sys1_ckpts")
+SYS1_RESULTS_DIR = env_path("SYS1_RESULTS_DIR", DATA_DIR / "sys1_eval_results")
+ROBOCASA_DATASET = env_path("ROBOCASA_LEROBOT_ROOT", DATA_DIR / "robocasa_dataset")
+
+
 def _write_json(path: Path, obj) -> None:
+    # The tmp name carries the PID: the fleet runs 8 workers that all re-merge the SAME
+    # index.json, and a fixed ".tmp" made them share one scratch path -- whoever renamed first
+    # unlinked it out from under the others, so the losers died with FileNotFoundError on rename
+    # (taking their episode down with them). Per-PID tmp names make concurrent writers
+    # independent; the rename itself is still atomic, so a reader sees old or new, never partial.
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(obj, indent=1, default=str))
-    tmp.replace(path)   # atomic: a crash mid-run still leaves a valid file
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(obj, indent=1, default=str))
+        tmp.replace(path)   # atomic: a crash mid-run still leaves a valid file
+    finally:
+        tmp.unlink(missing_ok=True)   # never leave scratch behind on an error path
 
 
 def _short_method_name(s1_dir: str | None, s2_dir: str | None) -> str:
@@ -95,8 +140,9 @@ def _short_method_name(s1_dir: str | None, s2_dir: str | None) -> str:
 
         s1-progreg270k_s2-qwen35-4b-full-ep3-11416
 
-    System1 side: the progress-head tag + training scale from the exp dir
-    (``f0717-270k-bs512-progreg_granfine_verbsimp_noexec`` -> ``progreg270k``).
+    System1 side: the progress-head tag + the *checkpoint step* (rounded to the nearest 1k), so
+    sibling steps of one run get distinct names instead of colliding on the run's training scale
+    (``f0717-270k-bs512-progreg_granfine_verbsimp_noexec/240000`` -> ``progreg240k``).
     System2 side: model + tuner + epoch from the run dir, plus the checkpoint step
     (``system2-full-0804-qwen35-4b-gb192-full-...-ep3/checkpoint-11416``
      -> ``qwen35-4b-full-ep3-11416``).
@@ -104,7 +150,15 @@ def _short_method_name(s1_dir: str | None, s2_dir: str | None) -> str:
     always traceable back to a checkpoint.
     """
     def s1_short(d: str | None) -> str:
-        """progress head + training scale + the ablation tags that still carry information.
+        """progress head + checkpoint step + the ablation tags that still carry information.
+
+        The scale comes from the STEP the checkpoint dir is named after, not from the ``-270k-``
+        in the run name: the latter is the run's total training length and is identical for every
+        step of that run, so evaluating 210000/240000/269999 would produce one name and three
+        sweeps would overwrite each other's results. Steps round to the nearest 1k
+        (269999 -> ``270k``), which keeps names stable for the off-by-one final checkpoints.
+        Only if the dir is not a step (a run dir passed directly) do we fall back to the run
+        name's scale.
 
         ``-noexec`` is dropped: every current checkpoint has it, so it distinguishes nothing.
         ``-noanchor``/``-noanchorstate`` (they always co-occur) collapse to a single ``-noanchor``.
@@ -112,13 +166,18 @@ def _short_method_name(s1_dir: str | None, s2_dir: str | None) -> str:
         if not d:
             return "s1-unknown"
         pp = Path(d)
-        exp = pp.parent.name if pp.name.isdigit() else pp.name
+        is_step = pp.name.isdigit()
+        exp = pp.parent.name if is_step else pp.name
         head = next((h for h in ("progreg", "progact", "progcls") if h in exp), None)
-        scale = re.search(r"-(\d+k)-", exp)
+        if is_step:
+            scale = f"{round(int(pp.name) / 1000)}k"
+        else:
+            m = re.search(r"-(\d+k)-", exp)
+            scale = m.group(1) if m else ""
         if not head:
             return f"s1-{exp}"
         tags = "-noanchor" if ("noanchor" in exp or "noanchorstate" in exp) else ""
-        return f"s1-{head}{scale.group(1) if scale else ''}{tags}"
+        return f"s1-{head}{scale}{tags}"
 
     def s2_short(d: str | None) -> str:
         if not d:
@@ -126,8 +185,13 @@ def _short_method_name(s1_dir: str | None, s2_dir: str | None) -> str:
         pp = Path(d)
         step = pp.name.split("-")[-1] if pp.name.startswith("checkpoint-") else None
         run = pp.parent.name if step else pp.name
-        model = re.search(r"(qwen[\d.]*-?\d*b)", run, re.I)
-        tuner = next((t for t in ("full", "lora") if f"-{t}-" in run or run.endswith(f"-{t}")), None)
+        model = re.search(r"(qwen[\d.]*(?:vl)?-?\d+b)", run, re.I)
+        # Tuner: LoRA wins over "full". Every run dir -- LoRA ones included -- is prefixed
+        # "system2-full-", so testing "full" first labelled every LoRA run as full. The rank is part
+        # of the tag because runs otherwise differing only in r32/r64 would derive the same name and
+        # overwrite each other's results.
+        rank = re.search(r"lora-r(\d+)", run, re.I)
+        tuner = f"lora{rank.group(1)}" if rank else ("lora" if "lora" in run.lower() else "full")
         ep = re.search(r"-(ep\d+)", run)
         bits = [b for b in (model.group(1).lower().replace(".", "") if model else None,
                             tuner, ep.group(1) if ep else None, step) if b]
@@ -1006,7 +1070,7 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--lerobot-dir", required=True,
                     help="raw LeRobot dataset dir, e.g. "
-                         "<root>/v1.0/target/atomic/CloseFridge/20250816/lerobot")
+                         "$ROBOCASA_LEROBOT_ROOT/v1.0/target/atomic/CloseFridge/20250816/lerobot")
     ap.add_argument("--episodes", default="0",
                     help="episode indices: comma list and/or ranges, e.g. '0', '0,1', '0-4'")
     ap.add_argument("--method", default=None,
@@ -1016,7 +1080,8 @@ def main():
                     help="System1 checkpoint dir being served (recorded + used for the run name)")
     ap.add_argument("--s2-dir", default=None,
                     help="System2 checkpoint dir being served (recorded + used for the run name)")
-    ap.add_argument("--out-root", type=Path, default=Path("eval_results/combine"))
+    ap.add_argument("--out-root", type=Path, default=SYS1_RESULTS_DIR / "combine",
+                    help="where rollouts are written (default: $SYS1_RESULTS_DIR/combine)")
     # System1 (JAX policy server)
     ap.add_argument("--s1-host", default="127.0.0.1")
     ap.add_argument("--s1-port", type=int, default=8060)
@@ -1102,7 +1167,15 @@ def main():
     # fallback) union them into index.json.
     part = f"{_task_name_from_lerobot_dir(Path(args.lerobot_dir))}-{os.getpid()}.json"
     _write_json(out_root / args.method / "index_parts" / part, idx)
-    merge_combine_index(out_root / args.method)
+    # The part file above is the durable record; index.json is a DERIVED convenience that any later
+    # merge (or scripts/extract_combine_results.py) can rebuild from the parts. So a merge failure
+    # must never fail the run -- the rollout is already safely on disk by this point, and letting
+    # this raise would report a completed episode as FAILED.
+    try:
+        merge_combine_index(out_root / args.method)
+    except Exception as e:  # noqa: BLE001 - derived artifact; parts/ still holds the truth
+        print(f"WARNING: index.json merge failed ({e}); parts/ intact, rebuild with "
+              f"scripts/extract_combine_results.py", flush=True)
     print(f"\nWROTE {out_root / args.method / 'index_parts' / part}  {ok}/{len(results)} success",
           flush=True)
 

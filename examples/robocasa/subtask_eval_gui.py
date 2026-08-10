@@ -31,6 +31,17 @@ import numpy as np
 from flask import Flask, abort, jsonify, send_file
 
 app = Flask(__name__)
+
+# Derived path roots, defined BEFORE first use (MSE_DIRS below needs them). Nothing is hardcoded
+# to one machine: env contract first, else the first existing "data" dir near this repo. Keeps both
+# the shared-filesystem layout and the classic "repo + sibling data/" layout working with no flags.
+_OPENPI_REPO = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(os.environ.get("REPO_ROOT") or _OPENPI_REPO.parent).expanduser()
+_DATA = Path(os.environ.get("DATA_DIR") or next(
+    (c for c in (_REPO_ROOT / "data", _OPENPI_REPO.parent / "data", Path.home() / "data")
+     if c.is_dir()), _REPO_ROOT / "data")).expanduser()
+_RESULTS = Path(os.environ.get("SYS1_RESULTS_DIR") or _DATA / "sys1_eval_results").expanduser()
+
 ROOT: Path = Path(".")                        # default / legacy subtask rollout root
 # Named rollout trees, both written in the SAME layout by subtask_eval.py (#3) and
 # episode_eval.py (#2), so ONE viewer serves both — selected by the <root> path segment.
@@ -40,8 +51,8 @@ VAL_MSE_DIR: Path = Path("eval_out/val_mse")  # eval #1 curves (scripts/eval_val
 # <exp>__<step>.json = {exp_name, steps:[{step, action_mse, progress_acc, progress_mae,
 # progress_mode}]}. The /val_mse page overlays both splits with per-split + per-method toggles.
 MSE_DIRS: dict[str, Path] = {
-    "val": Path("eval_results/valmse_results"),
-    "train": Path("eval_results/trainmse_results"),
+    "val": _RESULTS / "valmse_results",
+    "train": _RESULTS / "trainmse_results",
 }
 
 
@@ -425,7 +436,12 @@ def _target_split_map() -> dict[str, str]:
         return _TARGET_SPLIT_CACHE
     out: dict[str, str] = {}
     # ROBOCASA_REPO lets a different box point at its own robocasa checkout (default unchanged).
-    reg = Path(os.environ.get("ROBOCASA_REPO", "/home/yinpei.dai/robocasa")) / "robocasa/utils/dataset_registry.py"
+    # Default to the shared checkout; the old default was another host's home dir, so the split
+    # lookup silently failed and every task showed up as type "other".
+    # Prefer $ROBOCASA_REPO; else the robocasa checkout beside this repo. The old default was
+    # another host's home dir, so the split lookup silently failed and every task read "other".
+    reg = (Path(os.environ.get("ROBOCASA_REPO") or _REPO_ROOT / "robocasa")
+           / "robocasa/utils/dataset_registry.py")
     try:
         import re
         src = reg.read_text()
@@ -796,6 +812,9 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   /* per-task matrix: wrap the long s1_/s2_ method names instead of stretching the table */
   table.cmbtask th{white-space:normal;max-width:150px;line-height:1.25;font-size:11px;vertical-align:bottom}
   table.cmbtask td.exp{white-space:nowrap}
+  /* #0 summary: the method name is the widest thing in the row, so give it room and keep it on one
+     line -- dropping the terminations column freed the space. */
+  table.cmbmain td.exp{white-space:nowrap;min-width:340px}
   /* the combined S2+S1 rollout browser is the main drill-down from these tables */
   nav a.hi{background:#b0431c;color:#fff;border-radius:4px;padding:1px 8px;font-weight:700}
   nav a.hi:hover{background:#8f3616}
@@ -813,7 +832,10 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   <h2>#0 COMBINED System2+System1 <span style="font-size:11px;color:#888;font-weight:400">— closed-loop hierarchical rollouts (/combine) · success, wall-clock, and full-benchmark ETA</span></h2>
   <div id="cmbtab" style="overflow-x:auto"></div>
   <div id="cmbsplit" style="overflow-x:auto;margin-top:8px"></div>
-  <h2>#0b Per-task COMBINED success <span style="font-size:11px;color:#888;font-weight:400">— task × method, grouped by split · #successful / #episodes (hover for % and s/ep)</span></h2>
+  <div style="color:#888;font-size:11px;margin-top:-4px">success rate by target split; overall = the
+    three splits combined. Hover a cell for the underlying #success/#episodes and s/ep — the counts
+    are tabulated in #0b below.</div>
+  <h2>#0b Per-task COMBINED success <span style="font-size:11px;color:#888;font-weight:400">— task × method · #successful / #episodes (hover for % and s/ep) · OVERALL row = the three splits combined, then per-split totals and their tasks</span></h2>
   <div id="cmbtask" style="overflow-x:auto"></div>
   <h2>#2 Episode success rate <span style="font-size:11px;color:#888;font-weight:400">— % (n episodes)</span></h2>
   <div id="epfilter" style="margin:2px 0 8px;font-size:12px;display:flex;gap:6px;align-items:center;flex-wrap:wrap"></div>
@@ -1000,30 +1022,51 @@ async function load(){
     const C=d.combine||{}; const ms=Object.keys(C);
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
       '<span style="color:#888">No combined runs yet — see /combine.</span>';return;}
-    let h="<table><tr><th class='exp'>method</th><th>episodes</th><th>success</th><th>rate</th>"
-      +"<th>avg s/ep</th><th>avg turns</th><th>errors</th><th>total</th><th>ETA serial</th><th>ETA 8 GPU</th><th>terminations</th></tr>";
+    // NOTE: keep the header and the row below in 1:1 correspondence. The row used to omit the
+    // `errors` cell while the header declared it, which silently shifted every later column one to
+    // the left (terminations rendered under "ETA 8 GPU"). The terminations breakdown is now a
+    // tooltip on the errors cell instead of its own column -- it was wide, monospaced and pushed
+    // the numeric columns off screen.
+    let h="<table class=cmbmain><tr><th class='exp'>method</th><th>episodes</th><th>success</th><th>rate</th>"
+      +"<th>avg s/ep</th><th>avg turns</th><th>errors</th><th>total</th><th>ETA serial</th><th>ETA 8 GPU</th></tr>";
     ms.sort().forEach(m=>{const v=C[m], b=v.bench||{};
-      const tt=Object.entries(v.terminations||{}).map(([k,n])=>`${k}:${n}`).join(' ');
+      const tt=Object.entries(v.terminations||{}).sort((a,b2)=>b2[1]-a[1])
+                 .map(([k,n])=>`${k}: ${n}`).join(' · ');
       h+=`<tr><td class='exp'>${mName2(m)}</td><td>${v.n}</td><td>${v.n_success}</td>`
         +`<td><b>${pct(v.rate)}</b></td><td>${v.avg_seconds??'–'}</td><td>${v.avg_turns??'–'}</td>`
+        +`<td title="terminations — ${tt||'n/a'}">${v.n_error??'–'}</td>`
         +`<td>${v.total_seconds!=null?(v.total_seconds/60).toFixed(1)+' min':'–'}</td>`
         +`<td>${b.eta_serial_h!=null?b.eta_serial_h+' h':'–'}</td>`
-        +`<td><b>${b.eta_8gpu_h!=null?b.eta_8gpu_h+' h':'–'}</b></td>`
-        +`<td style="font-family:ui-monospace,monospace;font-size:10px">${tt}</td></tr>`;});
+        +`<td><b>${b.eta_8gpu_h!=null?b.eta_8gpu_h+' h':'–'}</b></td></tr>`;});
     h+="</table><div style='color:#888;font-size:11px;margin-top:3px'>ETA extrapolates the measured "
       +"mean episode time to all "+(ms.length?(C[ms[0]].bench||{}).episodes:0)+" benchmark episodes "
       +"(50 tasks × ~506); 8-GPU column assumes one full stack per GPU. "
-      +"errors = episodes that threw (counted in n, never successful). "
+      +"errors = episodes that threw (counted in n, never successful); hover it for the "
+      +"termination breakdown (env_success / task_finish / max_turns / no_subgoal / error). "
       +"Source: eval_results/combine_results/*.json via scripts/extract_combine_results.py.</div>";
     document.getElementById('cmbtab').innerHTML=h;
     // per-split breakdown
     const sp=['atomic_seen','composite_seen','composite_unseen','other'];
-    let h2="<table><tr><th class='exp'>method</th>"+sp.map(x=>`<th>${x.replace('_','-')}</th>`).join('')+"</tr>";
+    let h2="<table><tr><th class='exp'>method</th><th>overall</th>"
+      +sp.map(x=>`<th>${x.replace('_','-')}</th>`).join('')+"</tr>";
+    // Rate only -- this table is for comparing rates across splits at a glance. The raw
+    // success/episode counts live in #0b (split-total rows + OVERALL), and stay in the tooltip here.
+    const cellSp=(b,bold)=>{
+      if(!b||!b.n)return '<td style="color:#ccc">–</td>';
+      const ok=b.n_success??b.s??0, r=b.rate!=null?b.rate:ok/b.n;
+      return `<td title="${ok}/${b.n} · ${b.avg_seconds??'?'}s/ep"${bold?' style="font-weight:700;background:#eef2fb"':''}>`
+        +`${pct(r)}</td>`;};
     ms.sort().forEach(m=>{const P=C[m].per_split||{};
-      h2+=`<tr><td class='exp'>${mName2(m)}</td>`+sp.map(x=>{const b=P[x];
-        const ok=(b&&(b.n_success??b.s));
-        return b?`<td title="${b.avg_seconds??'?'}s/ep">${ok??0}<span style="color:#888">/${b.n}</span> ${pct(b.rate)}</td>`
-                :'<td style="color:#ccc">–</td>';}).join('')+`</tr>`;});
+      // "overall" = the three splits combined. Summed from per_split (not read off the top-level
+      // record) so the column is always consistent with the cells beside it, including for a
+      // partial sweep where the splits are unevenly filled.
+      let on=0,os=0,osec=0,osn=0;
+      for(const x of sp){const b=P[x]; if(!b||!b.n)continue;
+        on+=b.n; os+=(b.n_success??b.s??0);
+        if(typeof b.avg_seconds==='number'){osec+=b.avg_seconds*b.n; osn+=b.n;}}
+      const ov=on?{n:on,n_success:os,rate:os/on,avg_seconds:osn?+(osec/osn).toFixed(2):null}:null;
+      h2+=`<tr><td class='exp'>${mName2(m)}</td>`+cellSp(ov,true)
+        +sp.map(x=>cellSp(P[x],false)).join('')+`</tr>`;});
     document.getElementById('cmbsplit').innerHTML=h2+"</table>";
     // #0b per-task matrix: rows = tasks grouped by split, cols = methods.
     const order={atomic_seen:0,composite_seen:1,composite_unseen:2,other:3};
@@ -1040,6 +1083,17 @@ async function load(){
         +`${b.n_success}<span style="color:#888">/${b.n}</span></td>`;};
     let h3="<table class=cmbtask><tr><th class='exp'>task</th>"
       +ms.map(m=>`<th>${mName2(m)}</th>`).join('')+"</tr>";
+    // OVERALL row first: the three splits combined, summed from per_split so it always agrees with
+    // the split-total rows below it (and with a partial sweep's uneven splits).
+    h3+=`<tr><td class='exp' style="background:#cdd8ee;font-weight:700">OVERALL</td>`
+      +ms.map(m=>{const P=C[m].per_split||{};
+        let n=0,s=0,sec=0,sn=0;
+        for(const x of ['atomic_seen','composite_seen','composite_unseen','other']){
+          const b=P[x]; if(!b||!b.n)continue;
+          n+=b.n; s+=(b.n_success??b.s??0);
+          if(typeof b.avg_seconds==='number'){sec+=b.avg_seconds*b.n; sn+=b.n;}}
+        return cell(n?{n:n,n_success:s,rate:s/n,avg_seconds:sn?+(sec/sn).toFixed(2):null}:null);
+      }).join('')+`</tr>`;
     // split-total rows so a whole split reads at a glance
     ['atomic_seen','composite_seen','composite_unseen','other'].forEach(sp=>{
       const rows=tasks.filter(t=>info[t]===sp);
@@ -1858,10 +1912,15 @@ loadMethods();
 # system+user prompt, its raw response and parsed tags, the exact media it saw, the System1 prompt
 # + anchor image, the raw 20-fps rollout video, the condensed 4-fps clip that was actually fed
 # back, and a per-frame table showing which frames the condenser kept or dropped and why.
-COMBINE_ROOT: Path = Path("eval_results/combine")
+# Result trees default under the shared results dir (05b-shared-bashrc.sh exports
+# SYS1_RESULTS_DIR); a non-interactive shell falls back to the /shared layout.
+# Results roots are DERIVED, never hardcoded to one machine: prefer the env contract, else the
+# first existing "data" dir near this repo (<repo_root>/data, sibling, ~/data). Keeps both the
+# shared-filesystem layout and the classic repo+sibling-data layout working with no flags.
+COMBINE_ROOT: Path = _RESULTS / "combine"
 # Precomputed per-method summaries (scripts/extract_combine_results.py). /stats reads these
 # instead of aggregating raw rollout output.
-COMBINE_RESULTS_DIR: Path = Path("eval_results/combine_results")
+COMBINE_RESULTS_DIR: Path = _RESULTS / "combine_results"
 
 
 
@@ -1935,9 +1994,12 @@ def _combine_stats() -> dict:
                 k = e.get("termination") or "error"
                 terms[k] = terms.get(k, 0) + 1
             o = blk(eps)
+            turns = [e["n_turns"] for e in eps if isinstance(e.get("n_turns"), (int, float))]
             out[md.name] = {
                 **o, "total_seconds": doc.get("total_seconds"),
-                "avg_turns": None,
+                # index.json already carries n_turns per episode, so an in-flight sweep can show this
+                # instead of "-" until extract_combine_results.py runs.
+                "avg_turns": round(sum(turns) / len(turns), 2) if turns else None,
                 "n_error": sum(1 for e in eps if e.get("error")),
                 "terminations": terms,
                 "per_split": {k: blk(v) for k, v in sorted(per_split.items())},
@@ -2771,15 +2833,20 @@ def main():
                    help="MILESTONE rollout tree (milestone_eval.py output) -> /milestone")
     p.add_argument("--episode-root", type=Path, default=None,
                    help="EPISODE rollout tree (episode_eval.py output) -> /episode")
-    p.add_argument("--val-mse-dir", type=Path, default=Path("eval_out/val_mse"),
+    p.add_argument("--val-mse-dir", type=Path, default=_RESULTS / "valmse_results",
                    help="dir of scripts/eval_val_mse.py output JSONs (the /val_mse curves)")
     p.add_argument("--combine-root", type=Path, default=None,
                    help="COMBINED System2+System1 tree (combined_eval.py output) -> /combine")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8092)
     args = p.parse_args()
+    # Default every root under the shared results dir so `subtask_eval_gui.py --port N` just works.
     if args.finestep_root is None:
-        raise SystemExit("--finestep-root (or --rollout-root) is required")
+        args.finestep_root = _RESULTS / "finestep"
+    if args.milestone_root is None:
+        args.milestone_root = _RESULTS / "milestone"
+    if args.episode_root is None:
+        args.episode_root = _RESULTS / "episode"
     ROOT = args.finestep_root.resolve()          # legacy default root = finestep
     ROOTS = {"finestep": ROOT}
     if args.milestone_root is not None:

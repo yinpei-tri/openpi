@@ -6,8 +6,8 @@ The GUI's /stats page should not have to aggregate raw rollout output. Each meth
 per-split and per-task tables from it on every cache miss. This script precomputes those tables
 once, per method, into::
 
-    eval_results/combine_results/<method>.json     # summary + per_split + per_task
-    eval_results/combine_results/SUMMARY.json      # one row per method, for the table
+    $SYS1_RESULTS_DIR/combine_results/<method>.json   # summary + per_split + per_task
+    $SYS1_RESULTS_DIR/combine_results/SUMMARY.json    # one row per method, for the table
 
 so /stats can render from a handful of KB with no aggregation at all.
 
@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -36,6 +37,12 @@ except Exception:
     TARGET_TASK_SPLIT = {}
 
 SPLITS = ("atomic_seen", "composite_seen", "composite_unseen", "other")
+
+# Derived, not hardcoded: env contract first, else the first existing "data" dir near the repo.
+_REPO_ROOT = Path(os.environ.get("REPO_ROOT") or Path(__file__).resolve().parents[1].parent)
+_DATA = Path(os.environ.get("DATA_DIR") or next(
+    (c for c in (_REPO_ROOT / "data", Path.home() / "data") if c.is_dir()), _REPO_ROOT / "data"))
+RESULTS_DIR = Path(os.environ.get("SYS1_RESULTS_DIR") or _DATA / "sys1_eval_results").expanduser()
 
 
 def _stat_block(eps: list[dict]) -> dict:
@@ -105,8 +112,8 @@ def extract_method(method_dir: Path) -> dict | None:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--combine-root", type=Path, default=Path("eval_results/combine"))
-    ap.add_argument("--out-dir", type=Path, default=Path("eval_results/combine_results"))
+    ap.add_argument("--combine-root", type=Path, default=RESULTS_DIR / "combine")
+    ap.add_argument("--out-dir", type=Path, default=RESULTS_DIR / "combine_results")
     a = ap.parse_args()
 
     if not a.combine_root.is_dir():

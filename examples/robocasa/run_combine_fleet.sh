@@ -6,19 +6,37 @@
 # stacks. Nothing is shared between GPUs, so there is no cross-talk and a dead GPU only loses its
 # own shard.
 #
-#   GPU g : S1 policy on port (S1_BASE+g)   |  S2 vLLM on port (S2_BASE+g)  |  1 rollout client
+#   stack i : S1 policy on port (S1_BASE+i)  |  S2 vLLM on port (S2_BASE+i)  |  1 rollout client
 #
 # Memory: the S1 server takes XLA_FRAC of the GPU and vLLM takes GPU_FRAC; keep the sum <= ~0.9 so
-# MuJoCo/EGL still has room to render (it shares the same device).
+# MuJoCo/EGL still has room to render (it shares the S1 device). To give each server a whole GPU
+# instead, split them with S1_GPUS/S2_GPUS -- useful when something else already holds memory on the
+# card, or to run one stack at full size.
 #
 # Usage:
 #   METHOD=progreg TASKS=CloseFridge EPISODES=0-9  bash examples/robocasa/run_combine_fleet.sh
 #   METHOD=progact TASK_SET=atomic_seen EPISODES=0-4 bash examples/robocasa/run_combine_fleet.sh
+#   # one stack, S1+sim on GPU0 and S2 on GPU1:
+#   METHOD=progreg-noanchor STEP=240000 S1_GPUS=0 S2_GPUS=1 XLA_FRAC=0.9 GPU_FRAC=0.9 \
+#     TASKS=CloseFridge EPISODES=0 bash examples/robocasa/run_combine_fleet.sh
 #
-# Monitor:  tail -f _evallogs/fleet_<method>/client-gpu*.log
+# Monitor:  tail -f _evallogs/fleet_<method>_<step>/client-stack*.log
 # Results:  eval_results/combine/<derived-method-name>/
 set -euo pipefail
-cd /home/ec2-user/openpi
+
+# ---- PATHS ------------------------------------------------------------------------------------
+# Repos + data are on a shared filesystem so several instances share one copy; venvs are local.
+# Read the shared_bashrc contract when present, else default to the /shared layout (a
+# non-interactive shell never sources that file).
+SHARED_ROOT=${SHARED_ROOT:-/shared}
+REPO_ROOT=${REPO_ROOT:-$SHARED_ROOT}
+DATA_DIR=${DATA_DIR:-$SHARED_ROOT/data}
+OPENPI_REPO=${OPENPI_REPO:-$REPO_ROOT/openpi}
+SYS2_REPO=${SYS2_REPO:-$REPO_ROOT/sys2_train_eval}
+SYS1_CKPT_DIR=${SYS1_CKPT_DIR:-$DATA_DIR/sys1_ckpts}
+CKPT_DIR=${CKPT_DIR:-$DATA_DIR/sys2_ckpts}
+SYS1_RESULTS_DIR=${SYS1_RESULTS_DIR:-$DATA_DIR/sys1_eval_results}
+cd "$OPENPI_REPO"
 
 METHOD=${METHOD:-progreg}                  # progreg | progact  (which System1 head)
 EPISODES=${EPISODES:-0}                    # per-task episode spec, e.g. "0", "0-9", "0,5,10"
@@ -29,40 +47,83 @@ TASK_SET=${TASK_SET:-all}                  # all (the 50-task benchmark) | atomi
                                            # composite_seen | composite_unseen
 NGPU=${NGPU:-8}
 GPUS=${GPUS:-$(seq -s, 0 $((NGPU-1)))}
+# One stack normally packs S1+S2+sim onto a single GPU. Set S1_GPUS/S2_GPUS to split them across
+# two devices instead -- e.g. S1_GPUS=0 S2_GPUS=1 gives one stack whose policy server owns GPU0 and
+# whose vLLM owns GPU1, so neither has to fit in a fraction of one card. The two lists are matched
+# element-wise and must be the same length; that length (not NGPU) is the number of stacks.
+S1_GPUS=${S1_GPUS:-$GPUS}
+S2_GPUS=${S2_GPUS:-$GPUS}
 S1_BASE=${S1_BASE:-8060}
 S2_BASE=${S2_BASE:-8100}
 XLA_FRAC=${XLA_FRAC:-0.32}                 # System1 JAX share
 GPU_FRAC=${GPU_FRAC:-0.42}                 # System2 vLLM share
 MAX_TURNS=${MAX_TURNS:-20}
-DATA_ROOT=${DATA_ROOT:-/home/ec2-user/data/robocasa_dataset/v1.0/target}
-S2_CKPT=${S2_CKPT:-/home/ec2-user/sys2_train_eval/data/sys2_ckpts/system2-full-0804-qwen35-4b-gb192-full-vitfull-lr1e5-vitlr2e6-alignerlr1e5-zero2-2n-ep3/checkpoint-11416}
+DATA_ROOT=${DATA_ROOT:-${ROBOCASA_LEROBOT_ROOT:-$DATA_DIR/robocasa_dataset}/v1.0/target}
+S2_CKPT=${S2_CKPT:-$CKPT_DIR/system2-full-0804-qwen35-4b-gb192-full-vitfull-lr1e5-vitlr2e6-alignerlr1e5-zero2-2n-ep3/checkpoint-11416}
 SKIP_SERVERS=${SKIP_SERVERS:-0}            # 1 = reuse servers already listening
 RESUME=${RESUME:-0}                        # 1 = skip episodes already finished (restartable)
-ROBOCASA_PY=${ROBOCASA_PY:-/home/ec2-user/micromamba/envs/robocasa/bin/python}
+# RUN_LABEL overrides the derived <method> results dir name. Use it to write a REPLICATION run
+# beside the real one (same checkpoints, separate dir) instead of appending into it.
+RUN_LABEL=${RUN_LABEL:-}
+# UNITS_FILE supplies an explicit "<lerobot-dir> <episode>" manifest, one line per episode, and
+# bypasses worklist generation entirely -- for re-running a hand-picked set of episodes.
+UNITS_FILE=${UNITS_FILE:-}
+ROBOCASA_PY=${ROBOCASA_PY:-/home/ec2-user/micromamba/envs/robocasa/bin/python}   # instance-local venv
+OPENPI_PY=${OPENPI_PY:-/home/ec2-user/venvs/openpi_venv/bin/python}                  # serves System1
 
+# STEP selects which checkpoint of a run to serve (210000 / 240000 / 269999).
+STEP=${STEP:-269999}
 case "$METHOD" in
-  progreg) S1_CKPT=/home/ec2-user/data/sys1_ckpts/f0717-270k-bs512-progreg_granfine_verbsimp_noexec/269999 ;;
-  progact) S1_CKPT=/home/ec2-user/data/sys1_ckpts/f0717-270k-bs512-progact_granfine_verbsimp_noexec/269999 ;;
-  *) echo "METHOD must be progreg or progact" >&2; exit 1 ;;
+  progreg)          S1_CKPT=$SYS1_CKPT_DIR/f0717-270k-bs512-progreg_granfine_verbsimp_noexec/$STEP ;;
+  progact)          S1_CKPT=$SYS1_CKPT_DIR/f0717-270k-bs512-progact_granfine_verbsimp_noexec/$STEP ;;
+  # The noanchor runs were downloaded from s3 as "...-2node-progreg-noexec-noanchor-noanchorstate"
+  # but were normalised to the underscore form of their siblings when data/ moved to the shared
+  # mount; these are the on-disk names.
+  progreg-noanchor) S1_CKPT=$SYS1_CKPT_DIR/f0717-270k-bs512-progreg_granfine_verbsimp_noexec_noanchor_noanchorstate/$STEP ;;
+  progact-noanchor) S1_CKPT=$SYS1_CKPT_DIR/f0717-270k-bs512-progact_granfine_verbsimp_noexec_noanchor_noanchorstate/$STEP ;;
+  *) echo "METHOD must be progreg|progact|progreg-noanchor|progact-noanchor" >&2; exit 1 ;;
 esac
 [[ -d "$S1_CKPT" ]] || { echo "FATAL: missing S1 ckpt $S1_CKPT" >&2; exit 1; }
 [[ -d "$S2_CKPT" ]] || { echo "FATAL: missing S2 ckpt $S2_CKPT" >&2; exit 1; }
 
-LOG=_evallogs/fleet_$METHOD
+# STEP is in the log dir too: it holds the per-run worklist/units/shard files, so two steps of the
+# same method running at once would otherwise clobber each other's work list. Scratch only --
+# --resume reads the results dir, so renaming this strands no state.
+LOG=_evallogs/fleet_${METHOD}_$STEP
 mkdir -p "$LOG"
-IFS=',' read -ra GPULIST <<< "$GPUS"
+IFS=',' read -ra S1LIST <<< "$S1_GPUS"
+IFS=',' read -ra S2LIST <<< "$S2_GPUS"
+[[ ${#S1LIST[@]} -eq ${#S2LIST[@]} ]] || {
+  echo "FATAL: S1_GPUS ($S1_GPUS) and S2_GPUS ($S2_GPUS) must list the same number of GPUs" >&2
+  exit 1; }
+# The rollout client renders MuJoCo/EGL on the same GPU as its policy server: observations go
+# straight to S1 every step, whereas S2 is consulted only once per subgoal.
+GPULIST=("${S1LIST[@]}")
 NG=${#GPULIST[@]}
+# Ports are keyed by stack index, not by GPU id -- with a split, two stacks can share an S1 GPU (or
+# an S2 GPU) and GPU-derived ports would collide.
+s1_port() { echo $((S1_BASE+$1)); }
+s2_port() { echo $((S2_BASE+$1)); }
 
 # ---- work list --------------------------------------------------------------------------------
 # Either an explicit (task, episode) manifest (EPISODE_JSON) or TASK_SET x EPISODES.
 WORK="$LOG/worklist.txt"
 : > "$WORK"
+if [[ -n "$UNITS_FILE" ]]; then
+  # Explicit manifest: every line is already one (task, episode) unit, so generation and the
+  # episode-spec expansion below are both skipped. Validated the same way as a generated list.
+  [[ -s "$UNITS_FILE" ]] || { echo "FATAL: empty/missing UNITS_FILE $UNITS_FILE" >&2; exit 1; }
+  grep -E '^/.*/lerobot [0-9]+$' "$UNITS_FILE" > "$WORK" || true
+  [[ -s "$WORK" ]] || { echo "FATAL: no valid '<lerobot-dir> <ep>' lines in $UNITS_FILE" >&2; exit 1; }
+  echo "[fleet] explicit manifest: $(wc -l < "$WORK") units from $UNITS_FILE"
+fi
+if [[ -z "$UNITS_FILE" ]]; then
 # robocasa env: the registry import needs robosuite, absent from system python3.
-"$ROBOCASA_PY" - "$DATA_ROOT" "$TASK_SET" "$TASKS" "$EPISODES" "$USE_EVAL_SET" \
+OPENPI_REPO="$OPENPI_REPO" "$ROBOCASA_PY" - "$DATA_ROOT" "$TASK_SET" "$TASKS" "$EPISODES" "$USE_EVAL_SET" \
   >> "$WORK" 2>"$LOG/worklist.err" <<'PY'
 import sys, glob, os
 root, task_set, tasks_csv, eps, use_eval_set = sys.argv[1:6]
-sys.path.insert(0, "/home/ec2-user/openpi/examples/robocasa")
+sys.path.insert(0, os.path.join(os.environ["OPENPI_REPO"], "examples", "robocasa"))
 missing = []
 
 def lerobot_dir(task):
@@ -99,6 +160,7 @@ PY
 # partial write can never be mistaken for a task.
 grep -E '^/.*/lerobot [0-9]' "$WORK" > "$WORK.clean" || true
 mv "$WORK.clean" "$WORK"
+fi   # end of generated-worklist branch
 NTASK=$(wc -l < "$WORK")
 echo "[fleet] method=$METHOD  src=$([[ $USE_EVAL_SET == 1 ]] && echo TARGET_EVAL_EPISODES || echo taskset:$TASK_SET)  lines=$NTASK  gpus=${GPULIST[*]}"
 [[ -s "$LOG/worklist.err" ]] && grep -i "MISSING" "$LOG/worklist.err" || true
@@ -106,31 +168,30 @@ echo "[fleet] method=$METHOD  src=$([[ $USE_EVAL_SET == 1 ]] && echo TARGET_EVAL
 
 # ---- servers ----------------------------------------------------------------------------------
 if [[ "$SKIP_SERVERS" != "1" ]]; then
-  for i in "${!GPULIST[@]}"; do
-    g=${GPULIST[$i]}
-    XLA_PYTHON_CLIENT_MEM_FRACTION=$XLA_FRAC CUDA_VISIBLE_DEVICES=$g \
-      nohup .venv/bin/python scripts/serve_policy.py --port $((S1_BASE+g)) \
+  for i in "${!S1LIST[@]}"; do
+    g1=${S1LIST[$i]}; g2=${S2LIST[$i]}
+    XLA_PYTHON_CLIENT_MEM_FRACTION=$XLA_FRAC CUDA_VISIBLE_DEVICES=$g1 \
+      nohup "$OPENPI_PY" scripts/serve_policy.py --port "$(s1_port "$i")" \
         policy:checkpoint --policy.config=auto --policy.dir "$S1_CKPT" \
-        > "$LOG/s1-gpu$g.log" 2>&1 &
-    MODEL_DIR="$S2_CKPT" GPU=$g GPU_FRAC=$GPU_FRAC PORT=$((S2_BASE+g)) \
-      NAME=sys2-vllm-fleet-$g MEDIA_DIR=/tmp/sys2_media \
-      nohup bash /home/ec2-user/sys2_train_eval/scripts/serve_system2_vllm.sh \
-        > "$LOG/s2-gpu$g.log" 2>&1 &
-    echo "[fleet] gpu$g: S1 :$((S1_BASE+g))  S2 :$((S2_BASE+g))"
+        > "$LOG/s1-stack$i.log" 2>&1 &
+    MODEL_DIR="$S2_CKPT" GPU=$g2 GPU_FRAC=$GPU_FRAC PORT="$(s2_port "$i")" \
+      NAME=sys2-vllm-fleet-$i MEDIA_DIR=/tmp/sys2_media \
+      nohup bash "$SYS2_REPO/scripts/serve_system2_vllm.sh" \
+        > "$LOG/s2-stack$i.log" 2>&1 &
+    echo "[fleet] stack$i: S1 gpu$g1 :$(s1_port "$i")  S2 gpu$g2 :$(s2_port "$i")"
   done
 
   echo "[fleet] waiting for all servers (vLLM takes ~4 min to load)..."
-  for i in "${!GPULIST[@]}"; do
-    g=${GPULIST[$i]}
+  for i in "${!S1LIST[@]}"; do
     for _ in $(seq 1 90); do
-      s1=$(ss -lnt 2>/dev/null | grep -c ":$((S1_BASE+g)) " || true)
-      s2=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$((S2_BASE+g))/v1/models" 2>/dev/null || echo 000)
+      s1=$(ss -lnt 2>/dev/null | grep -c ":$(s1_port "$i") " || true)
+      s2=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(s2_port "$i")/v1/models" 2>/dev/null || echo 000)
       [[ "$s1" == "1" && "$s2" == "200" ]] && break
       sleep 10
     done
     [[ "${s1:-0}" == "1" && "${s2:-000}" == "200" ]] \
-      && echo "[fleet] gpu$g READY" \
-      || { echo "[fleet] gpu$g FAILED (S1=$s1 S2=$s2); see $LOG/{s1,s2}-gpu$g.log" >&2; }
+      && echo "[fleet] stack$i READY" \
+      || { echo "[fleet] stack$i FAILED (S1=$s1 S2=$s2); see $LOG/{s1,s2}-stack$i.log" >&2; }
   done
 fi
 
@@ -170,9 +231,8 @@ NUNIT=$(wc -l < "$UNITS")
 echo "[fleet] work units (task,episode pairs): $NUNIT across $NG gpus"
 
 for i in "${!GPULIST[@]}"; do
-  g=${GPULIST[$i]}
-  awk -v n="$NG" -v k="$i" '{ if (((NR-1) % n) == k) print }' "$UNITS" > "$LOG/shard-gpu$g.txt"
-  echo "[fleet] gpu$g -> $(wc -l < "$LOG/shard-gpu$g.txt") episodes"
+  awk -v n="$NG" -v k="$i" '{ if (((NR-1) % n) == k) print }' "$UNITS" > "$LOG/shard-stack$i.txt"
+  echo "[fleet] stack$i (sim on gpu${GPULIST[$i]}) -> $(wc -l < "$LOG/shard-stack$i.txt") episodes"
 done
 
 for i in "${!GPULIST[@]}"; do
@@ -180,19 +240,20 @@ for i in "${!GPULIST[@]}"; do
   (
     while read -r ld ep; do
       MUJOCO_GL=egl PYOPENGL_PLATFORM=egl CUDA_VISIBLE_DEVICES=$g \
-        /home/ec2-user/micromamba/envs/robocasa/bin/python examples/robocasa/combined_eval.py \
+        "$ROBOCASA_PY" examples/robocasa/combined_eval.py \
           --lerobot-dir "$ld" --episodes "$ep" \
           --s1-dir "$S1_CKPT" --s2-dir "$S2_CKPT" \
-          --s1-port $((S1_BASE+g)) --s2-port $((S2_BASE+g)) --s2-model system2-full \
+          --s1-port "$(s1_port "$i")" --s2-port "$(s2_port "$i")" --s2-model system2-full \
           --norm-stats "$S1_CKPT/assets/robocasa_system1/norm_stats.json" \
-          --out-root eval_results/combine --max-turns "$MAX_TURNS" \
+          --out-root "$SYS1_RESULTS_DIR/combine" --max-turns "$MAX_TURNS" \
+          ${RUN_LABEL:+--method "$RUN_LABEL"} \
           $([[ "$RESUME" == 1 ]] && echo --resume) \
-        || echo "[fleet] gpu$g FAILED $ld ep$ep" >&2
-    done < "$LOG/shard-gpu$g.txt"
-    echo "[fleet] gpu$g SHARD COMPLETE"
-  ) > "$LOG/client-gpu$g.log" 2>&1 &
+        || echo "[fleet] stack$i FAILED $ld ep$ep" >&2
+    done < "$LOG/shard-stack$i.txt"
+    echo "[fleet] stack$i SHARD COMPLETE"
+  ) > "$LOG/client-stack$i.log" 2>&1 &
 done
 
-echo "[fleet] $NG clients launched. Monitor: tail -f $LOG/client-gpu*.log"
+echo "[fleet] $NG clients launched. Monitor: tail -f $LOG/client-stack*.log"
 wait
 echo "[fleet] ALL SHARDS COMPLETE for method=$METHOD"
