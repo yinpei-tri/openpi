@@ -830,6 +830,7 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <div id="tagdoc-body" style="margin-top:10px;font-size:13px;line-height:1.55"></div>
   </details>
   <h2>#0 COMBINED System2+System1 <span style="font-size:11px;color:#888;font-weight:400">— closed-loop hierarchical rollouts (/combine) · success, wall-clock, and full-benchmark ETA</span></h2>
+  <div id="cmbdebug" style="font-size:11px;margin:0 0 4px"></div>
   <div id="cmbtab" style="overflow-x:auto"></div>
   <div id="cmbsplit" style="overflow-x:auto;margin-top:8px"></div>
   <div style="color:#888;font-size:11px;margin-top:-4px">success rate by target split; overall = the
@@ -917,6 +918,9 @@ function renderTagDoc(){
   h+='<div style="color:#888;font-size:12px;margin-top:6px">granularity/verbosity (<code>granfine</code>, <code>verbsimp</code>) describe the subgoal text source; all current runs use fine+simple.</div>';
   box.innerHTML=h;
 }
+// Debug-run convention: a method named "debug-*" is a throwaway (small n, often unfinished), so
+// every table hides it by default rather than letting it sit beside a 1000-episode run.
+const isDebugMethod=m=>/^debug-/i.test(String(m||''));
 const pct=v=>v==null?'–':(100*v).toFixed(1)+'%';
 const f4=v=>v==null?'–':(+v).toFixed(4);
 async function load(){
@@ -943,12 +947,17 @@ async function load(){
   // Method-type toggles: a method's name carries tag tokens (progact/progreg/progcls + deviations
   // noexec/nocond/nostate/notask/noanchor/noanchorstate). Show only methods whose name contains
   // AT LEAST ONE checked token; if none are checked, show all. Filters BOTH #2 and #2b.
-  const ALL_METHODS=Object.keys(d.episode);
+  // debug-* runs are hidden here too (same convention as #0); the token chips below are built from
+  // the visible set so a debug-only token never offers a chip that filters to nothing.
+  const ALL_METHODS=Object.keys(d.episode).filter(m=>window._showDebug||!isDebugMethod(m));
   const TOKENS=['progact','progreg','progcls','noexec','nocond','nostate','noanchorstate','noanchor','notask','nogrip'];
   // only offer tokens that actually appear in the loaded methods
   const availTokens=TOKENS.filter(tk=>ALL_METHODS.some(m=>m.toLowerCase().includes(tk)));
   window._epTokens=window._epTokens||{};   // token -> checked
   const methodOn=(m)=>{const ml=m.toLowerCase();
+    // debug gate first: it must apply even with no token checked, otherwise the "nothing checked ->
+    // show all" shortcut below would let debug-* runs back into #2/#2b.
+    if(isDebugMethod(m)&&!window._showDebug)return false;
     const on=availTokens.filter(tk=>window._epTokens[tk]);
     if(!on.length)return true;                       // nothing checked -> show all
     return on.some(tk=>ml.includes(tk));};           // OR across checked tokens
@@ -1019,9 +1028,28 @@ async function load(){
   renderEpFilter(); renderEpTable(); renderTaskTab();
   // #0 COMBINED: per-method success + timing + extrapolated cost for the full 50-task benchmark.
   (function(){
-    const C=d.combine||{}; const ms=Object.keys(C);
+    const C=d.combine||{};
+    // DEBUG RUNS: by convention any method named "debug-*" is a throwaway (a few episodes, often a
+    // half-finished sweep), so its rate is noise and it would otherwise sit in the table next to
+    // 1000-episode runs inviting a false comparison. They stay LOADED and one click away, but are
+    // hidden by default. Re-rendering on toggle keeps #0 and #0b consistent, since both derive
+    // their method list from `ms` below.
+    const ALL=Object.keys(C);
+    const DBG=ALL.filter(isDebugMethod);
+    if(window._showDebug===undefined)window._showDebug=false;   // default OFF
+    const ms=ALL.filter(m=>window._showDebug||!isDebugMethod(m));
+    const dbgBar=document.getElementById('cmbdebug');
+    if(dbgBar)dbgBar.innerHTML = DBG.length
+      ? `<label style="cursor:pointer;color:#888"><input type="checkbox" id="cmbdbgcb" `
+        +`${window._showDebug?'checked':''} style="margin-right:4px">show ${DBG.length} debug-* `
+        +`run${DBG.length>1?'s':''}</label>`
+      : '';
+    const cb=document.getElementById('cmbdbgcb');
+    if(cb)cb.onchange=()=>{window._showDebug=cb.checked; load();};
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
-      '<span style="color:#888">No combined runs yet — see /combine.</span>';return;}
+      '<span style="color:#888">'+(DBG.length
+        ? 'Only debug-* runs present — tick “show debug” above to see them.'
+        : 'No combined runs yet — see /combine.')+'</span>';return;}
     // NOTE: keep the header and the row below in 1:1 correspondence. The row used to omit the
     // `errors` cell while the header declared it, which silently shifted every later column one to
     // the left (terminations rendered under "ETA 8 GPU"). The terminations breakdown is now a
@@ -2271,9 +2299,17 @@ function segClass(t){
 
 async function loadMethods(){
   const ms=await (await fetch('/api/combine/methods')).json();
-  $('#method').innerHTML=ms.map(m=>`<option value="${m.method}">${m.method} (${m.n_success??'?'}/${m.n_episodes??'?'})</option>`).join('');
+  // On THIS page debug-* runs stay selectable -- inspecting a debug rollout turn by turn is the
+  // whole point of /combine -- they just must not be the DEFAULT selection, which would silently
+  // open a 2-episode throwaway instead of a real sweep. So: keep every option, sort debug last,
+  // and default to the first non-debug method.
+  const isDbg=m=>/^debug-/i.test(String(m||''));
+  const ordered=ms.slice().sort((a,b)=>(isDbg(a.method)?1:0)-(isDbg(b.method)?1:0));
+  $('#method').innerHTML=ordered.map(m=>`<option value="${m.method}">${isDbg(m.method)?'[debug] ':''}${m.method} (${m.n_success??'?'}/${m.n_episodes??'?'})</option>`).join('');
   if(!ms.length){$('#left').innerHTML='<div class=card><span class=muted>No combined runs under eval_results/combine yet.</span></div>';return;}
-  S.method=ms[0].method; await loadEpisodes();
+  S.method=(ordered.find(m=>!isDbg(m.method))||ordered[0]).method;
+  $('#method').value=S.method;   // explicit: option 0 may now be a different method than S.method
+  await loadEpisodes();
 }
 const SPLIT_LABEL={atomic_seen:'atomic-seen',composite_seen:'composite-seen',
                    composite_unseen:'composite-unseen',other:'other'};
