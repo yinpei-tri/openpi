@@ -75,6 +75,7 @@ from stop_criterion import gripper_width
 # Sibling imports (this file runs as a script; examples/robocasa is sys.path[0]).
 import subtask_eval as SE
 import sys2_client as S2C
+import sys2_rules as SR
 
 HORIZON = SE.HORIZON
 SIM_GRIP_IDX = SE.SIM_GRIP_IDX
@@ -135,10 +136,13 @@ def _write_json(path: Path, obj) -> None:
         tmp.unlink(missing_ok=True)   # never leave scratch behind on an error path
 
 
-def _short_method_name(s1_dir: str | None, s2_dir: str | None) -> str:
+def _short_method_name(s1_dir: str | None, s2_dir: str | None, suffix: str = "") -> str:
     """Derive a compact run name that names BOTH systems, e.g.
 
         s1-progreg270k_s2-qwen35-4b-full-ep3-11416
+
+    ``suffix`` tags a non-default variant onto the end (``-memory``), so a variant sweep lands in
+    its OWN results dir instead of appending into the cold-plan run's numbers.
 
     System1 side: the progress-head tag + the *checkpoint step* (rounded to the nearest 1k), so
     sibling steps of one run get distinct names instead of colliding on the run's training scale
@@ -197,7 +201,7 @@ def _short_method_name(s1_dir: str | None, s2_dir: str | None) -> str:
                             tuner, ep.group(1) if ep else None, step) if b]
         return "s2-" + ("-".join(bits) if bits else run)
 
-    return f"{s1_short(s1_dir)}_{s2_short(s2_dir)}"
+    return f"{s1_short(s1_dir)}_{s2_short(s2_dir)}{suffix}"
 
 
 
@@ -540,6 +544,42 @@ def _gripper_status(grip_cmds: list[float]) -> str | None:
     return "unsure"
 
 
+def do_plan_cold(s2_client, instruction: str, plan_dir: Path, args) -> dict:
+    """COLD plan step: one tiled opening still -> <plan> milestone checklist.
+
+    Factored out (and swappable) so a plan VARIANT can be evaluated without duplicating the
+    execution loop: set ``args.plan_fn`` to another callable with this signature and
+    ``eval_episode`` uses it instead (see ``combine_memory_eval.py``, which first narrates a demo
+    video into a recipe and then issues a with-memory plan). Contract:
+
+        (s2_client, instruction, plan_dir, args) -> {"plan": str, "doc": dict, "variant": str}
+
+    ``plan`` is the checklist handed to the exec loop, ``doc`` is what lands in
+    ``episode.json["plan"]``, and the callee owns everything it writes under ``plan_dir``.
+    """
+    plan_dir.mkdir(parents=True, exist_ok=True)
+    # The planner READS this image, so it stays at model resolution; a small copy is written
+    # alongside for the GUI.
+    scene_full = plan_dir / "scene_full.png"
+    img0 = S2C.write_image(args.scene0, scene_full)
+    S2C.write_image(S2C.downscale([args.scene0])[0], plan_dir / "scene.png")
+    p = s2_client.plan_cold(instruction, scene_full)
+    plan = (p.get("plan") or "").strip()
+    _write_json(plan_dir / "plan.json", {
+        "mode": "plan_cold",
+        "s2_system_prompt": S2C.SYS_PLAN_COLD,
+        "s2_user_prompt": S2C.user_plan_cold(instruction),
+        "s2_response_raw": p["raw"], "thought": p.get("thought"), "plan": plan,
+        "media": {"image": img0}, "latency_s": p.get("latency_s"), "usage": p.get("usage"),
+    })
+    return {
+        "plan": plan,
+        "variant": "cold",
+        "doc": {"thought": p.get("thought"), "plan": plan, "latency_s": p.get("latency_s"),
+                "dir": plan_dir.name},
+    }
+
+
 def run_s1_segment(
     env, s1_client, *, subgoal_text: str, task_goal: str, est_length: int,
     base_pos_ref, base_yaw_ref, anchor_imgs, anchor_state, resize: int,
@@ -759,11 +799,17 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                      "sim_fps": S2C.SIM_FPS, "static_eps": args.static_eps},
             "video_policy_source": S2C.policy_source(),
             "privileged_task_status": True,   # fed from env._check_success(); GT bit by design
+            # Overwritten by the plan step with the variant it actually ran ("cold" / "memory").
             "plan_variant": "cold",
         },
         "turns": [],
     }
 
+    # Per-EPISODE rule state (skip counters) and the running intervention log. Both are
+    # per-episode by construction: a fresh dict here means one episode's skips can never
+    # leak into the next.
+    rule_state: dict = {}
+    ep_rule_log: list[dict] = []
     ep_timings: dict[str, list[float]] = {
         "env_make": [], "env_reset": [], "s2_plan": [], "s2_exec": [], "video_encode": [],
     }
@@ -784,26 +830,19 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         base_pos_ref, base_yaw_ref = base_reference(obs0)
         doc["n_recorded_frames"] = int(len(states))
 
-        # ---------------- PLAN (cold) ----------------
-        scene0 = SE._stacked_from_obs(obs0)
+        # ---------------- PLAN ----------------
+        # Cold by default; ``args.plan_fn`` swaps in a variant (e.g. the memory/recipe planner)
+        # without touching the execution loop below. ``args.scene0`` is the tiled opening still the
+        # planner reads.
+        args.scene0 = SE._stacked_from_obs(obs0)
         plan_dir = ep_out / "plan"
-        # The planner READS this image, so it stays at model resolution; a small copy is written
-        # alongside for the GUI.
-        img0 = S2C.write_image(scene0, plan_dir / "scene_full.png")
-        S2C.write_image(S2C.downscale([scene0])[0], plan_dir / "scene.png")
         _t = time.perf_counter()
-        p = s2_client.plan_cold(instruction, plan_dir / "scene_full.png")
+        res = getattr(args, "plan_fn", None) or do_plan_cold
+        res = res(s2_client, instruction, plan_dir, args)
         ep_timings["s2_plan"].append(time.perf_counter() - _t)
-        plan = (p.get("plan") or "").strip()
-        _write_json(plan_dir / "plan.json", {
-            "mode": "plan_cold",
-            "s2_system_prompt": S2C.SYS_PLAN_COLD,
-            "s2_user_prompt": S2C.user_plan_cold(instruction),
-            "s2_response_raw": p["raw"], "thought": p.get("thought"), "plan": plan,
-            "media": {"image": img0}, "latency_s": p.get("latency_s"), "usage": p.get("usage"),
-        })
-        doc["plan"] = {"thought": p.get("thought"), "plan": plan, "latency_s": p.get("latency_s"),
-                       "dir": "plan"}
+        plan = (res.get("plan") or "").strip()
+        doc["plan"] = res.get("doc") or {}
+        doc["config"]["plan_variant"] = res.get("variant", "cold")
         if not plan:
             raise ValueError("System2 returned no <plan>")
 
@@ -871,6 +910,27 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             sg_detail = (s2.get("subgoal_detail") or "").strip()
             est = s2.get("estimated_step")
 
+            # ---- HARDCODED PER-TASK RULES (opt-in via --task-rules) -------------------------
+            # Revise System2's output before System1 sees it. OFF by default, so the baseline
+            # path is byte-identical to a run without this module. The revised PLAN is assigned
+            # back to `plan`, which is what gets fed to every later exec_turn -- so a rule's plan
+            # edit becomes System2's context for the rest of the episode, exactly like a
+            # model-authored <plan_update>.
+            s2_raw_for_log = {"subgoal": subgoal, "estimated_step": est, "plan": plan}
+            rule_ivs: list[dict] = []
+            skip_s1 = False
+            if args.task_rules:
+                rr = SR.apply_rules(task_name, plan=plan, subgoal=subgoal,
+                                    subgoal_detail=sg_detail, est=est, state=rule_state)
+                plan, subgoal, sg_detail, est = rr["plan"], rr["subgoal"], rr["subgoal_detail"], rr["est"]
+                skip_s1 = rr["skip_s1"]
+                rule_ivs = rr["interventions"]
+                if rule_ivs:
+                    ep_rule_log.append({"turn": turn, "interventions": rule_ivs})
+                    for _iv in rule_ivs:
+                        print(f"  RULE [{_iv['kind']}] {_iv['rule']}: "
+                              f"{_iv['before']} -> {_iv['after']}", flush=True)
+
             turn_rec: dict = {
                 "turn": turn, "dir": tdir.name,
                 "s2": {
@@ -887,6 +947,10 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                     "t_total_s": round(t_s2, 3),   # request + media prep (latency_s = request only)
                 },
                 "plan_after": plan,
+                # Full audit trail: what System2 actually said, and every override applied to it.
+                # Empty list == no rule fired, so an unrevised turn is unambiguous.
+                "rules": {"enabled": bool(args.task_rules), "interventions": rule_ivs,
+                          "s2_before_rules": s2_raw_for_log if rule_ivs else None},
             }
 
             if judge == "task_finish":
@@ -906,6 +970,23 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                                      "subgoal": None, "n_steps": 0, "error": turn_rec["error"]})
                 turn += 1
                 break
+
+            # -- RULE SKIP: this turn runs NO System1 segment ---------------------------------
+            # The rule already marked the step done in `plan`, so next turn System2 sees it
+            # completed and moves on. prev_clip_path is deliberately left untouched: no segment
+            # ran, so there is no new video and System2 re-reads the previous one. The env is not
+            # stepped, so success state is unchanged.
+            if skip_s1:
+                turn_rec["s1"] = None
+                turn_rec["s1_skipped_by_rule"] = True
+                _write_json(tdir / "turn.json", turn_rec)
+                doc["turns"].append({"turn": turn, "dir": tdir.name, "judge": judge,
+                                     "subgoal": subgoal, "n_steps": 0,
+                                     "s1_skipped_by_rule": True,
+                                     "rules": turn_rec["rules"], "plan_after": plan})
+                print(f"  turn {turn}: System1 SKIPPED by rule (subgoal={subgoal!r})", flush=True)
+                turn += 1
+                continue
 
             # -- System1: execute that subgoal --
             # anchor = FIRST frame of THIS segment (== last frame of the previous one).
@@ -1031,6 +1112,12 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 break
         doc["n_turns"] = turn
         doc["termination"] = term
+        # Episode-level rule summary: the per-turn detail lives in each turn.json, this is the
+        # roll-up the report script and the GUI read. `rule_interventions: []` with
+        # `task_rules: true` means the rules were ON but nothing matched this episode.
+        doc["task_rules"] = bool(args.task_rules)
+        doc["rule_interventions"] = ep_rule_log
+        doc["n_rule_interventions"] = sum(len(t["interventions"]) for t in ep_rule_log)
         doc["episode_success"] = bool(env._check_success())
         doc["final_plan"] = plan
         doc["seconds"] = round(time.time() - t0, 2)
@@ -1052,6 +1139,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         return doc
 
     except Exception as e:
+        doc["task_rules"] = bool(args.task_rules)
+        doc["rule_interventions"] = ep_rule_log
         doc["error"] = f"{type(e).__name__}: {e}"
         doc["traceback"] = traceback.format_exc()
         doc["seconds"] = round(time.time() - t0, 2)
@@ -1065,8 +1154,10 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             pass
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
+def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
+    """The full CLI. Exposed so a plan VARIANT script can extend it instead of copying it
+    (``combine_memory_eval.py`` adds its own flags on top of this parser)."""
+    ap = argparse.ArgumentParser(description=description or __doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--lerobot-dir", required=True,
                     help="raw LeRobot dataset dir, e.g. "
@@ -1106,6 +1197,11 @@ def main():
     ap.add_argument("--horizon-mult", type=float, default=2.0,
                     help="segment budget = estimated_step * this, capped by --max-steps-cap")
     ap.add_argument("--max-steps-cap", type=int, default=400)
+    ap.add_argument("--task-rules", action="store_true",
+                    help="apply the HARDCODED per-task System2 revisions in sys2_rules.py "
+                         f"(tasks: {', '.join(SR.TASKS_WITH_RULES)}). Off by default so the "
+                         "baseline path is unchanged; every intervention is recorded under "
+                         "turn.json:rules and episode.json:rule_interventions.")
     ap.add_argument("--default-est-length", type=int, default=50,
                     help="fallback when System2 omits/garbles <estimated_step>")
     ap.add_argument("--replan-steps", type=int, default=16)
@@ -1122,13 +1218,20 @@ def main():
                          "(10x stricter than the stop rule's --stop-eps on purpose; see sys2_client)")
     ap.add_argument("--stop-on-env-success", action="store_true", default=True)
     ap.add_argument("--no-zero-arm-in-base", action="store_true")
-    args = ap.parse_args()
+    return ap
 
+
+def run_sweep(args, *, method_suffix: str = "") -> None:
+    """Connect to both servers, roll every requested episode, write the index part.
+
+    Shared by ``main()`` and by plan-variant scripts: a variant only has to set ``args.plan_fn``
+    (and pass its own ``method_suffix``) to get the identical loop, resume logic and output layout.
+    """
     ep_indices = _parse_episodes(args.episodes)
     # The servers are addressed by PORT, so the checkpoints they serve are not otherwise recorded
     # anywhere in the output. Pass --s1-dir/--s2-dir to bake that provenance into the run.
     if not args.method:
-        args.method = _short_method_name(args.s1_dir, args.s2_dir)
+        args.method = _short_method_name(args.s1_dir, args.s2_dir, method_suffix)
         print(f"derived --method: {args.method}", flush=True)
     norm_stats = None
     if args.norm_stats and args.norm_stats.exists():
@@ -1178,6 +1281,10 @@ def main():
               f"scripts/extract_combine_results.py", flush=True)
     print(f"\nWROTE {out_root / args.method / 'index_parts' / part}  {ok}/{len(results)} success",
           flush=True)
+
+
+def main():
+    run_sweep(build_argparser().parse_args())
 
 
 if __name__ == "__main__":

@@ -19,23 +19,45 @@
 #   # one stack, S1+sim on GPU0 and S2 on GPU1:
 #   METHOD=progreg-noanchor STEP=240000 S1_GPUS=0 S2_GPUS=1 XLA_FRAC=0.9 GPU_FRAC=0.9 \
 #     TASKS=CloseFridge EPISODES=0 bash examples/robocasa/run_combine_fleet.sh
+#   # MEMORY variant (narrate the demo -> recipe -> warm plan -> execute); own results dir + log dir:
+#   EVAL_SCRIPT=combine_memory_eval.py METHOD=progact TASK_SET=composite_unseen EPISODES=0-4 \
+#     bash examples/robocasa/run_combine_fleet.sh
 #
-# Monitor:  tail -f _evallogs/fleet_<method>_<step>/client-stack*.log
+# Monitor:  tail -f _evallogs/fleet_<method>_<step>[_<variant>]/client-stack*.log
 # Results:  eval_results/combine/<derived-method-name>/
 set -euo pipefail
 
 # ---- PATHS ------------------------------------------------------------------------------------
-# Repos + data are on a shared filesystem so several instances share one copy; venvs are local.
-# Read the shared_bashrc contract when present, else default to the /shared layout (a
-# non-interactive shell never sources that file).
-SHARED_ROOT=${SHARED_ROOT:-/shared}
-REPO_ROOT=${REPO_ROOT:-$SHARED_ROOT}
-DATA_DIR=${DATA_DIR:-$SHARED_ROOT/data}
-OPENPI_REPO=${OPENPI_REPO:-$REPO_ROOT/openpi}
+# Nothing is hardcoded to one machine's layout. Resolution order for every root:
+#   1. the env contract (REPO_ROOT / DATA_DIR / SYS1_CKPT_DIR / ... , exported by shared_bashrc on
+#      the shared-filesystem setup); a non-interactive shell never sources that file, hence 2-3.
+#   2. derived from THIS SCRIPT's location: it lives at <openpi>/examples/robocasa/, so the openpi
+#      checkout and its parent are known without naming a mount. Works for /shared/openpi,
+#      ~/openpi, or any other path.
+#   3. DATA_DIR: the first EXISTING candidate of <repo_root>/data, <openpi>/../data, ~/data, so
+#      the classic "repo + sibling data/" workstation layout keeps working untouched.
+# Venvs are deliberately NOT derived from these: they are node-local (not relocatable, and
+# small-file imports over a shared mount are slow) -- see ROBOCASA_PY / OPENPI_PY below.
+_SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+_OPENPI_REPO=$(cd "$_SELF_DIR/../.." && pwd)          # <openpi>/examples/robocasa -> <openpi>
+OPENPI_REPO=${OPENPI_REPO:-$_OPENPI_REPO}
+REPO_ROOT=${REPO_ROOT:-$(dirname "$OPENPI_REPO")}
+if [[ -z "${DATA_DIR:-}" ]]; then
+  for _c in "$REPO_ROOT/data" "$(dirname "$OPENPI_REPO")/data" "$HOME/data"; do
+    [[ -d "$_c" ]] && { DATA_DIR=$_c; break; }
+  done
+  DATA_DIR=${DATA_DIR:-$REPO_ROOT/data}
+fi
+# The rollout client imports sys2.data.video_policy from here (frame sampling must match training
+# exactly); it falls back to a vendored copy and warns if this path is wrong. EXPORTED below.
 SYS2_REPO=${SYS2_REPO:-$REPO_ROOT/sys2_train_eval}
 SYS1_CKPT_DIR=${SYS1_CKPT_DIR:-$DATA_DIR/sys1_ckpts}
 CKPT_DIR=${CKPT_DIR:-$DATA_DIR/sys2_ckpts}
 SYS1_RESULTS_DIR=${SYS1_RESULTS_DIR:-$DATA_DIR/sys1_eval_results}
+# Export so the rollout clients and the worklist generator resolve the SAME roots as this script,
+# rather than each re-deriving them (or, for SYS2_REPO, silently falling back to a vendored copy of
+# the frame-sampling formula). A shell variable alone is invisible to the child processes.
+export OPENPI_REPO REPO_ROOT DATA_DIR SYS2_REPO SYS1_CKPT_DIR SYS1_RESULTS_DIR
 cd "$OPENPI_REPO"
 
 METHOD=${METHOD:-progreg}                  # progreg | progact  (which System1 head)
@@ -68,6 +90,17 @@ RUN_LABEL=${RUN_LABEL:-}
 # UNITS_FILE supplies an explicit "<lerobot-dir> <episode>" manifest, one line per episode, and
 # bypasses worklist generation entirely -- for re-running a hand-picked set of episodes.
 UNITS_FILE=${UNITS_FILE:-}
+# TASK_RULES=1 applies the hardcoded per-task System2 revisions in sys2_rules.py. Off by default:
+# the baseline path must stay identical. Every override is recorded in the results.
+TASK_RULES=${TASK_RULES:-0}
+# Which rollout client each stack runs. The default is the cold-plan loop; combine_memory_eval.py is
+# the same loop with the narrate->recipe->warm-plan memory pass in front of it (it derives its own
+# "<...>-memory" results dir, so a memory sweep never mixes into the cold run's numbers).
+# EVAL_ARGS passes variant-specific flags through, e.g. EVAL_ARGS="--memory-episode 200".
+EVAL_SCRIPT=${EVAL_SCRIPT:-combined_eval.py}
+EVAL_ARGS=${EVAL_ARGS:-}
+[[ -f "$OPENPI_REPO/examples/robocasa/$EVAL_SCRIPT" ]] \
+  || { echo "FATAL: no such eval script examples/robocasa/$EVAL_SCRIPT" >&2; exit 1; }
 ROBOCASA_PY=${ROBOCASA_PY:-/home/ec2-user/micromamba/envs/robocasa/bin/python}   # instance-local venv
 OPENPI_PY=${OPENPI_PY:-/home/ec2-user/venvs/openpi_venv/bin/python}                  # serves System1
 
@@ -89,7 +122,13 @@ esac
 # STEP is in the log dir too: it holds the per-run worklist/units/shard files, so two steps of the
 # same method running at once would otherwise clobber each other's work list. Scratch only --
 # --resume reads the results dir, so renaming this strands no state.
-LOG=_evallogs/fleet_${METHOD}_$STEP
+# The variant is in the name for the same reason: a memory sweep and a cold sweep of the same
+# method+step are different runs and must not share shard files (or each other's client logs).
+# The default (cold) client keeps the historic unsuffixed path so existing logs stay put.
+if [[ "$EVAL_SCRIPT" == "combined_eval.py" ]]; then _VARIANT=""; else
+  _VARIANT=$(basename "$EVAL_SCRIPT" .py); _VARIANT=${_VARIANT#combine_}; _VARIANT=${_VARIANT%_eval}
+fi
+LOG=_evallogs/fleet_${METHOD}_$STEP${_VARIANT:+_$_VARIANT}
 mkdir -p "$LOG"
 IFS=',' read -ra S1LIST <<< "$S1_GPUS"
 IFS=',' read -ra S2LIST <<< "$S2_GPUS"
@@ -181,9 +220,17 @@ if [[ "$SKIP_SERVERS" != "1" ]]; then
     echo "[fleet] stack$i: S1 gpu$g1 :$(s1_port "$i")  S2 gpu$g2 :$(s2_port "$i")"
   done
 
-  echo "[fleet] waiting for all servers (vLLM takes ~4 min to load)..."
+  # READY_TRIES x 10s per stack. A cold-cache vLLM start is far slower than the warm ~4 min: on a
+  # fresh instance the container spends ~9.5 min merely importing its own site-packages (a 40 GB
+  # image of small files, latency-bound) before vLLM prints anything, then ~2 min of config, 48 s
+  # of torch.compile and ~4 min of KV-cache + CUDA-graph capture -- measured 19m20s end to end.
+  # The old 15 min budget expired 4 min short of that, so default to 40 min; warm starts still
+  # break out of the loop as soon as they are ready and cost nothing.
+  READY_TRIES=${READY_TRIES:-240}
+  echo "[fleet] waiting for all servers (up to $((READY_TRIES * 10 / 60)) min; a cold vLLM start is ~20 min)..."
+  failed=()
   for i in "${!S1LIST[@]}"; do
-    for _ in $(seq 1 90); do
+    for _ in $(seq 1 "$READY_TRIES"); do
       s1=$(ss -lnt 2>/dev/null | grep -c ":$(s1_port "$i") " || true)
       s2=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$(s2_port "$i")/v1/models" 2>/dev/null || echo 000)
       [[ "$s1" == "1" && "$s2" == "200" ]] && break
@@ -191,8 +238,20 @@ if [[ "$SKIP_SERVERS" != "1" ]]; then
     done
     [[ "${s1:-0}" == "1" && "${s2:-000}" == "200" ]] \
       && echo "[fleet] stack$i READY" \
-      || { echo "[fleet] stack$i FAILED (S1=$s1 S2=$s2); see $LOG/{s1,s2}-stack$i.log" >&2; }
+      || { echo "[fleet] stack$i FAILED (S1=$s1 S2=$s2); see $LOG/{s1,s2}-stack$i.log" >&2
+           failed+=("$i"); }
   done
+  # A stack whose servers never came up must NOT be given work. This used to fall through and
+  # launch the clients anyway: every episode of that shard then died on "Connection refused" in
+  # ~20s and was recorded as a failure, so a whole shard could be burnt while looking like a
+  # legitimately bad result. Refuse to start rather than produce junk.
+  if [[ ${#failed[@]} -gt 0 ]]; then
+    echo "[fleet] FATAL: ${#failed[@]} stack(s) not ready: ${failed[*]}." >&2
+    echo "[fleet] Not launching any clients (episodes would fail instantly against dead servers)." >&2
+    echo "[fleet] Inspect $LOG/{s1,s2}-stack*.log, then release GPUs with" >&2
+    echo "[fleet]   bash examples/robocasa/release_gpus.sh" >&2
+    exit 1
+  fi
 fi
 
 # ---- shard by (task, EPISODE) so the load balances -------------------------------------------
@@ -240,14 +299,16 @@ for i in "${!GPULIST[@]}"; do
   (
     while read -r ld ep; do
       MUJOCO_GL=egl PYOPENGL_PLATFORM=egl CUDA_VISIBLE_DEVICES=$g \
-        "$ROBOCASA_PY" examples/robocasa/combined_eval.py \
+        "$ROBOCASA_PY" "examples/robocasa/$EVAL_SCRIPT" \
           --lerobot-dir "$ld" --episodes "$ep" \
           --s1-dir "$S1_CKPT" --s2-dir "$S2_CKPT" \
           --s1-port "$(s1_port "$i")" --s2-port "$(s2_port "$i")" --s2-model system2-full \
           --norm-stats "$S1_CKPT/assets/robocasa_system1/norm_stats.json" \
           --out-root "$SYS1_RESULTS_DIR/combine" --max-turns "$MAX_TURNS" \
           ${RUN_LABEL:+--method "$RUN_LABEL"} \
+          $([[ "$TASK_RULES" == 1 ]] && echo --task-rules) \
           $([[ "$RESUME" == 1 ]] && echo --resume) \
+          ${EVAL_ARGS:-} \
         || echo "[fleet] stack$i FAILED $ld ep$ep" >&2
     done < "$LOG/shard-stack$i.txt"
     echo "[fleet] stack$i SHARD COMPLETE"
