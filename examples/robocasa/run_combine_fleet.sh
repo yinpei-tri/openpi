@@ -128,7 +128,13 @@ esac
 if [[ "$EVAL_SCRIPT" == "combined_eval.py" ]]; then _VARIANT=""; else
   _VARIANT=$(basename "$EVAL_SCRIPT" .py); _VARIANT=${_VARIANT#combine_}; _VARIANT=${_VARIANT%_eval}
 fi
-LOG=_evallogs/fleet_${METHOD}_$STEP${_VARIANT:+_$_VARIANT}
+# RUN_LABEL is part of the log dir, not just METHOD/STEP. Two runs of the SAME checkpoint with
+# different labels (e.g. a rules-on run and its rules-off control) otherwise share this directory
+# and clobber each other's worklist/units/shard files WHILE the first run's clients are still
+# reading them -- observed live: a 68-episode run had its shards overwritten by a concurrent
+# 20-episode run and silently stopped at 20, with per-stack counts (4/3, 5/3) exceeding the shard
+# files they came from.
+LOG=_evallogs/fleet_${METHOD}_$STEP${_VARIANT:+_$_VARIANT}${RUN_LABEL:+_$(echo "$RUN_LABEL" | tr -c 'A-Za-z0-9._-' '_')}
 mkdir -p "$LOG"
 IFS=',' read -ra S1LIST <<< "$S1_GPUS"
 IFS=',' read -ra S2LIST <<< "$S2_GPUS"
