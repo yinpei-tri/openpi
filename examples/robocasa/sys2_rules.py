@@ -134,6 +134,10 @@ _STRIP_RETRACT_TASKS = tuple(
 # capability, but a future skipping rule must account for the frozen-env effect.
 MAX_CONSEC_SKIPS = 2
 
+# Max consecutive turns System1 may be handed the SAME subgoal before the repeat cap advances the
+# plan (see _rule_repeat_cap). Env-overridable so the threshold can be swept without a code edit.
+MAX_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_SUBGOAL", "3"))
+
 
 # --------------------------------------------------------------------------------------------
 # the rules
@@ -297,6 +301,80 @@ def _rule_microwave_again(task: str, plan: str, subgoal: str, est, state) -> dic
                                "before": subgoal, "after": new}]}
 
 
+def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """ALL tasks: after MAX_SAME_SUBGOAL consecutive turns on one subgoal, advance to the next
+    fine step instead of re-issuing it.
+
+    Measured over the 1000-episode s1-progact270k run, success collapses with the length of the
+    longest run of consecutive turns on the same subgoal (normalising away "continue to"/"again"):
+
+        1-2 repeats  495 eps  74% success
+        3 repeats     41 eps  51%
+        4-8 repeats  213 eps  ~12%
+        9+ repeats   251 eps   2.4%   (243 of them end in max_turns)
+
+    92% of all wins come from episodes that never repeated more than twice, so a run of 4+ is
+    almost always System1 stuck rather than progress accumulating.
+
+    STIR IS EXEMPT. For continuous-effort actions the repetition IS the task, and stirring is the
+    clearest case: StirVegetables won 6 times at repeat depths 3,3,3,6,6,7. Capping it would
+    destroy those. (Other continuous-effort verbs -- push-door-closed, turn-knob -- also win deep,
+    notably ArrangeTea at depths 9-14; they are NOT exempt here, per the requested rule, so this
+    cap is expected to cost those wins. See the note in the module docstring.)
+
+    On trigger: mark the exhausted step done and hand System1 the NEXT fine step. Marking it done
+    matters -- it is what makes System2 move on as well, instead of re-proposing the same step and
+    forcing us to override every remaining turn.
+
+    NO NEXT STEP -> DO NOTHING. Advancing off the last step would leave System2 with nothing to
+    propose; that is exactly how stripping retract from TurnOnMicrowave turned 4/8 into 0/8, with
+    the planner looping to max_turns. Better to keep re-issuing than to strand it.
+    """
+    n = _norm(subgoal)
+    if not n:
+        return {}
+    prev, count = state.get("rep_sg"), state.get("rep_n", 0)
+    count = count + 1 if n == prev else 1
+    state["rep_sg"], state["rep_n"] = n, count
+    if count <= MAX_SAME_SUBGOAL:
+        return {}
+    if "stir" in n:
+        return {"interventions": [{"rule": "repeat_cap", "kind": "cap_exempt",
+                                   "detail": f"repeat #{count} but 'stir' is a continuous-effort "
+                                             "action -- the repetition IS the task",
+                                   "before": subgoal, "after": subgoal}]}
+    # Locate the current fine step and the one after it.
+    blocks = _blocks(plan)
+    flat = [(b, f) for b in blocks for f in b["fine"]]
+    cur_id = current_fine_id(plan)
+    idx = next((i for i, (_, f) in enumerate(flat) if f["fid"] == cur_id), None)
+    if idx is None or idx + 1 >= len(flat):
+        return {"interventions": [{"rule": "repeat_cap", "kind": "cap_declined",
+                                   "detail": f"repeat #{count} but no next fine step exists -- "
+                                             "advancing would strand System2 with nothing to "
+                                             "propose (see TurnOnMicrowave retract finding)",
+                                   "before": subgoal, "after": subgoal}]}
+    _, cur_f = flat[idx]
+    _, nxt_f = flat[idx + 1]
+    cur_f["mark"] = "x"                      # so System2 advances too, not just System1
+    nxt_f["mark"] = "~"
+    for b in blocks:                          # close a milestone whose steps are all done
+        if b["fine"] and all(f["mark"] == "x" for f in b["fine"]):
+            b["mark"] = "x"
+    new_sg = nxt_f["text"]
+    state["rep_sg"], state["rep_n"] = _norm(new_sg), 1
+    return {"plan": _render(blocks), "subgoal": new_sg, "subgoal_detail": new_sg,
+            "interventions": [
+                {"rule": "repeat_cap", "kind": "plan_revised",
+                 "detail": f"repeat #{count} > MAX_SAME_SUBGOAL={MAX_SAME_SUBGOAL}: marked "
+                           f"{cur_f['fid']} done, advanced to {nxt_f['fid']}",
+                 "before": f"{cur_f['fid']}: {cur_f['text']}",
+                 "after": f"{nxt_f['fid']}: {nxt_f['text']}"},
+                {"rule": "repeat_cap", "kind": "subgoal_override",
+                 "detail": "hand System1 the next fine step instead of the repeated one",
+                 "before": subgoal, "after": new_sg}]}
+
+
 def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dict:
     """TurnOnSinkFaucet: the turn-the-handle subgoal always gets 100 steps.
 
@@ -348,10 +426,12 @@ def _rule_coffee_m2_est(task: str, plan: str, subgoal: str, est, state) -> dict:
 
 # Order matters: the plan rewrite runs first so later rules see the revised checklist.
 _RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
-          _rule_microwave_again, _rule_sink_faucet_est, _rule_coffee_m2_est)
+          _rule_microwave_again, _rule_repeat_cap, _rule_sink_faucet_est,
+          _rule_coffee_m2_est)
 
+# Tasks with task-SPECIFIC rules. _rule_repeat_cap additionally applies to EVERY task.
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
-                    "OpenStandMixerHead", "CoffeeSetupMug")
+                    "OpenStandMixerHead", "CoffeeSetupMug", "<all: repeat_cap>")
 
 
 def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
