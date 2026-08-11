@@ -114,12 +114,19 @@ _RETRACT_RE = re.compile(r"^retract(ing)?\s+(the\s+)?(robot\s+)?arm\b")
 
 # Which tasks have retract steps stripped from the plan. Overridable via SYS2_RULES_STRIP_RETRACT
 # (comma list, or empty to disable) so the strip can be scoped per run WITHOUT editing this file --
-# it measured +2 on OpenStandMixerHead but -4 on TurnOnMicrowave, where retract turned out to be
-# load-bearing (it is System2's next step after pressing; with it gone the planner loops on
-# "continue to press" until max_turns, and the microwave only latches once the arm withdraws).
+# MEASURED, one variable at a time, on the same 8 TurnOnMicrowave episodes:
+#     keep retract, no rephrase    4/8   mean 4.0 turns
+#     strip retract, no rephrase   0/8   mean 9.0 turns  (8/8 max_turns)
+#     strip retract + rephrase     1/8   mean 8.6 turns  (7/8 max_turns)
+#     keep retract + rephrase      5/8   mean 3.8 turns
+# Stripping is what breaks it, and rephrasing does not rescue it -- the cause is structural, not
+# wording. Retract is System2's NEXT step after pressing; delete it and the planner has nothing to
+# advance to, so it loops on "press ... again" until the turn budget runs out, while the microwave
+# only registers as on once the arm withdraws. TurnOnMicrowave is therefore EXCLUDED by default.
+# OpenStandMixerHead keeps the strip (3/7 -> 5/7): the push alone completes that task.
 _STRIP_RETRACT_TASKS = tuple(
     t.strip() for t in os.environ.get(
-        "SYS2_RULES_STRIP_RETRACT", "TurnOnMicrowave,OpenStandMixerHead").split(",") if t.strip())
+        "SYS2_RULES_STRIP_RETRACT", "OpenStandMixerHead").split(",") if t.strip())
 
 # Max consecutive turns a rule may skip System1. NO RULE CURRENTLY SKIPS: the mechanism froze the
 # env (success is polled only on executed steps), so retract handling moved to plan surgery
