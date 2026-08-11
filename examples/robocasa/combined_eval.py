@@ -932,7 +932,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             skip_s1 = False
             if args.task_rules:
                 rr = SR.apply_rules(task_name, plan=plan, subgoal=subgoal,
-                                    subgoal_detail=sg_detail, est=est, state=rule_state)
+                                    subgoal_detail=sg_detail, est=est, state=rule_state,
+                                    judge=judge)
                 plan, subgoal, sg_detail, est = rr["plan"], rr["subgoal"], rr["subgoal_detail"], rr["est"]
                 skip_s1 = rr["skip_s1"]
                 rule_ivs = rr["interventions"]

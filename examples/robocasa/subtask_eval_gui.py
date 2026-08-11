@@ -937,9 +937,13 @@ function renderTagDoc(){
   h+='<div style="color:#888;font-size:12px;margin-top:6px">granularity/verbosity (<code>granfine</code>, <code>verbsimp</code>) describe the subgoal text source; all current runs use fine+simple.</div>';
   box.innerHTML=h;
 }
-// Debug-run convention: a method named "debug-*" is a throwaway (small n, often unfinished), so
-// every table hides it by default rather than letting it sit beside a 1000-episode run.
-const isDebugMethod=m=>/^debug-/i.test(String(m||''));
+// Hidden-by-default methods. Two kinds, both of which would otherwise sit beside a finished
+// 1000-episode cold run and invite a false comparison:
+//   debug-*   throwaway runs (small n, often unfinished)
+//   *-memory  the memory VARIANT (narrate -> recipe -> warm plan); a different pipeline, not a
+//             different checkpoint, so comparing it row-by-row with the cold runs is misleading.
+// Both stay LOADED and one checkbox away -- only the default view is filtered.
+const isDebugMethod=m=>/^debug-/i.test(String(m||''))||/-memory$/i.test(String(m||''));
 const pct=v=>v==null?'–':(100*v).toFixed(1)+'%';
 const f4=v=>v==null?'–':(+v).toFixed(4);
 async function load(){
@@ -1067,7 +1071,7 @@ async function load(){
     if(cb)cb.onchange=()=>{window._showDebug=cb.checked; load();};
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
       '<span style="color:#888">'+(DBG.length
-        ? 'Only debug-* runs present — tick “show debug” above to see them.'
+        ? 'Only hidden runs present (debug-* / *-memory) — tick the box above to see them.'
         : 'No combined runs yet — see /combine.')+'</span>';return;}
     // NOTE: keep the header and the row below in 1:1 correspondence. The row used to omit the
     // `errors` cell while the header declared it, which silently shifted every later column one to
@@ -2338,9 +2342,9 @@ async function loadMethods(){
   // whole point of /combine -- they just must not be the DEFAULT selection, which would silently
   // open a 2-episode throwaway instead of a real sweep. So: keep every option, sort debug last,
   // and default to the first non-debug method.
-  const isDbg=m=>/^debug-/i.test(String(m||''));
+  const isDbg=m=>/^debug-/i.test(String(m||''))||/-memory$/i.test(String(m||''));
   const ordered=ms.slice().sort((a,b)=>(isDbg(a.method)?1:0)-(isDbg(b.method)?1:0));
-  $('#method').innerHTML=ordered.map(m=>`<option value="${m.method}">${isDbg(m.method)?'[debug] ':''}${m.method} (${m.n_success??'?'}/${m.n_episodes??'?'})</option>`).join('');
+  $('#method').innerHTML=ordered.map(m=>`<option value="${m.method}">${/-memory$/i.test(m.method)?'[memory] ':isDbg(m.method)?'[debug] ':''}${m.method} (${m.n_success??'?'}/${m.n_episodes??'?'})</option>`).join('');
   if(!ms.length){$('#left').innerHTML='<div class=card><span class=muted>No combined runs under eval_results/combine yet.</span></div>';return;}
   S.method=(ordered.find(m=>!isDbg(m.method))||ordered[0]).method;
   $('#method').value=S.method;   // explicit: option 0 may now be a different method than S.method
