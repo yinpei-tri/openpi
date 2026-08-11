@@ -139,6 +139,9 @@ MAX_CONSEC_SKIPS = 2
 MAX_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_SUBGOAL", "3"))
 # Tighter cap for a pure "reach to/for X": positioning either converges quickly or not at all.
 REACH_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_REACH", "2"))
+# OpenStandMixerHead est_length floor. est_length is a POLICY CONDITIONING tag (rendered into
+# System1's prompt as "Estimated Length"), not only a budget multiplier -- see _rule_mixer_est_floor.
+MIXER_EST_FLOOR = int(os.environ.get("SYS2_RULES_MIXER_EST_FLOOR", "75"))
 _REACH_RE = re.compile(r"^reach\s+(to|for)\b")
 
 
@@ -309,7 +312,7 @@ def _rule_flag_retract_emitted(task: str, plan: str, subgoal: str, est, state) -
 
 
 def _rule_microwave_again(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """ANY microwave subgoal: rewrite "continue to X" -> "X again" in the System1 prompt.
+    """ANY microwave subgoal: rewrite "continue to press X" -> "press X again" for System1.
 
     Both phrasings occur in this task's recorded rollouts, but they are not equally represented:
     "press the microwave start button again" (9x) / "press the start button again" (2x) appear as
@@ -327,9 +330,17 @@ def _rule_microwave_again(task: str, plan: str, subgoal: str, est, state) -> dic
     # 145 microwave-button turns, WaffleReheat 36, PrepareCoffee 11. Deliberately NOT global -- the
     # "start button" phrasing also belongs to the coffee machine (129 turns), and this rephrase is
     # only motivated where the "... again" form was observed in-distribution.
-    if "microwave" not in _norm(subgoal):
+    # Gate: the SUBGOAL names the microwave, OR the TASK does. Both are needed -- the atomic task
+    # drops the word ("press the start button" 6x, "press the start button again" 2x) so a
+    # subgoal-only gate would miss its own re-issues, while a task-only gate would miss the
+    # composite tasks (SteamInMicrowave 145 microwave-button turns, WaffleReheat 36).
+    if "microwave" not in _norm(subgoal) and "microwave" not in (task or "").lower():
         return {}
-    m = re.match(r"^\s*continue\s+to\s+(.+)$", subgoal or "", re.I)
+    # PRESS only, by request: "continue to press X" -> "press X again". The "... again" form was
+    # observed in-distribution specifically for the button press ("press the microwave start button
+    # again" 9x, "press the start button again" 2x); there is no such evidence for other verbs, so
+    # "continue to push the microwave door closed" is left exactly as System2 wrote it.
+    m = re.match(r"^\s*continue\s+to\s+(press\b.+)$", subgoal or "", re.I)
     if not m:
         return {}
     body = m.group(1).strip().rstrip(".")
@@ -447,6 +458,39 @@ def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dic
                                "before": est, "after": 100}]}
 
 
+def _rule_mixer_est_floor(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """OpenStandMixerHead: every subgoal gets est_length of AT LEAST 75.
+
+    A floor, not a fixed value: an estimate already >= 75 is left alone. System2 gave this task 50
+    for every single subgoal (reach 20/20, push 20/20, retract 12/12), so in practice the floor
+    raises all of them to 75.
+
+    WHY THIS IS NOT JUST A BUDGET CHANGE. The budget was never the binding constraint here -- with
+    est 50 and horizon_mult 2 the budget is 100, while the measured segments ran mean 49-50 steps
+    and max 60, ending on the stop rule or env_success and NEVER on budget. What makes this rule
+    bite is that ``est_length`` is also a POLICY CONDITIONING tag: it is sent to the server in the
+    infer dict and rendered into System1's prompt as "Estimated Length" (see
+    openpi robocasa_policy.py PROMPT_TAGS / build_prompt). So the floor changes the action
+    distribution System1 samples from, telling it to plan a longer motion, independently of how many
+    steps it is allowed.
+
+    Corollary worth remembering when reading results: est overrides on OTHER tasks (faucet, coffee)
+    act through the same two channels, and for progreg they additionally relax the progress
+    threshold (stop_criterion.PROGREG_THRESH_BY_EST). This run is progact, so only the conditioning
+    and budget channels apply.
+    """
+    if task != "OpenStandMixerHead":
+        return {}
+    cur = est if isinstance(est, int) else None
+    if cur is not None and cur >= MIXER_EST_FLOOR:
+        return {}
+    return {"est": MIXER_EST_FLOOR,
+            "interventions": [{"rule": "mixer_est_floor", "kind": "est_override",
+                               "detail": f"floor est_length at {MIXER_EST_FLOOR} (conditioning "
+                                         "tag, not just budget)",
+                               "before": est, "after": MIXER_EST_FLOOR}]}
+
+
 def _rule_coffee_m2_est(task: str, plan: str, subgoal: str, est, state) -> dict:
     """CoffeeSetupMug: EVERY M2.x step gets 100 steps -- except a retract-arm step.
 
@@ -508,7 +552,7 @@ def action_overrides(task: str, plan: str, subgoal: str) -> dict:
 # Order matters: the plan rewrite runs first so later rules see the revised checklist.
 _RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
           _rule_microwave_again, _rule_repeat_cap, _rule_sink_faucet_est,
-          _rule_coffee_m2_est)
+          _rule_mixer_est_floor, _rule_coffee_m2_est)
 
 # Tasks with task-SPECIFIC rules. _rule_repeat_cap additionally applies to EVERY task.
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
