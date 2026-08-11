@@ -300,7 +300,11 @@ def _rule_flag_retract_emitted(task: str, plan: str, subgoal: str, est, state) -
     env, and ``_check_success`` only advances on executed steps (see _rule_strip_retract_plan).
     Executing is also exactly what the baseline did, so it adds no new risk.
     """
-    if task not in ("TurnOnMicrowave", "OpenStandMixerHead"):
+    # Only where the strip actually ran: this rule's whole claim is "System2 asked to retract even
+    # though the step is gone from the plan". On a task that KEEPS its retract step (TurnOnMicrowave,
+    # excluded from the strip since 3f6f1f2) that claim is false, and logging it would misreport
+    # normal planning as an anomaly.
+    if task not in _STRIP_RETRACT_TASKS:
         return {}
     if not _RETRACT_RE.match(_norm(subgoal)):
         return {}
