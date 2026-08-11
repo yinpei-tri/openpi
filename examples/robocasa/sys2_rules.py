@@ -158,15 +158,29 @@ _DRAWER_PULL_RE = re.compile(r"(pull|open|slide).*drawer|drawer.*(open|out)")
 _BASE_ALIGN_RE = re.compile(r"reposition|align|adjust|face the|orient")
 BASE_ALIGN_TEXT = "reposition the base to align with the drawer"
 
+# Which tasks get the base-alignment insert. SCOPED to the atomic task by request: the rule was
+# briefly gated on subgoal text alone, which would also have fired on every composite task that
+# opens a drawer (SetUpCuttingStation 172 drawer-subgoal turns, DeliverStraw 116, OpenDrawer 78,
+# CuttingToolSelection 12). Its 1/6 -> 6/6 result was measured ONLY on PickPlaceDrawerToCounter,
+# so widening it was an untested extrapolation. Add task names here (or via the env var) to widen
+# once there is evidence for it.
+_DRAWER_ALIGN_TASKS = tuple(
+    t.strip() for t in os.environ.get(
+        "SYS2_RULES_DRAWER_ALIGN_TASKS", "PickPlaceDrawerToCounter").split(",") if t.strip())
+
 
 def _rule_drawer_base_align(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """ANY task: guarantee a base-alignment step in front of a reach->pull drawer milestone.
+    """PickPlaceDrawerToCounter (see _DRAWER_ALIGN_TASKS): guarantee a base-alignment step in front
+    of a reach->pull drawer milestone.
 
-    Observed on the atomic task: 15/20 episodes planned the drawer milestone as exactly two fine
-    steps (reach handle -> pull open) and the robot reached from a pose the drawer was not aligned
-    to; the other 5 had System2 insert a base-alignment step itself. Forcing that step took the
-    previously-failing episodes from 1/6 (rules-off control) to 6/6 -- the strongest single effect
-    measured, which is why it is the rule worth generalising by subgoal text rather than task name.
+    Observed there: 15/20 episodes planned the drawer milestone as exactly two fine steps (reach
+    handle -> pull open) and the robot reached from a pose the drawer was not aligned to; the other
+    5 had System2 insert a base-alignment step itself. Forcing that step took the previously-failing
+    episodes from 1/6 (rules-off control) to 6/6 -- the strongest single effect measured.
+
+    The milestone is located by SHAPE rather than assumed to be M1, so the rule still works if the
+    planner numbers the drawer milestone differently; but the TASK gate is deliberate, because the
+    6/6 result was measured on this task alone.
 
     Guards:
       * the milestone must have exactly 2 fine steps matching reach-drawer then pull-drawer;
@@ -177,6 +191,8 @@ def _rule_drawer_base_align(task: str, plan: str, subgoal: str, est, state) -> d
     The subgoal is overridden ONLY when the current step is the one being displaced -- otherwise
     the plan is fixed up for later and this turn runs untouched.
     """
+    if task not in _DRAWER_ALIGN_TASKS:
+        return {}
     blocks = _blocks(plan)
     cur_id = current_fine_id(plan)
     for b in blocks:
