@@ -916,7 +916,12 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             # back to `plan`, which is what gets fed to every later exec_turn -- so a rule's plan
             # edit becomes System2's context for the rest of the episode, exactly like a
             # model-authored <plan_update>.
-            s2_raw_for_log = {"subgoal": subgoal, "estimated_step": est, "plan": plan}
+            # System2's OWN output, kept verbatim for the record. The rules below rebind
+            # `subgoal`/`est`/`plan` to the EFFECTIVE values handed to System1; these three keep
+            # what the model actually said, so turn.json's "s2" block never misreports the planner
+            # (its <estimated_step> stays whatever it emitted, even when a rule overrode the budget
+            # in flight). The raw response string is never touched.
+            s2_subgoal, s2_sg_detail, s2_est, s2_plan = subgoal, sg_detail, est, plan
             rule_ivs: list[dict] = []
             skip_s1 = False
             if args.task_rules:
@@ -938,8 +943,9 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                     "user_prompt": s2_user,
                     "response_raw": s2.get("raw"),
                     "thought": s2.get("thought"), "judge": judge, "judge_raw": s2.get("judge_raw"),
-                    "plan_update": s2.get("plan_update"), "estimated_step": est,
-                    "subgoal": subgoal, "subgoal_detail": sg_detail,
+                    # PRE-rule: what System2 itself emitted (see s2_* capture above).
+                    "plan_update": s2.get("plan_update"), "estimated_step": s2_est,
+                    "subgoal": s2_subgoal, "subgoal_detail": s2_sg_detail,
                     "latency_s": s2.get("latency_s"), "usage": s2.get("usage"),
                     "nframes_requested": s2.get("nframes"),
                     "media": s2_media,
@@ -950,7 +956,11 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 # Full audit trail: what System2 actually said, and every override applied to it.
                 # Empty list == no rule fired, so an unrevised turn is unambiguous.
                 "rules": {"enabled": bool(args.task_rules), "interventions": rule_ivs,
-                          "s2_before_rules": s2_raw_for_log if rule_ivs else None},
+                          # What System1 was ACTUALLY given, after any override. Equal to the "s2"
+                          # block above when no rule fired, so the two are always comparable.
+                          "effective": {"subgoal": subgoal, "subgoal_detail": sg_detail,
+                                        "estimated_step": est},
+                          "s2_plan_before_rules": (s2_plan if s2_plan != plan else None)},
             }
 
             if judge == "task_finish":

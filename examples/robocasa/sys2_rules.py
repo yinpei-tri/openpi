@@ -264,29 +264,40 @@ def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dic
                                "before": est, "after": 100}]}
 
 
-def _rule_coffee_carry_est(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """CoffeeSetupMug: M2.1 (carry the mug to the dispenser) always gets 100 steps.
+def _rule_coffee_m2_est(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """CoffeeSetupMug: EVERY M2.x step gets 100 steps -- except a retract-arm step.
 
-    Keyed on the milestone POSITION, per the requested rule: M2.1's wording varied 6 ways across
-    20 episodes ("lift and carry the mug to the coffee machine dispenser", "carry and place the
-    red mug ...", ...), so text matching would be fragile. System2 gave it 50 (16x) or 75 (4x)
-    and never 100.
+    Keyed on the milestone POSITION rather than wording: M2.1 alone was phrased 6 different ways
+    across 20 episodes ("lift and carry the mug to the coffee machine dispenser", "carry and place
+    the red mug under ...", ...), so text matching would be fragile. Across M2 System2 budgeted 50
+    or 75 and essentially never 100 (M2.1: 50x16/75x4, M2.2: 50x32/75x4, M2.3: 50x13).
+
+    The retract exemption is by request: unlike the carry/lower/release steps, a retract is a short
+    move away from the machine and does not need a full segment. NOTE this task keeps its retract
+    steps -- only TurnOnMicrowave/OpenStandMixerHead strip them, because here the retract is
+    load-bearing (it precedes carrying the mug).
     """
     if task != "CoffeeSetupMug":
         return {}
-    if current_fine_id(plan) != "M2.1":
+    fid = current_fine_id(plan)
+    if not fid or not fid.startswith("M2."):
         return {}
+    if _RETRACT_RE.match(_norm(subgoal)):
+        return {"interventions": [{"rule": "coffee_m2_est", "kind": "est_exempt",
+                                   "detail": f"{fid} is a retract-arm step -- left at System2's "
+                                             "estimate, no full segment needed",
+                                   "before": est, "after": est}]}
     if est == 100:
         return {}
     return {"est": 100,
-            "interventions": [{"rule": "coffee_carry_est", "kind": "est_override",
-                               "detail": "M2.1 carry-to-dispenser needs a full segment",
+            "interventions": [{"rule": "coffee_m2_est", "kind": "est_override",
+                               "detail": f"{fid} (M2 milestone) needs a full segment",
                                "before": est, "after": 100}]}
 
 
 # Order matters: the plan rewrite runs first so later rules see the revised checklist.
 _RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
-          _rule_sink_faucet_est, _rule_coffee_carry_est)
+          _rule_sink_faucet_est, _rule_coffee_m2_est)
 
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
                     "OpenStandMixerHead", "CoffeeSetupMug")
