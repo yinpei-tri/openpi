@@ -31,6 +31,7 @@ the match strings and milestone ids are the ones the model actually emits, not g
 
 from __future__ import annotations
 
+import os
 import re
 
 # --------------------------------------------------------------------------------------------
@@ -111,6 +112,15 @@ def _norm(s: str | None) -> str:
 # not.
 _RETRACT_RE = re.compile(r"^retract(ing)?\s+(the\s+)?(robot\s+)?arm\b")
 
+# Which tasks have retract steps stripped from the plan. Overridable via SYS2_RULES_STRIP_RETRACT
+# (comma list, or empty to disable) so the strip can be scoped per run WITHOUT editing this file --
+# it measured +2 on OpenStandMixerHead but -4 on TurnOnMicrowave, where retract turned out to be
+# load-bearing (it is System2's next step after pressing; with it gone the planner loops on
+# "continue to press" until max_turns, and the microwave only latches once the arm withdraws).
+_STRIP_RETRACT_TASKS = tuple(
+    t.strip() for t in os.environ.get(
+        "SYS2_RULES_STRIP_RETRACT", "TurnOnMicrowave,OpenStandMixerHead").split(",") if t.strip())
+
 # Max consecutive turns a rule may skip System1. NO RULE CURRENTLY SKIPS: the mechanism froze the
 # env (success is polled only on executed steps), so retract handling moved to plan surgery
 # instead -- see _rule_strip_retract_plan. The plumbing is kept because `skip_s1` is a generic
@@ -161,8 +171,11 @@ def _rule_drawer_base_align(task: str, plan: str, subgoal: str, est, state) -> d
                "before": old_fine,
                "after": [f"{f['fid']}: {f['text']}" for f in m1["fine"]]})
     out = {"plan": new_plan, "interventions": iv}
-    # Hand System1 the new first step this turn, with the requested budget.
+    # Hand System1 the new first step this turn, with the requested budget. The detail is synced
+    # HERE, by the rule that changed the ACTION -- a stale detail would still describe reaching for
+    # the handle. Rules that only rephrase (see _rule_microwave_again) must NOT touch the detail.
     out["subgoal"] = NEW
+    out["subgoal_detail"] = NEW
     out["est"] = 75
     iv.append({"rule": "drawer_base_align", "kind": "subgoal_override",
                "detail": "execute the inserted base-alignment step before reaching",
@@ -197,7 +210,7 @@ def _rule_strip_retract_plan(task: str, plan: str, subgoal: str, est, state) -> 
     Deliberately NOT applied to CoffeeSetupMug, which also emits retract subgoals but where the
     retract precedes carrying the mug and is load-bearing.
     """
-    if task not in ("TurnOnMicrowave", "OpenStandMixerHead"):
+    if task not in _STRIP_RETRACT_TASKS:
         return {}
     blocks = _blocks(plan)
     removed: list[str] = []
@@ -244,6 +257,37 @@ def _rule_flag_retract_emitted(task: str, plan: str, subgoal: str, est, state) -
                                          "plan; executing it (NOT skipping -- a skip would "
                                          "freeze the env and block success detection)",
                                "before": subgoal, "after": subgoal}]}
+
+
+def _rule_microwave_again(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """TurnOnMicrowave: rewrite "continue to X" -> "X again" in the System1 prompt.
+
+    Both phrasings occur in this task's recorded rollouts, but they are not equally represented:
+    "press the microwave start button again" (9x) / "press the start button again" (2x) appear as
+    their own subgoals, so the "... again" form is in-distribution for System1, while "continue
+    to ..." is the wrapper System2 adds when it judges a step only partway done.
+
+    This changes ONLY the instruction string handed to System1. System2's own subgoal is recorded
+    verbatim (turn.json "s2"), the checklist is untouched, and the est/budget is unchanged -- so the
+    planner's behaviour on later turns is unaffected except through what System1 actually does.
+
+    Guards: an existing trailing "again" is not doubled, and a subgoal without the "continue to"
+    wrapper is left exactly as-is.
+    """
+    if task != "TurnOnMicrowave":
+        return {}
+    m = re.match(r"^\s*continue\s+to\s+(.+)$", subgoal or "", re.I)
+    if not m:
+        return {}
+    body = m.group(1).strip().rstrip(".")
+    new = body if re.search(r"\bagain$", body, re.I) else f"{body} again"
+    if new == subgoal:
+        return {}
+    return {"subgoal": new,
+            "interventions": [{"rule": "microwave_again", "kind": "subgoal_override",
+                               "detail": "'continue to X' -> 'X again' (the in-distribution "
+                                         "phrasing for System1 on this task)",
+                               "before": subgoal, "after": new}]}
 
 
 def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dict:
@@ -297,7 +341,7 @@ def _rule_coffee_m2_est(task: str, plan: str, subgoal: str, est, state) -> dict:
 
 # Order matters: the plan rewrite runs first so later rules see the revised checklist.
 _RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
-          _rule_sink_faucet_est, _rule_coffee_m2_est)
+          _rule_microwave_again, _rule_sink_faucet_est, _rule_coffee_m2_est)
 
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
                     "OpenStandMixerHead", "CoffeeSetupMug")
@@ -327,9 +371,6 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
                 cur[k] = r[k]
         if cur["skip_s1"]:
             break            # nothing else applies to a turn that runs no segment
-    # A subgoal override must not leave a stale detail string describing the old instruction.
-    if any(i["kind"] == "subgoal_override" for i in ivs):
-        cur["subgoal_detail"] = cur["subgoal"]
     st["consec_skips"] = (st.get("consec_skips", 0) + 1) if cur["skip_s1"] else 0
     cur["interventions"] = ivs
     return cur
