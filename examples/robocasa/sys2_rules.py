@@ -111,9 +111,10 @@ def _norm(s: str | None) -> str:
 # not.
 _RETRACT_RE = re.compile(r"^retract(ing)?\s+(the\s+)?(robot\s+)?arm\b")
 
-# Max consecutive turns a rule may skip System1. Without a cap, a task whose System2 insists on
-# the skipped step would burn its whole turn budget on no-op turns; on hitting the cap the
-# subgoal is executed normally instead.
+# Max consecutive turns a rule may skip System1. NO RULE CURRENTLY SKIPS: the mechanism froze the
+# env (success is polled only on executed steps), so retract handling moved to plan surgery
+# instead -- see _rule_strip_retract_plan. The plumbing is kept because `skip_s1` is a generic
+# capability, but a future skipping rule must account for the frozen-env effect.
 MAX_CONSEC_SKIPS = 2
 
 
@@ -171,44 +172,78 @@ def _rule_drawer_base_align(task: str, plan: str, subgoal: str, est, state) -> d
     return out
 
 
-def _rule_drop_retract(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """TurnOnMicrowave / OpenStandMixerHead: never execute a retract-the-arm subgoal.
+def _rule_strip_retract_plan(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """TurnOnMicrowave / OpenStandMixerHead: DELETE retract-arm steps from the checklist.
 
-    These tasks' success is already latched by the dense env check before the retract; spending a
-    segment (and turns) pulling the arm back only risks disturbing the achieved state. The step is
-    marked DONE in the checklist and System1 is skipped, so System2 sees it completed next turn
-    and moves on (or judges task_finish) instead of re-issuing it.
+    Plan surgery, at the source. The cold plan reads
+
+        - [~] M1: open the stand mixer head
+          * [~] M1.1: reach to the stand mixer head
+          * [ ] M1.2: push the stand mixer head open
+          * [ ] M1.3: retract the arm        <- removed
+
+    so System2, conditioning on the revised checklist from task_begin onward, never proposes the
+    step in the first place. Surviving siblings are renumbered to stay contiguous.
+
+    WHY NOT the previous approach: the first version left the plan alone and skipped System1 on
+    each retract subgoal as it arrived. That was wrong twice over. (a) It only reacted after
+    System2 had already spent a turn proposing the step, so retract subgoals still filled the
+    turn list. (b) A skipped turn never steps the env, and ``_check_success`` is polled per
+    executed step -- so skipping FROZE the world and made success undetectable. Measured: 20
+    skipped vs 10 executed anyway (a skip cap turned it into a 2-on/1-off cycle), and all four
+    TurnOnMicrowave successes latched 10-13 steps INTO an executed retract, i.e. only because the
+    cap defeated the rule.
 
     Deliberately NOT applied to CoffeeSetupMug, which also emits retract subgoals but where the
-    retract is load-bearing (it precedes carrying the mug).
+    retract precedes carrying the mug and is load-bearing.
+    """
+    if task not in ("TurnOnMicrowave", "OpenStandMixerHead"):
+        return {}
+    blocks = _blocks(plan)
+    removed: list[str] = []
+    for b in blocks:
+        keep = []
+        for f in b["fine"]:
+            # Only strip a step that has NOT been executed. One already marked done is history:
+            # deleting it would rewrite what happened, and renumbering around it would silently
+            # change which id the remaining steps refer to.
+            if f["mark"] != "x" and _RETRACT_RE.match(_norm(f["text"])):
+                removed.append(f"{f['fid']}: {f['text']}")
+                continue
+            keep.append(f)
+        if len(keep) != len(b["fine"]):
+            for n, f in enumerate(keep, start=1):      # renumber to stay contiguous
+                f["fid"] = f"{b['mid']}.{n}"
+            b["fine"] = keep
+    if not removed:
+        return {}          # nothing to strip -> idempotent no-op on later turns
+    return {"plan": _render(blocks),
+            "interventions": [{"rule": "strip_retract_plan", "kind": "plan_revised",
+                               "detail": "deleted retract-arm step(s) from the checklist so "
+                                         "System2 never proposes them",
+                               "before": removed, "after": None}]}
+
+
+def _rule_flag_retract_emitted(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """Record when System2 asks to retract ANYWAY, despite the step being gone from the plan.
+
+    Purely observational -- it does not change behaviour. System2 also reads the video, so it can
+    re-propose a retract from what it sees even with no such step in the checklist; this counts
+    how often the plan edit fails to prevent that.
+
+    The subgoal is then EXECUTED normally rather than skipped, deliberately: skipping stops the
+    env, and ``_check_success`` only advances on executed steps (see _rule_strip_retract_plan).
+    Executing is also exactly what the baseline did, so it adds no new risk.
     """
     if task not in ("TurnOnMicrowave", "OpenStandMixerHead"):
         return {}
     if not _RETRACT_RE.match(_norm(subgoal)):
         return {}
-    if state.get("consec_skips", 0) >= MAX_CONSEC_SKIPS:
-        return {"interventions": [{"rule": "drop_retract", "kind": "skip_declined",
-                                   "detail": f"hit MAX_CONSEC_SKIPS={MAX_CONSEC_SKIPS}; "
-                                             "executing normally to avoid a stalled episode",
-                                   "before": subgoal, "after": subgoal}]}
-    blocks = _blocks(plan)
-    marked = None
-    for b in blocks:
-        for f in b["fine"]:
-            if f["mark"] in (" ", "~") and _RETRACT_RE.match(_norm(f["text"])):
-                f["mark"] = "x"
-                marked = f["fid"]
-                break
-        if marked:
-            if all(f["mark"] == "x" for f in b["fine"]):
-                b["mark"] = "x"
-            break
-    return {"plan": _render(blocks) if marked else plan,
-            "skip_s1": True,
-            "interventions": [{"rule": "drop_retract", "kind": "subgoal_skipped",
-                               "detail": ("dropped retract-arm subgoal; marked "
-                                          f"{marked or 'no matching plan step'} done"),
-                               "before": subgoal, "after": None}]}
+    return {"interventions": [{"rule": "retract_emitted_despite_plan", "kind": "observed",
+                               "detail": "System2 proposed a retract with no such step in the "
+                                         "plan; executing it (NOT skipping -- a skip would "
+                                         "freeze the env and block success detection)",
+                               "before": subgoal, "after": subgoal}]}
 
 
 def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dict:
@@ -250,8 +285,8 @@ def _rule_coffee_carry_est(task: str, plan: str, subgoal: str, est, state) -> di
 
 
 # Order matters: the plan rewrite runs first so later rules see the revised checklist.
-_RULES = (_rule_drawer_base_align, _rule_drop_retract, _rule_sink_faucet_est,
-          _rule_coffee_carry_est)
+_RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
+          _rule_sink_faucet_est, _rule_coffee_carry_est)
 
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
                     "OpenStandMixerHead", "CoffeeSetupMug")
