@@ -234,7 +234,8 @@ def _rule_drawer_base_align(task: str, plan: str, subgoal: str, est, state) -> d
 
 
 def _rule_strip_retract_plan(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """TurnOnMicrowave / OpenStandMixerHead: DELETE retract-arm steps from the checklist.
+    """_STRIP_RETRACT_TASKS (default: OpenStandMixerHead only): DELETE retract-arm steps from the
+    checklist.
 
     Plan surgery, at the source. The cold plan reads
 
