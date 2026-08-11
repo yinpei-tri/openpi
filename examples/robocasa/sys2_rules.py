@@ -206,15 +206,6 @@ def bump_est(est):
 
 
 _REACH_RE = re.compile(r"^reach\s+(to|for)\b")
-# CoffeeSetupMug. Matched on the RAW subgoal, not _norm(): _norm strips a trailing "again", which is
-# the very token that identifies a re-grasp.
-_REGRASP_RE = re.compile(r"^\s*(continue\s+to\s+)?grasp\b.*\bagain\b\s*$", re.I)
-COFFEE_REGRASP_SUBGOAL = "lift the mug"
-# "<action> and release" as a TRAILING suffix (46 of the 49 observed occurrences). The 3 remaining
-# use "lower and release the red mug ..." where the release is inside the verb phrase, not a
-# trailing clause -- splitting that would require rewriting the object, so it is left alone.
-_AND_RELEASE_RE = re.compile(r"^(?P<head>.+?)\s+and\s+release\s*$", re.I)
-COFFEE_RELEASE_SUBGOAL = "release the mug"
 
 
 # --------------------------------------------------------------------------------------------
@@ -613,79 +604,6 @@ def _rule_mixer_est_floor(task: str, plan: str, subgoal: str, est, state) -> dic
                                "before": est, "after": MIXER_EST_FLOOR}]}
 
 
-def _rule_coffee_regrasp_to_lift(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """CoffeeSetupMug: replace a "grasp ... again" subgoal with "lift the mug".
-
-    System2 emits this only when it judges ``subgoal_failed`` -- measured: "grasp the mug again" 4x
-    and "grasp the red mug again" 2x, every one of them with judge=subgoal_failed. That judgement is
-    a FALSE POSITIVE on this task: the mug is in fact already held, so re-grasping repeats a
-    completed action and stalls the episode. Handing System1 "lift the mug" moves the segment on to
-    the action that should follow instead.
-
-    Matched on the RAW subgoal: _norm() strips a trailing "again", which is exactly the token that
-    identifies a re-grasp. The judge is recorded in the intervention for the audit but is not
-    required to match -- the phrasing alone is the trigger, as requested.
-    """
-    if task != "CoffeeSetupMug" or not _REGRASP_RE.match(subgoal or ""):
-        return {}
-    return {"subgoal": COFFEE_REGRASP_SUBGOAL, "subgoal_detail": COFFEE_REGRASP_SUBGOAL,
-            "interventions": [{"rule": "coffee_regrasp_to_lift", "kind": "subgoal_override",
-                               "detail": "re-grasp is a false positive (the mug is already held); "
-                                         f"System2 judge was {state.get('judge')!r}",
-                               "before": subgoal, "after": COFFEE_REGRASP_SUBGOAL}]}
-
-
-def _rule_coffee_split_release(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """CoffeeSetupMug: split an M2 "<action> and release" step into "<action>" + "release the mug".
-
-    The combined step asks System1 to position the mug AND open the gripper in one segment, and the
-    stop rule fires once for the pair -- so the release rides on whatever pose the positioning
-    ended in. Splitting makes the release its own segment with its own stop decision.
-
-    Plan surgery, so the revised checklist is what System2 conditions on from the next turn onward
-    (M2.2 -> M2.2 + M2.3, later steps renumbered). Idempotent: once split, no step matches. An
-    already-executed step ([x]) is left alone -- that is history.
-
-    Targets M2 only, and only the trailing "... and release" form (46 of 49 observed; see
-    _AND_RELEASE_RE). When the step being split is the CURRENT one, System1 is also handed the
-    positioning half this turn, so it does not perform the release it was just told to defer.
-    """
-    if task != "CoffeeSetupMug":
-        return {}
-    blocks = _blocks(plan)
-    cur = current_fine_id(plan)
-    for b in blocks:
-        if b["mid"] != "M2":
-            continue
-        for i, f in enumerate(b["fine"]):
-            if f["mark"] == "x":
-                continue
-            m = _AND_RELEASE_RE.match(f["text"])
-            if not m:
-                continue
-            head = m.group("head").strip()
-            was_current = (f["fid"] == cur)
-            new_fine = list(b["fine"])
-            new_fine[i] = {"mark": f["mark"], "fid": "", "text": head}
-            new_fine.insert(i + 1, {"mark": " ", "fid": "", "text": COFFEE_RELEASE_SUBGOAL})
-            for k, ff in enumerate(new_fine, start=1):
-                ff["fid"] = f"{b['mid']}.{k}"
-            b["fine"] = new_fine
-            iv = [{"rule": "coffee_split_release", "kind": "plan_revised",
-                   "detail": f"split {f['fid']} into positioning + a separate release step",
-                   "before": f"{f['fid']}: {f['text']}",
-                   "after": [f"{x['fid']}: {x['text']}" for x in new_fine[i:i + 2]]}]
-            out = {"plan": _render(blocks), "interventions": iv}
-            if was_current:
-                out["subgoal"] = head
-                out["subgoal_detail"] = head
-                iv.append({"rule": "coffee_split_release", "kind": "subgoal_override",
-                           "detail": "defer the release to its own segment",
-                           "before": subgoal, "after": head})
-            return out
-    return {}
-
-
 def _rule_coffee_m2_est(task: str, plan: str, subgoal: str, est, state) -> dict:
     """CoffeeSetupMug: EVERY M2.x step gets 100 steps -- except a retract-arm step.
 
@@ -747,8 +665,7 @@ def action_overrides(task: str, plan: str, subgoal: str) -> dict:
 # Order matters: the plan rewrite runs first so later rules see the revised checklist.
 _RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
           _rule_microwave_again, _rule_repeat_cap, _rule_sink_faucet_est,
-          _rule_est_bump, _rule_mixer_est_floor,
-          _rule_coffee_regrasp_to_lift, _rule_coffee_split_release, _rule_coffee_m2_est)
+          _rule_est_bump, _rule_mixer_est_floor, _rule_coffee_m2_est)
 
 # Tasks with task-SPECIFIC rules. _rule_repeat_cap additionally applies to EVERY task.
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
@@ -756,7 +673,7 @@ TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFa
 
 
 def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
-                state: dict | None = None, judge: str | None = None) -> dict:
+                state: dict | None = None) -> dict:
     """Revise one turn's System2 output. Returns what the caller should actually use.
 
     ``state`` is a per-EPISODE dict the caller threads through every turn (skip counters live
@@ -766,8 +683,6 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
     running without this module.
     """
     st = state if state is not None else {}
-    if judge is not None:
-        st["judge"] = judge      # recorded by coffee_regrasp_to_lift; not a gate
     cur = {"plan": plan, "subgoal": subgoal, "subgoal_detail": subgoal_detail, "est": est,
            "skip_s1": False}
     ivs: list[dict] = []
