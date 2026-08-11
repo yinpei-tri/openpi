@@ -206,6 +206,12 @@ def bump_est(est):
 
 
 _REACH_RE = re.compile(r"^reach\s+(to|for)\b")
+# ANY subgoal containing the word "wait" -- including the compound "reach to the toaster slot and
+# wait" (29 turns), which also has to hold still once it arrives.
+_WAIT_RE = re.compile(r"\bwait\b")
+# est for a pure wait on GetToastedBread. NOTE 700 is not one of EST_BUCKETS (…600, 800…); it is the
+# requested value and is passed through as-is rather than snapped.
+TOAST_WAIT_EST = int(os.environ.get("SYS2_RULES_TOAST_WAIT_EST", "700"))
 
 
 # --------------------------------------------------------------------------------------------
@@ -571,6 +577,32 @@ def _rule_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
                                "before": est, "after": new}]}
 
 
+def _rule_toast_wait_est(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """GetToastedBread: ANY subgoal containing "wait" gets est TOAST_WAIT_EST (700).
+
+    Covers "wait for the bread to pop up" (25 turns), "continue to wait for the bread to pop up"
+    (58), "wait for the toaster lever to pop up", and the compound "reach to the toaster slot and
+    wait" (31) -- that one also has to hold still once it arrives.
+
+    HEADS UP, recorded here because it limits what this rule can do: est feeds the segment budget as
+    ``min(max_steps_cap, est * horizon_mult)``, and --max-steps-cap defaults to 400. System2 already
+    asks 400-600 for this subgoal, so the budget is ALREADY pinned at 400 and these segments already
+    end on stop=budget. Raising est to 700 therefore changes only the CONDITIONING channel (System1
+    is told to expect a very long motion, i.e. to stay put), not the number of steps it may run. To
+    actually lengthen a single wait, --max-steps-cap has to rise too (700 * 2 = 1400). The wait does
+    still accumulate across turns, because System2 re-issues "continue to wait".
+    """
+    if task != "GetToastedBread" or not _WAIT_RE.search(_norm(subgoal)):
+        return {}
+    if isinstance(est, int) and est >= TOAST_WAIT_EST:
+        return {}
+    return {"est_proposal": TOAST_WAIT_EST,
+            "interventions": [{"rule": "toast_wait_est", "kind": "est_proposed",
+                               "detail": f"pure wait -> est {TOAST_WAIT_EST} (conditioning; budget "
+                                         "stays capped by --max-steps-cap)",
+                               "before": est, "after": TOAST_WAIT_EST}]}
+
+
 def _rule_mixer_est_floor(task: str, plan: str, subgoal: str, est, state) -> dict:
     """OpenStandMixerHead: every subgoal gets est_length of AT LEAST 75.
 
@@ -665,7 +697,8 @@ def action_overrides(task: str, plan: str, subgoal: str) -> dict:
 # Order matters: the plan rewrite runs first so later rules see the revised checklist.
 _RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
           _rule_microwave_again, _rule_repeat_cap, _rule_sink_faucet_est,
-          _rule_est_bump, _rule_mixer_est_floor, _rule_coffee_m2_est)
+          _rule_est_bump, _rule_toast_wait_est, _rule_mixer_est_floor,
+          _rule_coffee_m2_est)
 
 # Tasks with task-SPECIFIC rules. _rule_repeat_cap additionally applies to EVERY task.
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
