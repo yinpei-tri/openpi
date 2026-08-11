@@ -663,9 +663,286 @@ def action_overrides(task: str, plan: str, subgoal: str) -> dict:
 
 
 # Order matters: the plan rewrite runs first so later rules see the revised checklist.
+
+# =============================================================================================
+# GRADUATED per-task rules. Each arrived via sys2_rules_exp.py and is promoted here only after a
+# run measured it. The measurement tables are kept inline so a rule is never re-litigated from
+# memory. Both sets are gated on ONE task and share the two helpers below.
+# =============================================================================================
+
+
+def _split_fine_step(plan: str, subgoal: str, match_re, second_text_fn, first_text_fn=None,
+                     milestone: str | None = None, rule: str = "split"):
+    """Split the first matching fine step into two, renumbering that milestone.
+
+    Skips steps already marked done ([x]) -- that is history, and renumbering around it would change
+    which id the later steps refer to. Idempotent: once split, nothing matches. When the split step
+    is the CURRENT one, System1 is also handed the FIRST half this turn, so it does not perform the
+    half it was just told to defer.
+    """
+    blocks = _blocks(plan)
+    cur = current_fine_id(plan)
+    for b in blocks:
+        if milestone is not None and b["mid"] != milestone:
+            continue
+        for i, f in enumerate(b["fine"]):
+            if f["mark"] == "x":
+                continue
+            m = match_re.match(f["text"])
+            if not m:
+                continue
+            head = (first_text_fn or (lambda mm: mm.group("head").strip()))(m)
+            tail = second_text_fn(m)
+            was_current = (f["fid"] == cur)
+            new_fine = list(b["fine"])
+            new_fine[i] = {"mark": f["mark"], "fid": "", "text": head}
+            new_fine.insert(i + 1, {"mark": " ", "fid": "", "text": tail})
+            for k, ff in enumerate(new_fine, start=1):
+                ff["fid"] = f"{b['mid']}.{k}"
+            b["fine"] = new_fine
+            iv = [{"rule": rule, "kind": "plan_revised",
+                   "detail": f"split {f['fid']} into two steps",
+                   "before": f"{f['fid']}: {f['text']}",
+                   "after": [f"{x['fid']}: {x['text']}" for x in new_fine[i:i + 2]]}]
+            out = {"plan": _render(blocks), "interventions": iv}
+            if was_current:
+                out["subgoal"] = head
+                out["subgoal_detail"] = head
+                iv.append({"rule": rule, "kind": "subgoal_override",
+                           "detail": "run only the first half this turn",
+                           "before": subgoal, "after": head})
+            return out
+    return {}
+
+
+def _advance_current_step(plan: str, subgoal: str, rule: str, detail: str):
+    """Mark the current fine step done and hand System1 the NEXT one.
+
+    This is how "skip this subgoal" is implemented. It is deliberately NOT ``skip_s1``: a skipped
+    turn never steps the env, and ``_check_success()`` is polled only on executed steps, so skipping
+    FREEZES the world and makes success undetectable (measured on TurnOnMicrowave: strip-retract via
+    skipping took 4/8 -> 0/8, every episode running to max_turns). Advancing keeps the env moving.
+
+    Declines when there is no next step: advancing off the last one strands System2 with nothing to
+    propose, which is the same failure.
+    """
+    blocks = _blocks(plan)
+    flat = [(b, f) for b in blocks for f in b["fine"]]
+    cur = current_fine_id(plan)
+    idx = next((i for i, (_, f) in enumerate(flat) if f["fid"] == cur), None)
+    if idx is None or idx + 1 >= len(flat):
+        return {"interventions": [{"rule": rule, "kind": "advance_declined",
+                                   "detail": "no next fine step -- advancing would strand System2",
+                                   "before": subgoal, "after": subgoal}]}
+    _, cur_f = flat[idx]
+    _, nxt_f = flat[idx + 1]
+    cur_f["mark"] = "x"
+    nxt_f["mark"] = "~"
+    for b in blocks:
+        if b["fine"] and all(f["mark"] == "x" for f in b["fine"]):
+            b["mark"] = "x"
+    return {"plan": _render(blocks), "subgoal": nxt_f["text"], "subgoal_detail": nxt_f["text"],
+            "interventions": [
+                {"rule": rule, "kind": "plan_revised", "detail": detail,
+                 "before": f"{cur_f['fid']}: {cur_f['text']}",
+                 "after": f"{nxt_f['fid']}: {nxt_f['text']}"},
+                {"rule": rule, "kind": "subgoal_override",
+                 "detail": "run the next step instead", "before": subgoal,
+                 "after": nxt_f["text"]}]}
+
+
+# =============================================================================================
+# GRADUATED: PickPlaceCounterToCabinet   (baseline 15/20, verified rules 14/20)
+#
+# No rule has ever modified this task: repeat_cap is the only one that applies and it fired 33
+# cap_declined / 0 advances, because the step it wants to cap is the LAST in the plan.
+#
+# All 6 failures in the verified run are max_turns at 14t, every one stuck repeating "continue to
+# retract the arm from the cabinet" for 6-9 turns AFTER the object was already carried and placed.
+# Separately, 7 turns carried judge=subgoal_failed, all of them "grasp X again".
+#
+# Plan shape: M1 pick up X (reach / grasp / lift) ; M2.1 carry X to the cabinet ;
+#             M2.2 place X in the cabinet and release ; M2.3 retract the arm from the cabinet.
+# =============================================================================================
+
+PPC2C = "PickPlaceCounterToCabinet"
+
+# 1. judge == subgoal_failed. All 7 observed were "grasp X again" -- the same false positive seen on
+#    CoffeeSetupMug, where the object is in fact already held, so re-doing the grasp repeats a
+#    finished action. Skip it by ADVANCING the plan (see _advance_current_step for why not skip_s1).
+_REGRASP_RE = re.compile(r"^\s*(continue\s+to\s+)?grasp\b.*\bagain\b\s*$", re.I)
+
+# 2. The grasp is the pose every later step inherits. est_length is a POLICY CONDITIONING tag
+#    (rendered into System1's prompt as "Estimated Length"), so a floor makes the grasp slower and
+#    more precise rather than merely longer. Uses the shared ladder; bump_est(50) == 75.
+_GRASP_RE = re.compile(r"^grasp\b")
+GRASP_EST_FLOOR = 75
+
+# 3. One extra "continue to <M2.1>" step after M2.1. M2.1 is the CARRY ("carry X to the cabinet"),
+#    and the carry is what has to get the object far enough inside; a second segment gives it another
+#    go before the plan moves on to the release. Inserted into the plan, so System2 conditions on it
+#    from the next turn.
+_CONTINUE_PREFIX = "continue to "
+
+
+def _rule_ppc2c_skip_failed(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """PickPlaceCounterToCabinet: a re-grasp after subgoal_failed advances the plan instead."""
+    if task != PPC2C:
+        return {}
+    if not _REGRASP_RE.match(subgoal or ""):
+        return {}
+    return _advance_current_step(
+        plan, subgoal, "exp_ppc2c_skip_failed",
+        f"subgoal_failed re-grasp is a false positive (judge={state.get('judge')!r}); "
+        "advance rather than repeat a finished grasp")
+
+
+def _rule_ppc2c_grasp_est(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """PickPlaceCounterToCabinet: floor a "grasp ..." subgoal at est 75 (one bucket up from 50)."""
+    if task != PPC2C or not _GRASP_RE.match(_norm(subgoal)):
+        return {}
+    new = max(bump_est(est), GRASP_EST_FLOOR) if isinstance(est, int) else GRASP_EST_FLOOR
+    if isinstance(est, int) and est >= new:
+        return {}
+    return {"est_proposal": new,
+            "interventions": [{"rule": "ppc2c_grasp_est", "kind": "est_proposed",
+                               "detail": f"grasp sets the pose everything downstream inherits "
+                                         f"({est} -> {new}); conditioning tag",
+                               "before": est, "after": new}]}
+
+
+def _rule_ppc2c_extra_carry(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """PickPlaceCounterToCabinet: add one extra "continue to <M2.1>" step after M2.1.
+
+    Idempotent: the inserted step already starts with "continue to", so it never matches itself, and
+    the rule does nothing once the extra step exists. Skips a done M2.1 -- once the carry has been
+    executed there is nothing to extend.
+    """
+    if task != PPC2C:
+        return {}
+    blocks = _blocks(plan)
+    for b in blocks:
+        if b["mid"] != "M2" or not b["fine"]:
+            continue
+        first = b["fine"][0]
+        if first["fid"] != "M2.1" or first["mark"] == "x":
+            return {}
+        if first["text"].lower().startswith(_CONTINUE_PREFIX):
+            return {}
+        nxt = b["fine"][1]["text"].lower() if len(b["fine"]) > 1 else ""
+        if nxt.startswith(_CONTINUE_PREFIX):
+            return {}                      # already inserted on an earlier turn
+        extra = _CONTINUE_PREFIX + first["text"]
+        new_fine = list(b["fine"])
+        new_fine.insert(1, {"mark": " ", "fid": "", "text": extra})
+        for k, ff in enumerate(new_fine, start=1):
+            ff["fid"] = f"{b['mid']}.{k}"
+        b["fine"] = new_fine
+        return {"plan": _render(blocks),
+                "interventions": [{"rule": "ppc2c_extra_carry", "kind": "plan_revised",
+                                   "detail": "give the carry a second segment before the release",
+                                   "before": f"M2.1: {first['text']}",
+                                   "after": f"M2.2: {extra}"}]}
+    return {}
+
+
+# =============================================================================================
+# GRADUATED: CoffeeSetupMug   (baseline 10/20, verified rules 11/20)
+#
+# Seven runs of the same 20 episodes:
+#     config                                  success   task_finish
+#     baseline (no rules)                      10/20         8
+#     verified rules only                      11/20         8
+#     splits only                              10/20         8
+#     grasp est only                           10/20        10
+#     splits + grasp est                       13/20         3
+#     splits + grasp est, repeat               12/20         4
+#     splits + grasp est, repeat               12/20         5
+#
+# The success counts alone are marginal (+2.1 mean, and two runs of IDENTICAL code agreed on only
+# 15/20 episodes). What justifies keeping this is the INTERACTION: task_finish -- the diagnosed
+# failure signature for this task, both milestones done and arm retracted with _check_success()
+# never firing -- collapses to 3-5 only when BOTH ingredients are present, and stays at 8-10 in all
+# four configurations missing either one. Three runs with both, four without, and the groups do not
+# overlap on either metric. Reading: the splits fix WHEN the release happens, the grasp est fixes
+# THE POSE IT INHERITS FROM; neither is sufficient alone.
+# =============================================================================================
+
+COFFEE = "CoffeeSetupMug"
+
+# "<action> and release" as a TRAILING clause -- 46 of 49 occurrences on this task, all in M2
+# ("lower the mug under the coffee machine dispenser and release" 30x, "place the mug ... and
+# release" 10x). The 3 remaining are "lower and release the red mug ..." where the release sits
+# inside the verb phrase; splitting that would need the object rewritten, so it is left alone.
+_COFFEE_AND_RELEASE_RE = re.compile(r"^(?P<head>.+?)\s+and\s+release\s*$", re.I)
+COFFEE_RELEASE_SUBGOAL = "release the mug"
+
+# "reach and grasp <object>" -> "reach to <object>" + "grasp <object>". Rare here (4x and 1x in the
+# two runs) -- this task usually plans reach and grasp as separate steps already -- but System2 does
+# occasionally emit the compound.
+_COFFEE_REACH_GRASP_RE = re.compile(r"^reach\s+and\s+grasp\s+(?P<obj>.+?)\s*$", re.I)
+
+# The grasp sets the pose every later step inherits. M1 step, so it cannot collide with the verified
+# coffee_m2_est, which is M2-only. Uses the shared ladder; bump_est(50) == 75, and System2 budgeted
+# the grasp 50 in all 42 observed firings.
+_COFFEE_GRASP_RE = re.compile(r"^grasp\b")
+
+
+def _rule_coffee_split_release(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """CoffeeSetupMug: M2 "<action> and release" -> "<action>" + "release the mug"."""
+    if task != COFFEE:
+        return {}
+    return _split_fine_step(plan, subgoal, _COFFEE_AND_RELEASE_RE,
+                            second_text_fn=lambda m: COFFEE_RELEASE_SUBGOAL,
+                            milestone="M2", rule="exp_coffee_split_release")
+
+
+def _rule_coffee_split_reach_grasp(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """CoffeeSetupMug: "reach and grasp X" -> "reach to X" + "grasp X"."""
+    if task != COFFEE:
+        return {}
+    return _split_fine_step(
+        plan, subgoal, _COFFEE_REACH_GRASP_RE,
+        first_text_fn=lambda m: f"reach to {m.group('obj').strip()}",
+        second_text_fn=lambda m: f"grasp {m.group('obj').strip()}",
+        rule="exp_coffee_split_reach_grasp")
+
+
+def _rule_coffee_grasp_est(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """CoffeeSetupMug: bump a "grasp ..." subgoal one est bucket (50 -> 75, 75 -> 100, ...)."""
+    if task != COFFEE or not _COFFEE_GRASP_RE.match(_norm(subgoal)):
+        return {}
+    new = bump_est(est)
+    if new == est:
+        return {}
+    return {"est_proposal": new,
+            "interventions": [{"rule": "coffee_grasp_est", "kind": "est_proposed",
+                               "detail": "grasp sets the pose everything downstream inherits; "
+                                         f"one bucket up ({est} -> {new}), conditioning tag",
+                               "before": est, "after": new}]}
+
+
 _RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
           _rule_microwave_again, _rule_repeat_cap, _rule_sink_faucet_est,
-          _rule_est_bump, _rule_mixer_est_floor, _rule_coffee_m2_est)
+          _rule_est_bump, _rule_mixer_est_floor, _rule_coffee_m2_est,
+          # GRADUATED (see the tables above)
+          _rule_coffee_split_release, _rule_coffee_split_reach_grasp, _rule_coffee_grasp_est,
+          _rule_ppc2c_skip_failed, _rule_ppc2c_extra_carry, _rule_ppc2c_grasp_est)
+
+# EXPERIMENTAL PATCH LAYER. Unverified per-task rules live in sys2_rules_exp.py and are appended
+# here if that module is importable. This is the ONLY hook they need: an experiment is added,
+# revised or thrown away by editing that one file, and DELETING it reverts to the verified rule set
+# above -- the import simply fails and nothing is appended. Kept last so an experiment sees the
+# checklist the verified rules produced, and set SYS2_RULES_NO_EXP=1 to ignore the file without
+# deleting it (e.g. to re-measure the verified baseline).
+if not os.environ.get("SYS2_RULES_NO_EXP"):
+    try:
+        from sys2_rules_exp import EXP_RULES as _EXP_RULES
+    except Exception:  # noqa: BLE001 - absent or broken patch file must never break a real run
+        _EXP_RULES = ()
+    _RULES = _RULES + tuple(_EXP_RULES)
+else:
+    _EXP_RULES = ()
 
 # Tasks with task-SPECIFIC rules. _rule_repeat_cap additionally applies to EVERY task.
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
