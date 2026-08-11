@@ -142,12 +142,28 @@ REACH_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_REACH", "2"))
 # OpenStandMixerHead est_length floor. est_length is a POLICY CONDITIONING tag (rendered into
 # System1's prompt as "Estimated Length"), not only a budget multiplier -- see _rule_mixer_est_floor.
 MIXER_EST_FLOOR = int(os.environ.get("SYS2_RULES_MIXER_EST_FLOOR", "75"))
-# TurnOnMicrowave est ladder: one bucket up, retract exempt. Only these two rungs -- see
-# _rule_microwave_est_bump for why 100 is not pushed to 150.
-_EST_BUMP = {50: 75, 75: 100}
-_MICROWAVE_EST_BUMP_TASKS = tuple(
-    t.strip() for t in os.environ.get(
-        "SYS2_RULES_EST_BUMP_TASKS", "TurnOnMicrowave").split(",") if t.strip())
+# est_length BUCKET LADDER, as used by the training data. A bump means "the next bucket up".
+EST_BUCKETS = (50, 75, 100, 125, 150, 175, 200, 250, 300, 350, 400, 500,
+               600, 800, 1000, 1300)
+# At and above this, est is left alone: the bump is a precision aid for short/medium motions, and
+# the rungs above 500 are large jumps on spans that are already long.
+EST_BUMP_CEILING = int(os.environ.get("SYS2_RULES_EST_BUMP_CEILING", "500"))
+# Which tasks get the bump. "all" (default) = every task; a comma list restricts it.
+_EST_BUMP_TASKS = tuple(
+    t.strip() for t in os.environ.get("SYS2_RULES_EST_BUMP_TASKS", "all").split(",") if t.strip())
+
+
+def bump_est(est):
+    """Next bucket up, or ``est`` unchanged at/above EST_BUMP_CEILING (or if not a number).
+
+    A value that is not itself a bucket (System2 occasionally writes e.g. 60) snaps UP to the next
+    bucket, which is the in-distribution neighbour rather than an invented number.
+    """
+    if not isinstance(est, int) or est >= EST_BUMP_CEILING:
+        return est
+    return next((b for b in EST_BUCKETS if b > est), est)
+
+
 _REACH_RE = re.compile(r"^reach\s+(to|for)\b")
 
 
@@ -468,37 +484,49 @@ def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dic
                                "before": est, "after": 100}]}
 
 
-def _rule_microwave_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """TurnOnMicrowave: bump est_length one bucket -- 50 -> 75, 75 -> 100. Retract is exempt.
+def _rule_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """ALL tasks (see _EST_BUMP_TASKS): raise est_length one bucket -- 50->75, 75->100, ... 400->500.
+    Retract-arm subgoals are exempt, and 500+ is left alone.
 
-    Aimed at the measured failure mode. Across 20 episodes the press segments in the 9 failures were
-    statistically identical to those in the 11 successes (1.3 vs 1.5 press turns, 46 vs 53 steps,
-    gripper already fully closed at +1.000 in both), and EVERY press segment ended on ``stop_rule``
-    -- System1's progress head reports the press complete while the button was never depressed. So
-    the lever to pull is System1's own notion of how long the motion should be, and ``est_length`` is
-    exactly that: a conditioning tag rendered into its prompt as "Estimated Length" (see
-    _rule_mixer_est_floor for the two channels est acts through).
+    MECHANISM. est_length is not only a budget multiplier: it is a POLICY CONDITIONING tag, rendered
+    into System1's prompt as "Estimated Length". A larger value tells System1 the motion should take
+    longer, so it commands smaller per-step deltas -- it moves more slowly and therefore more
+    precisely. That is the effect being exploited here, not the extra step allowance.
 
-    What this will touch, from the recorded run: reach 75 -> 100 (19 of 20 episodes), every press
-    50 -> 75 (28 turns). Retract stays at System2's 50 -- it is a short move away from the button and
-    is also where success latches, so lengthening it is not the goal.
+    EVIDENCE, on TurnOnMicrowave (all 20 episodes, same episodes as the baseline):
+        baseline (no rules)            12/20
+        rephrase + repeat cap          11/20
+        + est bump 50->75, 75->100     18/20   press segments 35.7 -> 44.6 mean steps,
+                                               task_finish failures 9 -> 2
+    The failure there was System1 stopping short of depressing the button while its progress head
+    reported stop_rule; the longer conditioned motion actually depresses it. Consistent with
+    OpenStandMixerHead, whose est floor of 75 (from System2's flat 50) took it 13/20 -> 20/20.
 
-    Buckets above 100 are left alone: only the two mappings requested are applied, and inventing a
-    100 -> 150 rung would extrapolate past what the training data's length buckets support.
+    SCOPE CAUTION. That evidence is ONE task and ONE failure mode (under-shooting a contact). A task
+    that fails for the opposite reason -- overshooting, or releasing late -- could regress, and every
+    segment that runs to budget gets up to 2x more sim steps. Hence _EST_BUMP_TASKS, so this can be
+    measured broadly before being trusted broadly.
+
+    PROGREG INTERACTION, worth knowing before running the regression head with this on: for
+    progreg, est_length ALSO selects the progress threshold
+    (stop_criterion.PROGREG_THRESH_BY_EST -- 50/75 -> 0.88, 100 -> 0.92, else 0.95), so a bump makes
+    the stop rule STRICTER (75->100 raises the bar 0.88 -> 0.92). These runs are progact, where the
+    threshold is a flat 0.95 and only the conditioning and budget channels apply.
     """
-    if task not in _MICROWAVE_EST_BUMP_TASKS:
+    if "all" not in _EST_BUMP_TASKS and task not in _EST_BUMP_TASKS:
         return {}
     if _RETRACT_RE.match(_norm(subgoal)):
-        return {"interventions": [{"rule": "microwave_est_bump", "kind": "est_exempt",
-                                   "detail": "retract-arm step -- left at System2's estimate",
+        return {"interventions": [{"rule": "est_bump", "kind": "est_exempt",
+                                   "detail": "retract-arm step -- a short move away, left at "
+                                             "System2's estimate",
                                    "before": est, "after": est}]}
-    if not isinstance(est, int) or est not in _EST_BUMP:
+    new = bump_est(est)
+    if new == est:
         return {}
-    new = _EST_BUMP[est]
     return {"est": new,
-            "interventions": [{"rule": "microwave_est_bump", "kind": "est_override",
-                               "detail": f"bump est one bucket ({est} -> {new}); conditioning tag, "
-                                         "not just budget",
+            "interventions": [{"rule": "est_bump", "kind": "est_override",
+                               "detail": f"one bucket up ({est} -> {new}); conditioning tag, so "
+                                         "System1 moves slower and more precisely",
                                "before": est, "after": new}]}
 
 
@@ -596,7 +624,7 @@ def action_overrides(task: str, plan: str, subgoal: str) -> dict:
 # Order matters: the plan rewrite runs first so later rules see the revised checklist.
 _RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
           _rule_microwave_again, _rule_repeat_cap, _rule_sink_faucet_est,
-          _rule_microwave_est_bump, _rule_mixer_est_floor, _rule_coffee_m2_est)
+          _rule_est_bump, _rule_mixer_est_floor, _rule_coffee_m2_est)
 
 # Tasks with task-SPECIFIC rules. _rule_repeat_cap additionally applies to EVERY task.
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
