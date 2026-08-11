@@ -1222,7 +1222,15 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                     help="ignore the per-task table and use --max-turns for every task")
     ap.add_argument("--horizon-mult", type=float, default=2.0,
                     help="segment budget = estimated_step * this, capped by --max-steps-cap")
-    ap.add_argument("--max-steps-cap", type=int, default=400)
+    ap.add_argument("--max-steps-cap", type=int, default=800,
+                    help="hard ceiling on ONE subgoal segment: budget = min(this, est_length * "
+                         "horizon_mult). Raised from 400 because the old value silently truncated "
+                         "long subgoals -- notably GetToastedBread's 'wait for the bread to pop up', "
+                         "where System2 asks est 500-600 so est*2 was clipped to 400 and 15 of 20 "
+                         "episodes were cut mid-wait. Only ~3%% of composite segments are affected "
+                         "(90 cap-bound, 23 actually truncated, across 640 episodes), so this is a "
+                         "narrow change -- but it does mean runs are NOT step-for-step comparable "
+                         "with the 1000-episode baseline recorded at 400.")
     ap.add_argument("--task-rules", action="store_true",
                     help="apply the HARDCODED per-task System2 revisions in sys2_rules.py "
                          f"(tasks: {', '.join(SR.TASKS_WITH_RULES)}). Off by default so the "

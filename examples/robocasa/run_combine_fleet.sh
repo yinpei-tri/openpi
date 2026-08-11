@@ -80,6 +80,8 @@ S2_BASE=${S2_BASE:-8100}
 XLA_FRAC=${XLA_FRAC:-0.32}                 # System1 JAX share
 GPU_FRAC=${GPU_FRAC:-0.42}                 # System2 vLLM share
 MAX_TURNS=${MAX_TURNS:-20}
+# Hard ceiling on ONE subgoal segment (budget = min(this, est_length*horizon_mult)).
+MAX_STEPS_CAP=${MAX_STEPS_CAP:-800}
 DATA_ROOT=${DATA_ROOT:-${ROBOCASA_LEROBOT_ROOT:-$DATA_DIR/robocasa_dataset}/v1.0/target}
 S2_CKPT=${S2_CKPT:-$CKPT_DIR/system2-full-0804-qwen35-4b-gb192-full-vitfull-lr1e5-vitlr2e6-alignerlr1e5-zero2-2n-ep3/checkpoint-11416}
 SKIP_SERVERS=${SKIP_SERVERS:-0}            # 1 = reuse servers already listening
@@ -311,6 +313,7 @@ for i in "${!GPULIST[@]}"; do
           --s1-port "$(s1_port "$i")" --s2-port "$(s2_port "$i")" --s2-model system2-full \
           --norm-stats "$S1_CKPT/assets/robocasa_system1/norm_stats.json" \
           --out-root "$SYS1_RESULTS_DIR/combine" --max-turns "$MAX_TURNS" \
+          --max-steps-cap "$MAX_STEPS_CAP" \
           ${RUN_LABEL:+--method "$RUN_LABEL"} \
           $([[ "$TASK_RULES" == 1 ]] && echo --task-rules) \
           $([[ "$RESUME" == 1 ]] && echo --resume) \

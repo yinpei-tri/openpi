@@ -2829,8 +2829,21 @@ function renderScrub(i){
       `the simulator's _check_success() returned true at step ${sr.success_step} \u2014 the rollout stopped there`,'#d3f0d8','#5fa96b'];
     if(sr.stop_reason==='stop_rule')return ['progress reached &amp; arm stopped',
       `progress ${sr.progress_done?'\u2265 threshold':'below threshold'} AND commanded motion quiescent over the last steps \u2014 subgoal judged complete`,'#cfe0ff','#7fa8f0'];
-    if(sr.stop_reason==='budget')return ['timeout',
-      `hit the step budget (${sr.budget} = est_length ${sr.est_length} \u00d7 horizon_mult) without the stop rule firing`,'#fff1cf','#dcae4a'];
+    if(sr.stop_reason==='budget'){
+      // The budget is min(max_steps_cap, est_length * horizon_mult). Saying it "= est_length x
+      // horizon_mult" was WRONG whenever the CAP bound instead: a wait with est_length 600 showed
+      // "400 = est_length 600 x horizon_mult", which does not multiply out and hid the real
+      // limiter. Detect which term bound and say so.
+      const prod=(sr.est_length!=null&&S.doc&&S.doc.config&&S.doc.config.horizon_mult!=null)
+                  ? sr.est_length*S.doc.config.horizon_mult : null;
+      const capped=(prod!=null&&sr.budget!=null&&sr.budget<prod);
+      return ['timeout', capped
+        ? `hit the step budget ${sr.budget} \u2014 this is the <b>--max-steps-cap</b>, not est_length \u00d7 horizon_mult `
+          +`(that would be ${prod} = ${sr.est_length} \u00d7 ${S.doc.config.horizon_mult}). The segment was cut by the CAP, `
+          +`so raising est_length alone will not lengthen it.`
+        : `hit the step budget (${sr.budget}${prod!=null?` = est_length ${sr.est_length} \u00d7 ${S.doc.config.horizon_mult}`:''}) without the stop rule firing`,
+        '#fff1cf','#dcae4a'];
+    }
     return [esc(sr.stop_reason||'unknown'),'',' #eee','#bbb'];
   })();
   const stopPanel=`<div class=stopwhy style="opacity:${atEnd?1:.45};background:${why[2]};border-color:${why[3]}">
