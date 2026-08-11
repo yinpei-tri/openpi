@@ -137,63 +137,84 @@ MAX_CONSEC_SKIPS = 2
 # Max consecutive turns System1 may be handed the SAME subgoal before the repeat cap advances the
 # plan (see _rule_repeat_cap). Env-overridable so the threshold can be swept without a code edit.
 MAX_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_SUBGOAL", "3"))
+# Tighter cap for a pure "reach to/for X": positioning either converges quickly or not at all.
+REACH_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_REACH", "2"))
+_REACH_RE = re.compile(r"^reach\s+(to|for)\b")
 
 
 # --------------------------------------------------------------------------------------------
 # the rules
 
 
-def _rule_drawer_base_align(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """PickPlaceDrawerToCounter: guarantee a base-alignment step at the head of M1.
+# Drawer milestone shape: a "reach ... drawer handle" step followed by a "pull/open ... drawer"
+# step. Matching the SUBGOAL TEXT rather than a task name generalises the rule from the atomic
+# PickPlaceDrawerToCounter to every composite task that opens a drawer (measured drawer-subgoal
+# turns: SetUpCuttingStation 172, DeliverStraw 116, OpenDrawer 78, CuttingToolSelection 12).
+_DRAWER_REACH_RE = re.compile(r"(reach|move|extend).*drawer|drawer handle")
+_DRAWER_PULL_RE = re.compile(r"(pull|open|slide).*drawer|drawer.*(open|out)")
+# Already-has-base-alignment guard. MUST cover the model's own phrasings or the rule would insert a
+# duplicate: it writes "reposition the base to face the drawer" (53x) and "adjust the base to face
+# the drawer" (51x) as well as "reposition the base to align with the drawer" (19x).
+_BASE_ALIGN_RE = re.compile(r"reposition|align|adjust|face the|orient")
+BASE_ALIGN_TEXT = "reposition the base to align with the drawer"
 
-    Observed: 15/20 episodes planned M1 as exactly two fine steps (reach handle -> pull open) and
-    the robot reached from a pose the drawer was not aligned to; the other 5 episodes had System2
-    itself insert "reposition the base to align with the drawer" first. This rule makes that
-    third step unconditional.
+
+def _rule_drawer_base_align(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """ANY task: guarantee a base-alignment step in front of a reach->pull drawer milestone.
+
+    Observed on the atomic task: 15/20 episodes planned the drawer milestone as exactly two fine
+    steps (reach handle -> pull open) and the robot reached from a pose the drawer was not aligned
+    to; the other 5 had System2 insert a base-alignment step itself. Forcing that step took the
+    previously-failing episodes from 1/6 (rules-off control) to 6/6 -- the strongest single effect
+    measured, which is why it is the rule worth generalising by subgoal text rather than task name.
 
     Guards:
-      * only when M1 has exactly 2 fine steps and none already mentions repositioning/aligning
-        the base -> idempotent, and never fights a plan that already has it;
-      * only when NO M1 fine step is marked done, so a mid-milestone plan is not reset (the
-        inserted step demotes its siblings to todo, which would discard completed work).
-    On the turn it fires it ALSO overrides the subgoal, because leaving System2's "reach to the
-    drawer handle" to execute first is precisely the ordering the rule exists to prevent.
+      * the milestone must have exactly 2 fine steps matching reach-drawer then pull-drawer;
+      * none may already mention repositioning/aligning/adjusting/facing -> idempotent, and never
+        duplicates a step System2 wrote itself;
+      * none may be marked done, so a milestone already under way is not rewound (the insert
+        demotes its siblings to todo, which would discard completed work).
+    The subgoal is overridden ONLY when the current step is the one being displaced -- otherwise
+    the plan is fixed up for later and this turn runs untouched.
     """
-    iv: list[dict] = []
-    if task != "PickPlaceDrawerToCounter":
-        return {}
     blocks = _blocks(plan)
-    m1 = next((b for b in blocks if b["mid"] == "M1"), None)
-    if m1 is None or len(m1["fine"]) != 2:
-        return {}
-    if any(re.search(r"reposition|align", f["text"], re.I) for f in m1["fine"]):
-        return {}          # already present (model-authored or ours from an earlier turn)
-    if any(f["mark"] == "x" for f in m1["fine"]):
-        return {}          # milestone already in progress -- do not rewind it
-
-    NEW = "reposition the base to align with the drawer"
-    old_fine = [f"{f['fid']}: {f['text']}" for f in m1["fine"]]
-    m1["fine"] = [{"mark": "~", "fid": "M1.1", "text": NEW},
-                  {"mark": " ", "fid": "M1.2", "text": m1["fine"][0]["text"]},
-                  {"mark": " ", "fid": "M1.3", "text": m1["fine"][1]["text"]}]
-    new_plan = _render(blocks)
-    iv.append({"rule": "drawer_base_align", "kind": "plan_revised",
-               "detail": "inserted M1.1 base alignment; M1 2 fine steps -> 3",
+    cur_id = current_fine_id(plan)
+    for b in blocks:
+        if len(b["fine"]) != 2:
+            continue
+        t0, t1 = b["fine"][0]["text"].lower(), b["fine"][1]["text"].lower()
+        if not (_DRAWER_REACH_RE.search(t0) and _DRAWER_PULL_RE.search(t1)):
+            continue
+        if any(_BASE_ALIGN_RE.search(f["text"].lower()) for f in b["fine"]):
+            continue
+        if any(f["mark"] == "x" for f in b["fine"]):
+            continue
+        old_fine = [f"{f['fid']}: {f['text']}" for f in b["fine"]]
+        displaced_first = (cur_id == b["fine"][0]["fid"])
+        mid = b["mid"]
+        b["fine"] = [{"mark": "~" if displaced_first else " ", "fid": f"{mid}.1",
+                      "text": BASE_ALIGN_TEXT},
+                     {"mark": " ", "fid": f"{mid}.2", "text": b["fine"][0]["text"]},
+                     {"mark": " ", "fid": f"{mid}.3", "text": b["fine"][1]["text"]}]
+        iv = [{"rule": "drawer_base_align", "kind": "plan_revised",
+               "detail": f"inserted {mid}.1 base alignment; {mid} 2 fine steps -> 3",
                "before": old_fine,
-               "after": [f"{f['fid']}: {f['text']}" for f in m1["fine"]]})
-    out = {"plan": new_plan, "interventions": iv}
-    # Hand System1 the new first step this turn, with the requested budget. The detail is synced
-    # HERE, by the rule that changed the ACTION -- a stale detail would still describe reaching for
-    # the handle. Rules that only rephrase (see _rule_microwave_again) must NOT touch the detail.
-    out["subgoal"] = NEW
-    out["subgoal_detail"] = NEW
-    out["est"] = 75
-    iv.append({"rule": "drawer_base_align", "kind": "subgoal_override",
-               "detail": "execute the inserted base-alignment step before reaching",
-               "before": subgoal, "after": NEW})
-    iv.append({"rule": "drawer_base_align", "kind": "est_override",
-               "detail": "base alignment budget", "before": est, "after": 75})
-    return out
+               "after": [f"{f['fid']}: {f['text']}" for f in b["fine"]]}]
+        out = {"plan": _render(blocks), "interventions": iv}
+        if displaced_first:
+            # Execute the inserted step NOW: letting System2's "reach to the drawer handle" run
+            # first is exactly the ordering this rule exists to prevent. The detail is synced here,
+            # by the rule that changed the ACTION (a stale detail would still describe reaching).
+            out["subgoal"] = BASE_ALIGN_TEXT
+            out["subgoal_detail"] = BASE_ALIGN_TEXT
+            out["est"] = 75
+            iv.append({"rule": "drawer_base_align", "kind": "subgoal_override",
+                       "detail": "execute the inserted base-alignment step before reaching",
+                       "before": subgoal, "after": BASE_ALIGN_TEXT})
+            iv.append({"rule": "drawer_base_align", "kind": "est_override",
+                       "detail": "base alignment budget", "before": est, "after": 75})
+        return out
+    return {}
 
 
 def _rule_strip_retract_plan(task: str, plan: str, subgoal: str, est, state) -> dict:
@@ -285,7 +306,11 @@ def _rule_microwave_again(task: str, plan: str, subgoal: str, est, state) -> dic
     Guards: an existing trailing "again" is not doubled, and a subgoal without the "continue to"
     wrapper is left exactly as-is.
     """
-    if task != "TurnOnMicrowave":
+    # ANY task whose subgoal is about the MICROWAVE (not just the atomic task): SteamInMicrowave
+    # 145 microwave-button turns, WaffleReheat 36, PrepareCoffee 11. Deliberately NOT global -- the
+    # "start button" phrasing also belongs to the coffee machine (129 turns), and this rephrase is
+    # only motivated where the "... again" form was observed in-distribution.
+    if "microwave" not in _norm(subgoal):
         return {}
     m = re.match(r"^\s*continue\s+to\s+(.+)$", subgoal or "", re.I)
     if not m:
@@ -322,6 +347,9 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
     notably ArrangeTea at depths 9-14; they are NOT exempt here, per the requested rule, so this
     cap is expected to cost those wins. See the note in the module docstring.)
 
+    Two thresholds: MAX_SAME_SUBGOAL (3) in general, REACH_SAME_SUBGOAL (2) for a pure
+    "reach to/for X" -- see the comment at the cap selection below.
+
     On trigger: mark the exhausted step done and hand System1 the NEXT fine step. Marking it done
     matters -- it is what makes System2 move on as well, instead of re-proposing the same step and
     forcing us to override every remaining turn.
@@ -336,7 +364,14 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
     prev, count = state.get("rep_sg"), state.get("rep_n", 0)
     count = count + 1 if n == prev else 1
     state["rep_sg"], state["rep_n"] = n, count
-    if count <= MAX_SAME_SUBGOAL:
+    # A pure REACH gets a tighter cap. Reaching is positioning, not effort accumulation: if System1
+    # has not arrived in two turns it is not converging, and more reaching only burns turns. The
+    # clearest case is ArrangeTea ep0, which spent turns 9-22 on "continue to reach to the right
+    # cabinet door" -- 14 repeats -- while "push the right cabinet door closed" sat untouched.
+    # Matches "reach to"/"reach for" only, NOT compounds like "reach and grasp the kettle", where
+    # the grasp is the real work.
+    cap = REACH_SAME_SUBGOAL if _REACH_RE.match(n) else MAX_SAME_SUBGOAL
+    if count <= cap:
         return {}
     if "stir" in n:
         return {"interventions": [{"rule": "repeat_cap", "kind": "cap_exempt",
@@ -381,8 +416,10 @@ def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dic
     System2 budgeted this 50 (18x) or re-issued it as "continue to ..." (33x) -- i.e. it kept
     running out of segment before the handle was over. 100 covers it in one segment.
     """
-    if task != "TurnOnSinkFaucet":
-        return {}
+    # ANY task: gated on the SUBGOAL, not the task name, so the composite tasks that turn on the
+    # same faucet are covered too (measured faucet-subgoal turns: WashLettuce 138, RinseSinkBasin
+    # 99, WashFruitColander 94, PreSoakPan 89, vs 51 on the atomic task). The phrasing is stable --
+    # "turn on the sink faucet handle" accounts for 471 of the turns across all five.
     if _norm(subgoal) != "turn on the sink faucet handle":
         return {}
     if est == 100:
@@ -422,6 +459,33 @@ def _rule_coffee_m2_est(task: str, plan: str, subgoal: str, est, state) -> dict:
             "interventions": [{"rule": "coffee_m2_est", "kind": "est_override",
                                "detail": f"{fid} (M2 milestone) needs a full segment",
                                "before": est, "after": 100}]}
+
+
+# --------------------------------------------------------------------------------------------
+# ACTION-level overrides. Everything above revises System2's output; this one reaches into
+# System1's actions instead, so it is applied by the rollout loop per step rather than per turn.
+
+# GetToastedBread M1.1/M1.2 = "reach to the toaster lever" (68x) then "press/push the toaster lever
+# down" (47x/21x). Pressing a lever wants a CLOSED gripper -- open fingers straddle the lever
+# instead of bearing on it -- so the gripper command is pinned closed for both steps. Task was 8/20.
+_TOASTER_GRIP_STEPS = ("M1.1", "M1.2")
+
+
+def action_overrides(task: str, plan: str, subgoal: str) -> dict:
+    """Per-STEP overrides applied to System1's commanded action for this segment.
+
+    Returns e.g. ``{"grip": 1.0}`` to pin the gripper command (+1 = close). Applied to the whole
+    predicted chunk, so quiescence/lookahead and the recorded actions all see the same values --
+    an override applied only at step time would make the stop criterion reason about actions that
+    were never executed.
+
+    Empty dict == no override, which is the untouched path.
+    """
+    if task == "GetToastedBread" and current_fine_id(plan) in _TOASTER_GRIP_STEPS:
+        return {"grip": 1.0,
+                "why": f"GetToastedBread {current_fine_id(plan)}: pin gripper CLOSED to press "
+                       "the toaster lever"}
+    return {}
 
 
 # Order matters: the plan rewrite runs first so later rules see the revised checklist.

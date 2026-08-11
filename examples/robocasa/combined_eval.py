@@ -584,7 +584,7 @@ def run_s1_segment(
     env, s1_client, *, subgoal_text: str, task_goal: str, est_length: int,
     base_pos_ref, base_yaw_ref, anchor_imgs, anchor_state, resize: int,
     replan_steps: int, budget: int, stop_cfg: StopConfig, norm_stats,
-    last_cmd_grip_init: float, zero_arm_in_base: bool,
+    last_cmd_grip_init: float, zero_arm_in_base: bool, act_override: dict | None = None,
 ) -> dict:
     """Roll System1 on ONE System2 subgoal until the stop rule fires or the budget runs out.
 
@@ -645,6 +645,12 @@ def run_s1_segment(
             timings["s1_obs_build"].append(t_obs_build)
             chunk = np.asarray(result["actions"])                 # (H,12) LeRobot order
             chunk_sim = np.stack([lerobot_action_to_sim(a) for a in chunk], axis=0)
+            # ACTION OVERRIDE (sys2_rules.action_overrides). Applied to the WHOLE chunk here, not
+            # at step time, so the executed actions, the recorded chunk, the motion norms and the
+            # lookahead stop all reason about the same values -- otherwise the stop criterion would
+            # judge a chunk that was never executed.
+            if act_override and act_override.get("grip") is not None:
+                chunk_sim[:, SIM_GRIP_IDX] = float(act_override["grip"])
             prog = SE._read_progress(result)
             if prog:
                 prog["at_step"] = executed
@@ -1006,6 +1012,16 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             anchor_tile = SE._stacked_from_obs(anchor_obs)
             anchor_info = S2C.write_image(S2C.downscale([anchor_tile])[0], tdir / "s1_anchor.png")
 
+            # Per-step action override for this segment (gripper pinning); {} when none applies.
+            act_override = SR.action_overrides(task_name, plan, subgoal) if args.task_rules else {}
+            if act_override:
+                rule_ivs.append({"rule": "action_override", "kind": "action_override",
+                                 "detail": act_override.get("why", ""),
+                                 "before": "System1 gripper command",
+                                 "after": f"pinned to {act_override.get('grip')}"})
+                ep_rule_log.append({"turn": turn, "interventions": rule_ivs[-1:]})
+                print(f"  RULE [action_override] {act_override.get('why','')}", flush=True)
+                turn_rec["rules"]["interventions"] = rule_ivs
             est_eff = int(est) if isinstance(est, int) and est > 0 else args.default_est_length
             budget = int(min(args.max_steps_cap, max(1, round(est_eff * args.horizon_mult))))
             s1_text = sg_detail if (args.prompt_source == "subgoal_detail" and sg_detail) else subgoal
@@ -1016,7 +1032,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 anchor_imgs=anchor_imgs, anchor_state=anchor_state, resize=args.resize_size,
                 replan_steps=args.replan_steps, budget=budget, stop_cfg=stop_cfg,
                 norm_stats=norm_stats, last_cmd_grip_init=last_cmd_grip,
-                zero_arm_in_base=not args.no_zero_arm_in_base)
+                zero_arm_in_base=not args.no_zero_arm_in_base, act_override=act_override)
 
             frames = roll.pop("_clean_frames")
             steps = roll.pop("_step_records")
