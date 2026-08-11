@@ -248,7 +248,7 @@ def _rule_drawer_base_align(task: str, plan: str, subgoal: str, est, state) -> d
             # by the rule that changed the ACTION (a stale detail would still describe reaching).
             out["subgoal"] = BASE_ALIGN_TEXT
             out["subgoal_detail"] = BASE_ALIGN_TEXT
-            out["est"] = 75
+            out["est_proposal"] = 75
             iv.append({"rule": "drawer_base_align", "kind": "subgoal_override",
                        "detail": "execute the inserted base-alignment step before reaching",
                        "before": subgoal, "after": BASE_ALIGN_TEXT})
@@ -478,8 +478,8 @@ def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dic
         return {}
     if est == 100:
         return {}
-    return {"est": 100,
-            "interventions": [{"rule": "sink_faucet_est", "kind": "est_override",
+    return {"est_proposal": 100,
+            "interventions": [{"rule": "sink_faucet_est", "kind": "est_proposed",
                                "detail": "handle rotation needs a full segment",
                                "before": est, "after": 100}]}
 
@@ -523,8 +523,8 @@ def _rule_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
     new = bump_est(est)
     if new == est:
         return {}
-    return {"est": new,
-            "interventions": [{"rule": "est_bump", "kind": "est_override",
+    return {"est_proposal": new,
+            "interventions": [{"rule": "est_bump", "kind": "est_proposed",
                                "detail": f"one bucket up ({est} -> {new}); conditioning tag, so "
                                          "System1 moves slower and more precisely",
                                "before": est, "after": new}]}
@@ -556,8 +556,8 @@ def _rule_mixer_est_floor(task: str, plan: str, subgoal: str, est, state) -> dic
     cur = est if isinstance(est, int) else None
     if cur is not None and cur >= MIXER_EST_FLOOR:
         return {}
-    return {"est": MIXER_EST_FLOOR,
-            "interventions": [{"rule": "mixer_est_floor", "kind": "est_override",
+    return {"est_proposal": MIXER_EST_FLOOR,
+            "interventions": [{"rule": "mixer_est_floor", "kind": "est_proposed",
                                "detail": f"floor est_length at {MIXER_EST_FLOOR} (conditioning "
                                          "tag, not just budget)",
                                "before": est, "after": MIXER_EST_FLOOR}]}
@@ -588,8 +588,8 @@ def _rule_coffee_m2_est(task: str, plan: str, subgoal: str, est, state) -> dict:
                                    "before": est, "after": est}]}
     if est == 100:
         return {}
-    return {"est": 100,
-            "interventions": [{"rule": "coffee_m2_est", "kind": "est_override",
+    return {"est_proposal": 100,
+            "interventions": [{"rule": "coffee_m2_est", "kind": "est_proposed",
                                "detail": f"{fid} (M2 milestone) needs a full segment",
                                "before": est, "after": 100}]}
 
@@ -645,16 +645,40 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
     cur = {"plan": plan, "subgoal": subgoal, "subgoal_detail": subgoal_detail, "est": est,
            "skip_s1": False}
     ivs: list[dict] = []
+    est_proposals: list[tuple] = []
     for fn in _RULES:
         r = fn(task, cur["plan"], cur["subgoal"], cur["est"], st)
         if not r:
             continue
         ivs.extend(r.get("interventions", []))
-        for k in ("plan", "subgoal", "est", "skip_s1"):
+        if "est_proposal" in r:
+            # Collected, NOT applied: several rules may propose an est for the same turn (a
+            # task-specific one and the universal bucket bump), and applying them in sequence would
+            # CHAIN -- the faucet rule's 100 would then be bumped again to 125, which is neither
+            # proposal. They are resolved once, below, by taking the largest.
+            est_proposals.append((r["est_proposal"], r["interventions"][0]["rule"]
+                                  if r.get("interventions") else "?"))
+        for k in ("plan", "subgoal", "subgoal_detail", "skip_s1"):
             if k in r:
                 cur[k] = r[k]
         if cur["skip_s1"]:
             break            # nothing else applies to a turn that runs no segment
+    # EST RESOLUTION: largest of System2's own estimate and every proposal. "Whichever is larger"
+    # is the rule because a larger est_length conditions System1 to move slower, i.e. more
+    # precisely -- so between a task-specific value and the universal bump, the bigger one is the
+    # stronger version of the same intent. All proposals are computed from System2's ORIGINAL est,
+    # so the order rules run in cannot change the outcome.
+    if est_proposals:
+        base = est if isinstance(est, int) else 0
+        best, who = max(est_proposals, key=lambda pr: pr[0])
+        if best > base:
+            cur["est"] = best
+            names = "+".join(sorted({w for _, w in est_proposals}))
+            ivs.append({"rule": "est_resolve", "kind": "est_override",
+                        "detail": f"largest of {sorted({p for p, _ in est_proposals})} "
+                                  f"proposed by {names}" + (f"; winner {who}"
+                                                            if len(est_proposals) > 1 else ""),
+                        "before": est, "after": best})
     st["consec_skips"] = (st.get("consec_skips", 0) + 1) if cur["skip_s1"] else 0
     cur["interventions"] = ivs
     return cur
