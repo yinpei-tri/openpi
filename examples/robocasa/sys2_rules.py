@@ -148,9 +148,23 @@ EST_BUCKETS = (50, 75, 100, 125, 150, 175, 200, 250, 300, 350, 400, 500,
 # At and above this, est is left alone: the bump is a precision aid for short/medium motions, and
 # the rungs above 500 are large jumps on spans that are already long.
 EST_BUMP_CEILING = int(os.environ.get("SYS2_RULES_EST_BUMP_CEILING", "500"))
-# Which tasks get the bump. "all" (default) = every task; a comma list restricts it.
+# Which tasks get the bump. "all" = every task; the default is the three SINGLE-CONTACT PRECISION
+# tasks, measured one variable at a time (v3 -> v4, same 20 episodes per task, bump the only change):
+#     TurnOnMicrowave   11 -> 15   (+4)   press a button
+#     GetToastedBread   13 -> 16   (+3)   press a lever
+#     TurnOnSinkFaucet  17 -> 19   (+2)   turn a handle
+#     OpenStandMixerHead 20 -> 20  ( 0)   already saturated (its own est floor covers it)
+#     CoffeeSetupMug    11 -> 11   ( 0)
+#     PickPlaceDrawerToCounter 19 -> 18 (-1)
+#     ArrangeTea         9 ->  5   (-4)   <-- long-horizon, TURN-bound not precision-bound
+# ArnrangeTea shows the boundary: every one of its failures is max_turns at 23t, and the bump raised
+# steps/turn 112 -> 140 and steps/episode 2282 -> 3038 while reaching the SAME 5.2 of 6.4 milestones.
+# Slower, more careful motion buys nothing when the binding constraint is the turn budget, and costs
+# the episodes that were finishing just inside it.
 _EST_BUMP_TASKS = tuple(
-    t.strip() for t in os.environ.get("SYS2_RULES_EST_BUMP_TASKS", "all").split(",") if t.strip())
+    t.strip() for t in os.environ.get(
+        "SYS2_RULES_EST_BUMP_TASKS",
+        "TurnOnMicrowave,TurnOnSinkFaucet,GetToastedBread").split(",") if t.strip())
 
 
 def bump_est(est):
@@ -485,7 +499,7 @@ def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dic
 
 
 def _rule_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """ALL tasks (see _EST_BUMP_TASKS): raise est_length one bucket -- 50->75, 75->100, ... 400->500.
+    """_EST_BUMP_TASKS (default: the 3 single-contact precision tasks): raise est_length one bucket -- 50->75, 75->100, ... 400->500.
     Retract-arm subgoals are exempt, and 500+ is left alone.
 
     MECHANISM. est_length is not only a budget multiplier: it is a POLICY CONDITIONING tag, rendered
