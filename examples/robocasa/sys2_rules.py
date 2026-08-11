@@ -292,7 +292,7 @@ def _rule_flag_retract_emitted(task: str, plan: str, subgoal: str, est, state) -
 
 
 def _rule_microwave_again(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """TurnOnMicrowave: rewrite "continue to X" -> "X again" in the System1 prompt.
+    """ANY microwave subgoal: rewrite "continue to X" -> "X again" in the System1 prompt.
 
     Both phrasings occur in this task's recorded rollouts, but they are not equally represented:
     "press the microwave start button again" (9x) / "press the start button again" (2x) appear as
@@ -411,7 +411,7 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
 
 
 def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """TurnOnSinkFaucet: the turn-the-handle subgoal always gets 100 steps.
+    """ANY task: the turn-on-the-sink-faucet-handle subgoal always gets 100 steps.
 
     System2 budgeted this 50 (18x) or re-issued it as "continue to ..." (33x) -- i.e. it kept
     running out of segment before the handle was over. 100 covers it in one segment.
