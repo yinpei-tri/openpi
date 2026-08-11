@@ -94,6 +94,22 @@ def current_fine_id(plan: str) -> str | None:
     return None
 
 
+def current_milestone_text(plan: str) -> str:
+    """Text of the milestone that owns the current fine step ("" if none).
+
+    Lets a rule key on the PHASE of a composite task rather than the task name -- e.g. the
+    "turn on the sink faucet" milestone inside RinseSinkBasin is the same physical act as the whole
+    of the atomic TurnOnSinkFaucet task.
+    """
+    cur = current_fine_id(plan)
+    if not cur:
+        return ""
+    for b in _blocks(plan):
+        if any(f["fid"] == cur for f in b["fine"]):
+            return b["text"].strip().lower()
+    return ""
+
+
 def _norm(s: str | None) -> str:
     """Lowercase, strip a leading 'continue to ' / trailing 'again', collapse spaces.
 
@@ -161,6 +177,22 @@ EST_BUMP_CEILING = int(os.environ.get("SYS2_RULES_EST_BUMP_CEILING", "500"))
 # steps/turn 112 -> 140 and steps/episode 2282 -> 3038 while reaching the SAME 5.2 of 6.4 milestones.
 # Slower, more careful motion buys nothing when the binding constraint is the turn budget, and costs
 # the episodes that were finishing just inside it.
+# Milestones that ARE a single precise contact, so the bump applies to their fine steps in ANY task
+# -- this is what carries the rule from the atomic tasks into the composites that contain the same
+# act. Measured milestone texts: "turn on the sink faucet" 72x (RinseSinkBasin, WashFruitColander,
+# TurnOnSinkFaucet), "turn on the sink faucet handle" 20x (PreSoakPan), "open the sink faucet" 8x
+# (WashLettuce), "press the microwave start button" 46x (SteamInMicrowave, WaffleReheat,
+# TurnOnMicrowave), "turn on the microwave" 14x (WaffleReheat).
+# Deliberately NOT matched: the microwave DOORS ("open/close the microwave door", 60x) and
+# "navigate to"/"place the bowl in the microwave" -- transport and door work, not a precise contact --
+# nor "press the coffee machine start button" (11x), a different appliance.
+_BUMP_MILESTONE_RE = re.compile(
+    r"(turn|switch)\s+(on|off)\s+the\s+(sink\s+)?faucet"
+    r"|open\s+the\s+sink\s+faucet"
+    r"|(turn|switch)\s+(on|off)\s+the\s+(sink\s+)?water"
+    r"|(turn|switch)\s+(on|off)\s+the\s+microwave"
+    r"|press\s+the\s+microwave\s+start\s+button")
+
 _EST_BUMP_TASKS = tuple(
     t.strip() for t in os.environ.get(
         "SYS2_RULES_EST_BUMP_TASKS",
@@ -527,7 +559,13 @@ def _rule_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
     the stop rule STRICTER (75->100 raises the bar 0.88 -> 0.92). These runs are progact, where the
     threshold is a flat 0.95 and only the conditioning and budget channels apply.
     """
-    if "all" not in _EST_BUMP_TASKS and task not in _EST_BUMP_TASKS:
+    # Fire when the TASK is one of the precision tasks, OR when the current MILESTONE is itself a
+    # single precise contact -- which carries the rule into the composite tasks that contain the
+    # same act (a "turn on the sink faucet" milestone inside RinseSinkBasin is the same physical
+    # thing as the whole atomic task).
+    by_task = "all" in _EST_BUMP_TASKS or task in _EST_BUMP_TASKS
+    by_milestone = bool(_BUMP_MILESTONE_RE.search(current_milestone_text(plan)))
+    if not (by_task or by_milestone):
         return {}
     if _RETRACT_RE.match(_norm(subgoal)):
         return {"interventions": [{"rule": "est_bump", "kind": "est_exempt",
