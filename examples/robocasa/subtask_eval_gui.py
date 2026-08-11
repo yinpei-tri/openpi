@@ -619,6 +619,25 @@ def _stats_fingerprint() -> tuple:
                 fp.append((str(f), f.stat().st_mtime))
             except OSError:
                 pass
+    # COMBINED roots. These were missing, and the omission was silent in the worst way: sections #0
+    # and #0b are built from them, so a newly finished sweep (or a fresh
+    # scripts/extract_combine_results.py) did not change the fingerprint and /stats kept serving a
+    # cached payload WITHOUT that method -- it simply was not in the table, with no error, until the
+    # GUI was restarted or ?refresh=1 was passed by hand.
+    #   * combine/*/index.json  -> a sweep writing new episodes
+    #   * combine_results/*.json -> a re-extraction (the preferred source for #0/#0b)
+    if COMBINE_ROOT.is_dir():
+        for idx in COMBINE_ROOT.glob("*/index.json"):
+            try:
+                fp.append((str(idx), idx.stat().st_mtime))
+            except OSError:
+                pass
+    if COMBINE_RESULTS_DIR.is_dir():
+        for f in COMBINE_RESULTS_DIR.glob("*.json"):
+            try:
+                fp.append((str(f), f.stat().st_mtime))
+            except OSError:
+                pass
     return tuple(sorted(fp))
 
 
@@ -2132,7 +2151,11 @@ def api_combine_turn(method, episode, turn):
     """Full per-turn doc: S2 prompts/response + S1 segment + clip stats (incl. per-frame table)."""
     base = COMBINE_ROOT / method / episode / turn
     out = {}
-    for name, key in (("turn.json", "turn"), ("s1_steps.json", "s1_steps"), ("plan.json", "plan")):
+    # memory/*.json exist only for the -memory plan variant (combine_memory_eval.py): memory.json
+    # carries the per-chunk narration index, recipe.json the aggregation call's prompt+response.
+    # Absent = cold run, and the keys are simply missing (the memory panel then never renders).
+    for name, key in (("turn.json", "turn"), ("s1_steps.json", "s1_steps"), ("plan.json", "plan"),
+                      ("memory/memory.json", "memory"), ("memory/recipe.json", "recipe")):
         f = base / name
         if f.exists():
             try:
@@ -2181,6 +2204,8 @@ COMBINE_HTML = """<!doctype html><meta charset=utf-8>
  .seg:hover{filter:brightness(.95)}
  .seg.cur{font-weight:700;z-index:3;box-shadow:0 0 0 2px #1a1a1a inset}
  .s-plan{background:#e9e2f8;border-color:#a98fd8;color:#3f2a6b}
+ /* the memory pass (narrate -> recipe) exists only in the -memory plan variant */
+ .s-memory{background:#dcefe4;border-color:#7fb99a;color:#1f4a35}
  .s-begin{background:#e8e8ec;border-color:#bbb;color:#444}
  .s-complete{background:#cfe0ff;border-color:#7fa8f0;color:#1c3a6b}
  .s-incomplete{background:#fff1cf;border-color:#dcae4a;color:#6b4a12}
@@ -2249,6 +2274,15 @@ COMBINE_HTML = """<!doctype html><meta charset=utf-8>
  canvas.curve{width:100%;height:82px;display:block;border:1px solid #eee;border-radius:4px;background:#fff}
  .lg{font-size:10px;color:#666} .lg i{display:inline-block;width:9px;height:3px;margin:0 3px 2px 6px}
  .tcost{font-size:11px;color:#555;font-family:ui-monospace,monospace;margin-top:3px}
+ /* MEMORY step: one row per narrated clip -- the 4s video System2 watched beside the single
+    sentence it produced, so the narration can be checked against the pixels that caused it. */
+ .memrow{display:grid;grid-template-columns:300px 1fr;gap:10px;align-items:start;
+   padding:5px 0;border-top:1px solid #f0f0f0}
+ .memrow:first-child{border-top:0}
+ .memrow video{width:300px;border-radius:3px;display:block;background:#000}
+ .memrow .narr{margin-top:2px}
+ /* the recipe is the artifact that crosses from the memory step into the plan step */
+ pre.recipe{background:#f4fbf7;border-color:#cfe8dc}
  /* two minipage columns inside the System1 output card: video+curves stacked on the left, the
     predicted action chunk beside them on the right so the pointer is visible while the video plays */
  .mini{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start}
@@ -2286,8 +2320,9 @@ const esc=s=>(s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').r
 const jtag=j=>j?`<span class="tag j-${esc(j)}">${esc(j)}</span>`:'';
 const nn=v=>(v==null?'&ndash;':v);
 
-// Judge -> track segment class. The synthetic "plan" turn gets its own colour.
+// Judge -> track segment class. The synthetic "memory"/"plan" turns get their own colours.
 function segClass(t){
+  if(t.kind==='memory')return 's-memory';
   if(t.kind==='plan')return 's-plan';
   const j=t.judge||'';
   if(j==='task_finish')return 's-finish';
@@ -2363,8 +2398,11 @@ async function selectEpisode(i){
   const e=window._eps[i]; S.ep=e.dir;
   S.doc=await (await fetch(`/api/combine/episode/${S.method}/${S.ep}`)).json();
   const d=S.doc;
-  // Turn list = a synthetic PLAN turn (System2 only) + every execution turn from episode.json.
-  S.turns=[{kind:'plan'}].concat((d.turns||[]).map(t=>({kind:'exec',...t})));
+  // Turn list = a synthetic MEMORY step (only for the -memory variant, where System2 narrated a
+  // video before planning) + a synthetic PLAN turn (System2 only) + every execution turn.
+  const hasMem=!!(d.plan||{}).memory;
+  S.turns=(hasMem?[{kind:'memory'}]:[]).concat([{kind:'plan'}],
+    (d.turns||[]).map(t=>({kind:'exec',...t})));
   $('#epsum').textContent=`${d.task_name} · ${d.episode_success?'SUCCESS':'FAIL'} · ${d.n_turns} turns · ${d.termination} · ${d.seconds}s`;
   drawTrack();
   selectTurn(0);
@@ -2373,13 +2411,18 @@ async function selectEpisode(i){
 // the bar reads as a timeline of where the episode actually spent its control steps.
 function drawTrack(){
   const ts=S.turns;
-  const w=ts.map(t=>Math.max(t.kind==='plan'?26:(t.n_steps||0),26));
+  const w=ts.map(t=>Math.max(t.kind==='exec'?(t.n_steps||0):26,26));
   const tot=w.reduce((a,b)=>a+b,0)||1;
+  const mem=(S.doc.plan||{}).memory||{};
   let acc=0;
   const segs=ts.map((t,i)=>{
     const L=100*acc/tot, W=100*w[i]/tot; acc+=w[i];
-    const lab=t.kind==='plan'?'PLAN':`t${t.turn} ${(t.judge||'?').replace('subgoal_','sg_')}`;
-    const tip=t.kind==='plan'?'plan mode (System2 only)'
+    const lab=t.kind==='memory'?'MEMORY':t.kind==='plan'?'PLAN'
+      :`t${t.turn} ${(t.judge||'?').replace('subgoal_','sg_')}`;
+    const tip=t.kind==='memory'
+        ?`memory pass (System2 only): narrated ${mem.n_chunks_narrated??'?'} clips of the demo of `
+         +`episode ${mem.source_episode??'?'} into a reusable recipe`
+      :t.kind==='plan'?'plan mode (System2 only)'
       :`turn ${t.turn}: ${t.judge||'?'}\\n${t.subgoal||'(no subgoal)'}\\nsteps=${t.n_steps??0} est=${t.estimated_step??'-'} stop=${t.stop_reason||'-'}`;
     return `<div class="seg ${segClass(t)}${i===S.ti?' cur':''}" data-i="${i}" title="${esc(tip)}"
               style="left:${L}%;width:${W}%">${esc(lab)}</div>`;
@@ -2391,7 +2434,8 @@ function setNav(){
   $('#prev').disabled=S.ti<=0;
   $('#next').disabled=S.ti>=S.turns.length-1;
   const t=S.turns[S.ti];
-  $('#pos').textContent=`${S.ti+1}/${S.turns.length}  ${t.kind==='plan'?'plan':'turn '+t.turn}`;
+  $('#pos').textContent=`${S.ti+1}/${S.turns.length}  `
+    +(t.kind==='exec'?'turn '+t.turn:t.kind);
   document.querySelectorAll('#track .seg').forEach(s=>s.classList.toggle('cur',+s.dataset.i===S.ti));
 }
 
@@ -2403,6 +2447,7 @@ function setNav(){
 function planAsOf(i){
   const t=S.turns[i];
   if(!t)return '';
+  if(t.kind==='memory')return '';   // the memory pass runs BEFORE any plan exists
   if(t.kind==='plan')return (S.doc.plan||{}).plan||'';
   return t.plan_after||planBefore(t);
 }
@@ -2425,6 +2470,96 @@ function planCard(){
     <div class=plangrid>${rows}</div></div>`;
 }
 
+// ---- MEMORY step (the -memory plan variant only): the chunk-by-chunk narration pass that
+// produced the recipe. Its own timeline step, BEFORE plan -- this is the stage that distinguishes
+// narrate->summarize->plan->execute from plain plan->execute. Absent for cold runs. ----
+async function renderMemory(){
+  const d=S.doc;
+  const j=await (await fetch(`/api/combine/turn/${S.method}/${S.ep}/plan`)).json();
+  // memory.json = the per-chunk index (+ aggregate timings); recipe.json = the aggregation call's
+  // own prompt/response. Merged field by field, NOT Object.assign: both carry `latency_s`, as a
+  // {narrate_total, recipe} dict in the former and a bare float in the latter.
+  const mem=j.memory||{}, agg=j.recipe||{}, P=j.plan||{};
+  const M=f=>`/api/combine/media/${S.method}/${S.ep}/plan/${f}`;
+  const pm=(d.plan||{}).memory||{};
+  const srcEp=pm.source_episode, priv=pm.privileged;
+  // `chunks` is the per-chunk index. Runs made before it was added carry only the flat narration
+  // list, so fall back to that (windows/clips unknown -> the row shows the sentence alone).
+  const chunks=mem.chunks||(mem.narrations||pm.narrations||[]).map((t,i)=>
+    ({chunk:i, window:null, n_clip_frames:null, narration:t, latency_s:null}));
+  const recipe=mem.recipe||pm.recipe||'';
+
+  // Each chunk row = the 4s clip System2 watched + the one sentence it produced. clip.mp4 is the
+  // display copy at 128x384; the model read clip_full.mp4 at the trained 256x768.
+  const rows=chunks.map(c=>{
+    const cd=`memory/chunk${String(c.chunk).padStart(2,'0')}`;
+    return `<div class=memrow>
+      <video src="${M(cd+'/clip.mp4')}" muted loop autoplay playsinline controls></video>
+      <div>
+        <div class=muted>clip ${c.chunk+1}/${chunks.length}${c.window?` &middot; source frames ${c.window[0]}&ndash;${c.window[1]}`:''}
+          ${c.n_clip_frames?` &middot; ${c.n_clip_frames} frames @4fps`:''}
+          ${c.latency_s!=null?` &middot; vLLM ${nn(c.latency_s)}s`:''}</div>
+        <div class=narr>${esc(c.narration)}</div>
+      </div></div>`;
+  }).join('');
+  const skipped=(mem.skipped||[]).length
+    ? `<div class=muted>skipped ${mem.n_chunks_skipped} window(s): `
+      +esc((mem.skipped||[]).map(s=>`[${s.window}] ${s.reason}`).join('; '))+'</div>' : '';
+
+  // Prompts for the FIRST and LAST narration turn: the running "So far:" list is what makes this a
+  // sequential pass rather than N independent captions, and it is only visible by comparing them.
+  const first=chunks.length?await (await fetch(
+    `/api/combine/media/${S.method}/${S.ep}/plan/memory/chunk00/narration.json`)).json():null;
+  const lastI=chunks.length?chunks[chunks.length-1].chunk:null;
+  const last=chunks.length>1?await (await fetch(
+    `/api/combine/media/${S.method}/${S.ep}/plan/memory/chunk${String(lastI).padStart(2,'0')}/narration.json`)).json():null;
+
+  $('#body').classList.add('single'); $('#right').innerHTML='';
+  $('#left').innerHTML=
+   `<div class=card><h3>Memory pass &mdash; narrate &rarr; summarize
+      <span>step 1 of 3 &middot; System2 only, no robot yet</span></h3>
+      <div class=muted style="margin-bottom:5px">This run is the <b>-memory</b> variant: before
+      planning, System2 watched a video <b>clip by clip</b> and narrated each one, then turned the
+      whole narration into a reusable recipe. Fixed 4-second windows from frame 0
+      (${mem.chunk_source_frames||80} source frames each) over ${nn(mem.n_source_frames)} recorded
+      frames &mdash; the <code>summary_v2</code> training layout, NOT annotated spans. Each turn is
+      conditioned on the narrations before it (&ldquo;So far: 1. &hellip; 2. &hellip;&rdquo;), so
+      this is a sequential read of the video, not ${chunks.length} independent captions.</div>
+      <div class=kv><span class=k>goal</span> <b>${esc(d.instruction)}</b></div>
+      <div class=kv><span class=k>video watched</span> recorded demo of
+        <b>episode ${nn(srcEp)}</b> (3 cams tiled 256&times;768)</div>
+      ${priv?`<div class=kv style="color:#a33"><span class=k>privileged</span>
+        <b>this memory is the demo of the VERY episode under eval &mdash; oracle input, an upper
+        bound, not a transfer number</b></div>`:
+       `<div class=kv><span class=k>held-out</span> memory came from a different episode
+         (${nn(srcEp)}) than the one under eval &mdash; no ground truth for this scene</div>`}
+      ${skipped}
+    </div>
+    <div class=card><h3>Per-clip narrations<span>${chunks.length} clips &rarr; ${chunks.length} &times; &lt;narration&gt;</span></h3>
+      ${rows||'<span class=muted>no narrations recorded</span>'}
+      ${first?`<details><summary>System2 prompt &mdash; first clip (no history yet)</summary>
+        <pre>${esc(first.s2_system_prompt)}</pre><pre>${esc(first.s2_user_prompt)}</pre></details>`:''}
+      ${last?`<details><summary>System2 prompt &mdash; last clip (carries the running narration)</summary>
+        <pre>${esc(last.s2_user_prompt)}</pre></details>`:''}
+    </div>
+    <div class=card><h3>Aggregation &rarr; recipe<span>1 text-only call &middot; vLLM ${nn((mem.latency_s||{}).recipe)}s</span></h3>
+      <div class=muted style="margin-bottom:4px">The narrations are handed back as a numbered list
+      with <b>no video and no image</b>; System2 compresses them into a general recipe for tasks of
+      this KIND (the <code>summary_v2 &middot; recipe</code> mode). This string is what conditions
+      the plan in the next step.</div>
+      <div class=k>&lt;summary&gt; &mdash; the recipe handed to the planner</div>
+      <pre class=recipe>${esc(recipe)}</pre>
+      ${agg.s2_user_prompt?`<details><summary>aggregation prompt (text only &mdash; no media)</summary>
+        <pre>${esc(agg.s2_system_prompt)}</pre><pre>${esc(agg.s2_user_prompt)}</pre></details>`:''}
+      ${agg.s2_response_raw?`<details><summary>raw response</summary>
+        <pre>${esc(agg.s2_response_raw)}</pre></details>`:''}
+      <div class=tcost>time cost &mdash; ${chunks.length} narration calls
+        ${nn((mem.latency_s||{}).narrate_total)}s + aggregation ${nn((mem.latency_s||{}).recipe)}s
+        ${(pm.seconds||{}).memory!=null?` &middot; memory pass total ${nn(pm.seconds.memory)}s
+        (incl. video decode + clip encode)`:''}</div>
+    </div>`;
+}
+
 // ---- PLAN turn (turn 0): System2 only, single wide column. ----
 async function renderPlan(){
   const d=S.doc;
@@ -2432,10 +2567,15 @@ async function renderPlan(){
   const P=j.plan||{};
   const M=f=>`/api/combine/media/${S.method}/${S.ep}/plan/${f}`;
   $('#body').classList.add('single'); $('#right').innerHTML='';
+  const warm=(P.mode==='plan_with_memory');
+  const recipe=(P.memory||{}).recipe;
   $('#left').innerHTML=
    planCard()+
-   `<div class=card><h3>Plan mode &mdash; System2 input<span>cold / no memory</span></h3>
+   `<div class=card><h3>Plan mode &mdash; System2 input<span>${warm?'step 2 of 3 &middot; warm / with memory':'cold / no memory'}</span></h3>
       <div class=kv><span class=k>goal</span> <b>${esc(d.instruction)}</b></div>
+      ${warm&&recipe?`<div class=kv><span class=k>recalled recipe</span> from the memory pass
+        (previous step) &mdash; quoted verbatim inside the user prompt below</div>
+        <pre class=recipe>${esc(recipe)}</pre>`:''}
       <div class=kv><span class=k>opening scene (3 cams tiled 256&times;768)</span></div>
       <img class=tile src="${M('scene.png')}">
       <details><summary>system prompt</summary><pre>${esc(P.s2_system_prompt)}</pre></details>
@@ -2831,7 +2971,9 @@ async function selectTurn(i){
   const t=S.turns[S.ti];
   $('#left').innerHTML='<div class=card><span class=muted>loading…</span></div>';
   $('#right').innerHTML='';
-  if(t.kind==='plan')await renderPlan(); else await renderExec(t);
+  if(t.kind==='memory')await renderMemory();
+  else if(t.kind==='plan')await renderPlan();
+  else await renderExec(t);
   $('#left').scrollTop=0; $('#right').scrollTop=0;
 }
 
