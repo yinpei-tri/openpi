@@ -81,7 +81,11 @@ XLA_FRAC=${XLA_FRAC:-0.32}                 # System1 JAX share
 GPU_FRAC=${GPU_FRAC:-0.42}                 # System2 vLLM share
 MAX_TURNS=${MAX_TURNS:-20}
 # Hard ceiling on ONE subgoal segment (budget = min(this, est_length*horizon_mult)).
-MAX_STEPS_CAP=${MAX_STEPS_CAP:-800}
+# Back to 400: the 800 round existed only because long WAIT subgoals were being truncated, and the
+# wait rule in sys2_rules now returns force_steps, which bypasses this cap entirely. Measured on the
+# 800 run, only 0.8% of segments had a budget above 400 and 28 actually ran past it. NOTE a run at 400
+# is comparable with the 1000-episode no-rules baseline and NOT with the -estbump sweep (which used 800).
+MAX_STEPS_CAP=${MAX_STEPS_CAP:-400}
 DATA_ROOT=${DATA_ROOT:-${ROBOCASA_LEROBOT_ROOT:-$DATA_DIR/robocasa_dataset}/v1.0/target}
 S2_CKPT=${S2_CKPT:-$CKPT_DIR/system2-full-0804-qwen35-4b-gb192-full-vitfull-lr1e5-vitlr2e6-alignerlr1e5-zero2-2n-ep3/checkpoint-11416}
 SKIP_SERVERS=${SKIP_SERVERS:-0}            # 1 = reuse servers already listening

@@ -300,59 +300,167 @@ TARGET_MAX_SUBGOAL_TURNS: dict[str, int] = {
     'WeighIngredients': 8,
 }
 
-# TARGET_EVAL_EPISODES: the 1000-episode mid-scale eval manifest (50 tasks x 20 episodes),
-# from robocasa_target_episode.json (_evallogs/eps_target20/all.txt). task -> episode indices.
+# TARGET_EVAL_EPISODES: the 1500-episode eval manifest (50 tasks x 30 episodes), task ->
+# episode indices. 30 PER TASK to match the leaderboard denominator (it was 20; the first 20 of
+# every task are unchanged, so the 1000-episode runs recorded at 20 remain a valid prefix and
+# --resume only has to run the 10 new episodes per task).
+#
+# Regenerated from robocasa_target_episode_full.json, which enumerates every successfully
+# extracted target-split episode (24637 across the 50 tasks, 140-543 per task). Indices are the
+# SOURCE LeRobot indices and are SPARSE -- only extracted episodes are present -- so they are not
+# contiguous 0..N-1 (CloseBlenderLid starts 4, 6, 7, 10, ...). Taking the first 30 of the sorted
+# list is what "the first 30 episodes" means here.
 TARGET_EVAL_EPISODES: dict[str, list[int]] = {
-    'ArrangeBreadBasket': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'ArrangeTea': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'BreadSelection': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'CategorizeCondiments': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'CloseBlenderLid': [4, 6, 7, 10, 11, 17, 24, 26, 27, 28, 29, 38, 42, 43, 48, 55, 58, 60, 67, 72],
-    'CloseFridge': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'CloseToasterOvenDoor': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'CoffeeSetupMug': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'CuttingToolSelection': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'DeliverStraw': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'GarnishPancake': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'GatherTableware': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'GetToastedBread': [0, 1, 2, 3, 4, 7, 9, 12, 13, 14, 15, 16, 17, 18, 19, 22, 23, 24, 27, 28],
-    'HeatKebabSandwich': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'KettleBoiling': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'LoadDishwasher': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'MakeIceLemonade': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'NavigateKitchen': [1, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 25],
-    'OpenCabinet': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'OpenDrawer': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'OpenStandMixerHead': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'PackIdenticalLunches': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'PanTransfer': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'PickPlaceCounterToCabinet': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'PickPlaceCounterToStove': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'PickPlaceDrawerToCounter': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'PickPlaceSinkToCounter': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'PickPlaceToasterToCounter': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'PortionHotDogs': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'PreSoakPan': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'PrepareCoffee': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'RecycleBottlesByType': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'RinseSinkBasin': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'ScrubCuttingBoard': [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20],
-    'SearingMeat': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'SeparateFreezerRack': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'SetUpCuttingStation': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'SlideDishwasherRack': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'StackBowlsCabinet': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'SteamInMicrowave': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'StirVegetables': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'StoreLeftoversInBowl': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'TurnOffStove': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'TurnOnElectricKettle': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'TurnOnMicrowave': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'TurnOnSinkFaucet': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'WaffleReheat': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'WashFruitColander': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'WashLettuce': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    'WeighIngredients': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+    'ArrangeBreadBasket': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'ArrangeTea': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'BreadSelection': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'CategorizeCondiments': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'CloseBlenderLid': [
+        4, 6, 7, 10, 11, 17, 24, 26, 27, 28, 29, 38, 42, 43, 48, 55, 58, 60, 67, 72, 74, 77, 78, 79, 81, 83, 86,
+        89, 91, 92],
+    'CloseFridge': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'CloseToasterOvenDoor': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'CoffeeSetupMug': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'CuttingToolSelection': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'DeliverStraw': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'GarnishPancake': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'GatherTableware': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'GetToastedBread': [
+        0, 1, 2, 3, 4, 7, 9, 12, 13, 14, 15, 16, 17, 18, 19, 22, 23, 24, 27, 28, 29, 30, 31, 32, 33, 35, 36, 37,
+        38, 39],
+    'HeatKebabSandwich': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'KettleBoiling': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'LoadDishwasher': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'MakeIceLemonade': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'NavigateKitchen': [
+        1, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 20, 21, 22, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34,
+        37, 38],
+    'OpenCabinet': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'OpenDrawer': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'OpenStandMixerHead': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'PackIdenticalLunches': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'PanTransfer': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'PickPlaceCounterToCabinet': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'PickPlaceCounterToStove': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'PickPlaceDrawerToCounter': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'PickPlaceSinkToCounter': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'PickPlaceToasterToCounter': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'PortionHotDogs': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'PreSoakPan': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'PrepareCoffee': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'RecycleBottlesByType': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'RinseSinkBasin': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'ScrubCuttingBoard': [
+        0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+        29, 30],
+    'SearingMeat': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'SeparateFreezerRack': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'SetUpCuttingStation': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'SlideDishwasherRack': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'StackBowlsCabinet': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'SteamInMicrowave': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'StirVegetables': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28,
+        29, 30],
+    'StoreLeftoversInBowl': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'TurnOffStove': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'TurnOnElectricKettle': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'TurnOnMicrowave': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'TurnOnSinkFaucet': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'WaffleReheat': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'WashFruitColander': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'WashLettuce': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
+    'WeighIngredients': [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
+        28, 29],
 }
 
 # task -> split (atomic_seen / composite_seen / composite_unseen), same source.
@@ -428,19 +536,42 @@ TURN_HEADROOM = 5      # slack over the observed worst case
 TURN_DEF_OFFSET = 2    # +1 task_begin unroll, +1 possible task_finish turn
 
 
+def _turn_bonus() -> dict[str, int]:
+    """Per-task turn-budget bonus, from SYS2_TURN_BONUS="Task:2,Other:3". Empty unless set.
+
+    A turn bonus cannot be a sys2_rules rule: max_turns is resolved ONCE before the turn loop, so
+    nothing a rule returns mid-episode can change it. This is the experimental hook for "give task X
+    +2 turns" -- inert when the variable is unset, and the bonus is written into max_turns_reason so
+    every episode.json records whether it was applied.
+    """
+    out: dict[str, int] = {}
+    for part in (os.environ.get("SYS2_TURN_BONUS") or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        task, _, delta = part.partition(":")
+        try:
+            out[task.strip()] = int(delta)
+        except ValueError:
+            print(f"WARNING: ignoring bad SYS2_TURN_BONUS entry {part!r}", flush=True)
+    return out
+
+
 def max_turns_for(task_name: str, flat_max: int, *, dynamic: bool = True) -> tuple[int, str]:
     """Return (max_turns, why) for a task.
 
     Falls back to the flat cap for any task absent from the table (e.g. a non-target task), so an
     unknown task is never silently given a tiny budget.
     """
+    bonus = _turn_bonus().get(task_name, 0)
     if not dynamic:
-        return flat_max, "flat"
+        return flat_max + bonus, "flat" + (f" +{bonus} bonus" if bonus else "")
     n = TARGET_MAX_SUBGOAL_TURNS.get(task_name)
     if n is None:
-        return flat_max, "flat (task not in budget table)"
-    return (n + TURN_HEADROOM + TURN_DEF_OFFSET,
-            f"max_subgoal_turns {n} + {TURN_HEADROOM} headroom + {TURN_DEF_OFFSET} def-offset")
+        return flat_max + bonus, "flat (task not in budget table)" + (f" +{bonus} bonus" if bonus else "")
+    return (n + TURN_HEADROOM + TURN_DEF_OFFSET + bonus,
+            f"max_subgoal_turns {n} + {TURN_HEADROOM} headroom + {TURN_DEF_OFFSET} def-offset"
+            + (f" +{bonus} bonus" if bonus else ""))
 
 
 def _episode_done(method_dir: Path, lerobot_dir: Path, ep_index: int) -> bool:
@@ -585,12 +716,22 @@ def run_s1_segment(
     base_pos_ref, base_yaw_ref, anchor_imgs, anchor_state, resize: int,
     replan_steps: int, budget: int, stop_cfg: StopConfig, norm_stats,
     last_cmd_grip_init: float, zero_arm_in_base: bool, act_override: dict | None = None,
+    force_steps: int = 0,
 ) -> dict:
     """Roll System1 on ONE System2 subgoal until the stop rule fires or the budget runs out.
 
     Mirrors episode_eval's rollout but is driven by a System2 subgoal + estimated_step instead of
     an annotated span, and records everything the GUI needs. ``executed_step`` starts at 0 for
     every call (per-turn reset) and the anchor is whatever the caller snapshotted at segment start.
+
+    ``force_steps`` > 0 SUPPRESSES BOTH STOP RULES for the first ``force_steps`` executed steps, so
+    the segment runs at least that long. It exists for genuine WAIT subgoals, where the stop rule is
+    structurally wrong rather than merely mistuned: a waiting arm commands no motion, so action
+    quiescence is satisfied on the very first window and the segment ends while the physical process
+    (a toaster) is still running. The DENSE ``_check_success()`` break is deliberately NOT
+    suppressed -- if the task completes mid-wait the episode still ends there, which is the whole
+    point of waiting. ``stop_reason`` is reported as "forced_steps" when the force window is what
+    kept the segment alive.
     """
     q01s = q99s = q01a = q99a = None
     if norm_stats:
@@ -678,7 +819,7 @@ def run_s1_segment(
         # LOOKAHEAD stop: if the chunk we just received commands no motion for the next `window`
         # steps and progress is at threshold (and the gripper has settled, if it flipped), the
         # subgoal is done -- executing those quiescent actions would only burn sim steps + renders.
-        if replanned and tracker.should_stop_lookahead(chunk_sim):
+        if replanned and executed >= force_steps and tracker.should_stop_lookahead(chunk_sim):
             stop_reason = "stop_rule_lookahead"
             stop_debug = tracker.debug()
             break
@@ -747,6 +888,12 @@ def run_s1_segment(
 
         tracker.update(action_sim, prog, raw16=fld["cur_raw16"])
         fld["stop_signals"] = tracker.debug()
+        # The tracker is still UPDATED inside the force window (above), so its history is continuous
+        # and the recorded stop_signals stay truthful -- only the decision to break is withheld.
+        if executed < force_steps:
+            fld["forced"] = True
+            stop_reason = "forced_steps"
+            continue
         if tracker.should_stop():
             stop_reason = "stop_rule"
             stop_debug = tracker.debug()
@@ -851,6 +998,27 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         doc["config"]["plan_variant"] = res.get("variant", "cold")
         if not plan:
             raise ValueError("System2 returned no <plan>")
+        # PLAN-MODE rules: the one place a rule can replace the checklist itself. Runs once, here;
+        # during the exec loop the plan is then maintained as usual (System2's plan_update marks
+        # progress), so no rule has to reconstruct the marks. episode.json["plan"]["s2_plan_before_
+        # rules"] keeps what System2 actually emitted, so the override is always auditable.
+        if args.task_rules:
+            pr = SR.apply_plan_rules(task_name, plan=plan)
+            # Apply the revision whenever the plan actually changed -- NOT only when the rule also
+            # reported an intervention. Gating the assignment on ``interventions`` silently discarded
+            # the override of any rule that forgot to log one, which is a void experiment that still
+            # looks like a clean run.
+            if pr["plan"] != plan:
+                doc["plan"]["s2_plan_before_rules"] = plan
+                plan = pr["plan"]
+                doc["plan"]["plan_after_rules"] = plan
+            if pr["interventions"]:
+                ep_rule_log.append({"turn": "plan", "interventions": pr["interventions"]})
+                for _iv in pr["interventions"]:
+                    print(f"  RULE [{_iv['kind']}] {_iv['rule']}: plan-mode override", flush=True)
+            elif pr["plan"] != doc["plan"].get("s2_plan_before_rules", plan):
+                print("  WARNING: a plan-mode rule changed the plan without logging an "
+                      "intervention -- applied anyway, but fix the rule", flush=True)
 
         # ---------------- EXEC loop ----------------
         last_cmd_grip = 0.0
@@ -931,12 +1099,19 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             rule_ivs: list[dict] = []
             skip_s1 = False
             tx_label = None
+            force_steps = 0
             if args.task_rules:
                 rr = SR.apply_rules(task_name, plan=plan, subgoal=subgoal,
                                     subgoal_detail=sg_detail, est=est, state=rule_state)
                 plan, subgoal, sg_detail, est = rr["plan"], rr["subgoal"], rr["subgoal_detail"], rr["est"]
                 skip_s1 = rr["skip_s1"]
                 tx_label = rr.get("tx_label")
+                # force_steps: run EXACTLY this many steps, ignoring the stop rule and the
+                # --max-steps-cap ceiling. For a genuine wait ("wait for the bread to pop up") the
+                # stop rule is structurally wrong -- a waiting arm is quiescent by definition, so
+                # quiescence fires immediately and the segment ends while the toaster is still
+                # running. Only a rule can know a subgoal is a wait, hence the channel.
+                force_steps = int(rr.get("force_steps") or 0)
                 rule_ivs = rr["interventions"]
                 if rule_ivs:
                     ep_rule_log.append({"turn": turn, "interventions": rule_ivs})
@@ -1028,6 +1203,14 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 turn_rec["rules"]["interventions"] = rule_ivs
             est_eff = int(est) if isinstance(est, int) and est > 0 else args.default_est_length
             budget = int(min(args.max_steps_cap, max(1, round(est_eff * args.horizon_mult))))
+            # force_steps DELIBERATELY BYPASSES --max-steps-cap. The cap is a global guard against
+            # one subgoal eating the whole episode; a rule that names an exact step count has
+            # already made that judgement for this subgoal, and clamping it to the cap would
+            # silently deliver a different number than the rule asked for (with a 400 cap, a
+            # 1200-step wait would run 400). Recorded in turn.json as forced_steps so a segment
+            # longer than the cap is never mysterious.
+            if force_steps > 0:
+                budget = force_steps
             s1_text = sg_detail if (args.prompt_source == "subgoal_detail" and sg_detail) else subgoal
 
             roll = run_s1_segment(
@@ -1036,7 +1219,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 anchor_imgs=anchor_imgs, anchor_state=anchor_state, resize=args.resize_size,
                 replan_steps=args.replan_steps, budget=budget, stop_cfg=stop_cfg,
                 norm_stats=norm_stats, last_cmd_grip_init=last_cmd_grip,
-                zero_arm_in_base=not args.no_zero_arm_in_base, act_override=act_override)
+                zero_arm_in_base=not args.no_zero_arm_in_base, act_override=act_override,
+                force_steps=force_steps)
 
             frames = roll.pop("_clean_frames")
             steps = roll.pop("_step_records")
@@ -1109,6 +1293,9 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             })
             turn_rec["s1"] = {
                 "prompt_text": s1_text, "est_length": est_eff, "budget": budget,
+                # Non-zero only when a rule forced the segment length; makes a segment that exceeds
+                # --max-steps-cap self-explanatory in the record and in the GUI.
+                "forced_steps": force_steps or None,
                 "n_steps": roll["n_steps"], "stop_reason": roll["stop_reason"],
                 "success_step": roll.get("success_step"),
                 "progress_done": roll["progress_done"], "quiescent": roll["quiescent"],
@@ -1235,15 +1422,19 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                     help="ignore the per-task table and use --max-turns for every task")
     ap.add_argument("--horizon-mult", type=float, default=2.0,
                     help="segment budget = estimated_step * this, capped by --max-steps-cap")
-    ap.add_argument("--max-steps-cap", type=int, default=800,
+    ap.add_argument("--max-steps-cap", type=int, default=400,
                     help="hard ceiling on ONE subgoal segment: budget = min(this, est_length * "
-                         "horizon_mult). Raised from 400 because the old value silently truncated "
-                         "long subgoals -- notably GetToastedBread's 'wait for the bread to pop up', "
-                         "where System2 asks est 500-600 so est*2 was clipped to 400 and 15 of 20 "
-                         "episodes were cut mid-wait. Only ~3%% of composite segments are affected "
-                         "(90 cap-bound, 23 actually truncated, across 640 episodes), so this is a "
-                         "narrow change -- but it does mean runs are NOT step-for-step comparable "
-                         "with the 1000-episode baseline recorded at 400.")
+                         "horizon_mult). BACK TO 400 (it was raised to 800 for one round of runs). "
+                         "800 existed because the cap silently truncated long WAIT subgoals -- "
+                         "GetToastedBread asks est 500-600, so est*2 was clipped and episodes were cut "
+                         "mid-wait. That is now handled properly by sys2_rules' wait rule, which "
+                         "returns ``force_steps`` and DELIBERATELY BYPASSES this cap, so the wait gets "
+                         "its full length whatever the ceiling is -- and the ceiling can go back to "
+                         "guarding against a runaway segment. Measured on the 800 run: only 112 of "
+                         "13263 segments (0.8%%) had a budget above 400 and just 28 actually ran past "
+                         "it, half of them the GetToastedBread waits that now bypass the cap. Runs at "
+                         "400 ARE step-for-step comparable with the 1000-episode no-rules baseline and "
+                         "are NOT comparable with the -estbump sweep, which used 800.")
     ap.add_argument("--task-rules", action="store_true",
                     help="apply the HARDCODED per-task System2 revisions in sys2_rules.py "
                          f"(tasks: {', '.join(SR.TASKS_WITH_RULES)}). Off by default so the "

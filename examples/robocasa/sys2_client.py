@@ -45,7 +45,19 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Video policy. Prefer the real module in sys2_train_eval so training and eval cannot drift;
 # fall back to a vendored copy of the same constants/formula when that repo isn't importable.
-SYS2_REPO = Path(os.environ.get("SYS2_REPO", "/home/ec2-user/sys2_train_eval"))
+# Derived, not hardcoded: $SYS2_REPO, else the sys2_train_eval checkout beside this openpi repo
+# (parents[2] = <repo_root>/openpi), else ~/sys2_train_eval. A stale absolute default made the
+# import fail silently into the vendored copy on any box with a different layout -- and the
+# fallback is a SEPARATE copy of the frame-sampling formula, so a drift between it and the real
+# module would change the frames the model sees with nothing in the log to say so.
+_OPENPI_REPO = Path(__file__).resolve().parents[2]
+SYS2_REPO = Path(
+    os.environ.get("SYS2_REPO")
+    or next(
+        (c for c in (_OPENPI_REPO.parent / "sys2_train_eval", Path.home() / "sys2_train_eval") if c.is_dir()),
+        _OPENPI_REPO.parent / "sys2_train_eval",
+    )
+).expanduser()
 try:  # pragma: no cover - import path depends on the box
     import sys as _sys
 
@@ -56,7 +68,15 @@ try:  # pragma: no cover - import path depends on the box
     from sys2.data.video_policy import smart_nframes  # type: ignore
 
     _POLICY_SOURCE = "sys2_train_eval"
-except Exception:
+except Exception as _e:
+    # Say so on stderr. The vendored copy is a duplicate of the frame-sampling formula, so running
+    # on it unknowingly is how eval silently drifts from training; the log line names the path that
+    # failed to import so a wrong SYS2_REPO is a one-line diagnosis.
+    print(
+        f"[sys2_client] WARNING: could not import sys2.data.video_policy from {SYS2_REPO} ({_e}); "
+        "using the VENDORED frame-sampling copy. Set $SYS2_REPO to the sys2_train_eval checkout.",
+        file=__import__("sys").stderr,
+    )
     DEFAULT_VIDEO_POLICY = "system2_4fps_32"
     _VENDORED = {"system2_4fps_32": dict(fps=4.0, min_frames=2, max_frames=32, frame_factor=2)}
     _POLICY_SOURCE = "vendored"

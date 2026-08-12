@@ -2625,8 +2625,13 @@ async function renderExec(t){
         <span class=pill>task status: ${esc(priv.task_status)}</span>
         <span class=pill>gripper: ${esc(priv.gripper_status)}</span></div>
       ${inMedia}
-      <div class=kv style="margin-top:6px"><span class=k>plan handed in</span></div>
+      <div class=kv style="margin-top:6px"><span class=k>plan handed in</span>
+        ${t.turn===0&&(S.doc.plan||{}).plan_after_rules
+          ?'<span class=pill title="a plan-mode rule replaced the System2 checklist">rule-forced</span>':''}</div>
       <pre>${esc(planBefore(t))}</pre>
+      ${t.turn===0&&(S.doc.plan||{}).s2_plan_before_rules
+        ?`<details><summary>what System2 actually proposed (overridden)</summary>
+           <pre>${esc((S.doc.plan||{}).s2_plan_before_rules)}</pre></details>`:''}
       <details><summary>system prompt</summary><pre>${esc(s2.system_prompt)}</pre></details>
       <details><summary>full user prompt</summary><pre>${esc(s2.user_prompt)}</pre></details>
     </div>
@@ -2768,8 +2773,8 @@ async function renderExec(t){
       ${frames}${pf}
     </div>
     <div class=card><h3>Per-step trace<span>${steps.length} steps</span></h3>
-      <div class=scroll><table><tr><th>step</th><th>progress</th><th>|&Delta;a|</th><th>grip</th><th>eef_pos</th><th>eef_rot</th><th>base</th><th>rp</th><th>S1 s</th><th>step s</th></tr>`+
-      steps.map((v,i)=>`<tr class=trow data-i="${i}" style="cursor:pointer"><td>${v.frame_step}</td><td>${esc(v.progress)}</td><td>${v.motion_norm}</td><td>${esc(v.gripper_flag)}</td><td>${v.action_eef_pos_norm}</td><td>${v.action_eef_rot_norm}</td><td>${v.action_base_norm}</td><td>${v.replanned?'*':''}</td><td>${(v.query&&v.query.s1_infer_s)??''}</td><td>${v.t_env_step_s??''}</td></tr>`).join('')+
+      <div class=scroll><table><tr><th>step</th><th>progress</th><th>|&Delta;a|</th><th>grip</th><th>grip_w</th><th>eef_pos</th><th>eef_rot</th><th>base</th><th>rp</th><th>S1 s</th><th>step s</th></tr>`+
+      steps.map((v,i)=>`<tr class=trow data-i="${i}" style="cursor:pointer"><td>${v.frame_step}</td><td>${esc(v.progress)}</td><td>${v.motion_norm}</td><td>${esc(v.gripper_flag)}</td><td>${v.grip_width==null?'':v.grip_width.toFixed(4)}</td><td>${v.action_eef_pos_norm}</td><td>${v.action_eef_rot_norm}</td><td>${v.action_base_norm}</td><td>${v.replanned?'*':''}</td><td>${(v.query&&v.query.s1_infer_s)??''}</td><td>${v.t_env_step_s??''}</td></tr>`).join('')+
       `</table></div>
     </div>
     `;
@@ -2811,6 +2816,15 @@ function renderScrub(i){
       })()}</span>
       <span class=pill>|&Delta;a| ${st.motion_norm}</span>
       <span class=pill>grip ${esc(st.gripper_flag)}</span>
+      ${st.grip_width==null?''
+        // Finger-pad distance |q[14]-q[15]| in metres, and its per-step delta. The FLAG above is only
+        // Open/Close; the width is what distinguishes closed ON an object (~0.062) from closed on
+        // NOTHING (~0.001) -- i.e. a missed grasp -- against ~0.0799 fully open. The delta is shown
+        // because a grasp appears as a ~0.005 spike settling to ~0.0006, which is how you see the
+        // fingers still closing while a segment is being cut short.
+        :`<span class=pill title="finger-pad distance: ~0.0799 open, ~0.062 closed on an object, ~0.001 closed on nothing">grip_w ${st.grip_width.toFixed(4)}</span>`
+         +(st.grip_width_delta==null?''
+           :`<span class=pill title="per-step change in finger-pad distance">&Delta;grip ${st.grip_width_delta.toFixed(4)}</span>`)}
       <span class=pill>eef_pos ${st.action_eef_pos_norm}</span>
       <span class=pill>eef_rot ${st.action_eef_rot_norm}</span>
       <span class=pill>base ${st.action_base_norm}</span>
@@ -2977,7 +2991,10 @@ function gotoStep(i){
 
 // The plan a turn was HANDED (i.e. the previous turn's plan_after, or the initial plan for turn 0).
 function planBefore(t){
-  if(t.turn===0)return (S.doc.plan||{}).plan||'';
+  // A PLAN-MODE rule can replace System2's checklist before the exec loop starts, so on turn 0 the
+  // plan HANDED IN is the forced one -- doc.plan.plan stays the faithful record of what System2
+  // itself proposed, and showing that here misreported what System1/System2 actually received.
+  if(t.turn===0){const p=S.doc.plan||{};return p.plan_after_rules||p.plan||'';}
   const prev=(S.doc.turns||[]).find(x=>x.turn===t.turn-1);
   return prev?(prev.plan_after||''):'';
 }

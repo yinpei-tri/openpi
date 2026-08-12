@@ -969,10 +969,14 @@ DRAWER_MISS_WIDTH = float(os.environ.get("SYS2_RULES_DRAWER_MISS_WIDTH", "0.010"
 # =============================================================================================
 
 
-def _target_step(plan: str, milestone: str, target_re):
-    """The first not-yet-done fine step in ``milestone`` matching ``target_re``, or None."""
+def _target_step(plan: str, milestone: str | None, target_re):
+    """The first not-yet-done fine step matching ``target_re``, or None.
+
+    ``milestone=None`` searches every milestone -- needed when System2 numbers the step differently
+    across episodes (ScrubCuttingBoard puts the scrub at M2.2 in most plans and M3.2 in others).
+    """
     for b in _blocks(plan):
-        if b["mid"] != milestone:
+        if milestone is not None and b["mid"] != milestone:
             continue
         for f in b["fine"]:
             t = f["text"].rstrip(".").lower()
@@ -983,7 +987,8 @@ def _target_step(plan: str, milestone: str, target_re):
 
 def _inject_after_step(task_key: str, plan: str, subgoal: str, state, milestone: str,
                        target_re, extra_fn, rule: str, why, tx_label: str,
-                       phase2_gate=None, max_injections: int = 1) -> dict:
+                       phase2_gate=None, max_injections: int = 1,
+                       missing_means_done: bool = False) -> dict:
     """Borrow turn(s) for an extra attempt once the target step completes. Plan NEVER modified.
 
     System2's own subgoal is HELD, not discarded: it is stashed on the first borrowed turn and
@@ -997,6 +1002,13 @@ def _inject_after_step(task_key: str, plan: str, subgoal: str, state, milestone:
 
     ``phase2_gate`` is checked ONLY at injection time -- never on the remember phase, where a
     condition on the previous segment's outcome is not yet meaningful.
+
+    ``missing_means_done`` also treats the remembered step VANISHING from the plan as completion.
+    System2 drops the fine steps of a milestone when it marks that milestone [x] -- observed on
+    ScrubCuttingBoard, where "* [~] M2.2: scrub the cutting board" is simply absent from the next
+    turn's plan rather than becoming [x]. Without this the injection can never fire for a step that
+    is the last one in its milestone. OFF by default so rules that already measured with the
+    mark-based transition keep their exact behaviour.
     """
     done = state.get(f"{task_key}_injected", 0)
     step = _target_step(plan, milestone, target_re)
@@ -1012,7 +1024,9 @@ def _inject_after_step(task_key: str, plan: str, subgoal: str, state, milestone:
                                        "before": subgoal, "after": held}]}
         state[f"{task_key}_held"] = held      # more injections to come, keep holding
 
-    if done >= max_injections or step is None:
+    if done >= max_injections:
+        return {}
+    if step is None and not (missing_means_done and state.get(f"{task_key}_text")):
         return {}
     cur = current_fine_id(plan)
     # Phase 1 -- target in progress: remember it, and COUNT System2's own re-issues.
@@ -1022,7 +1036,7 @@ def _inject_after_step(task_key: str, plan: str, subgoal: str, state, milestone:
     # attempt, so it consumes one of the max_injections rather than being stacked on top. Counting
     # has to happen HERE and not at injection time: during a re-issue the step is still marked "~",
     # so this phase is the only place those turns are visible.
-    if cur == step["fid"] or step["mark"] == "~":
+    if step is not None and (cur == step["fid"] or step["mark"] == "~"):
         state[f"{task_key}_fid"] = step["fid"]
         base = step["text"].rstrip(".")
         state[f"{task_key}_text"] = base
@@ -1036,8 +1050,11 @@ def _inject_after_step(task_key: str, plan: str, subgoal: str, state, milestone:
                                                  "no borrowed turn added",
                                        "before": subgoal, "after": subgoal}]}
         return {}
-    # Phase 2 -- a target we saw in progress is now done: borrow this turn.
-    if not state.get(f"{task_key}_text") or step["mark"] != "x":
+    # Phase 2 -- a target we saw in progress is now done: borrow this turn. "Done" is either the
+    # step marked [x], or (with missing_means_done) the step no longer present at all.
+    if not state.get(f"{task_key}_text"):
+        return {}
+    if step is not None and step["mark"] != "x":
         return {}
     if phase2_gate is not None and not phase2_gate():
         return {}
@@ -1077,32 +1094,601 @@ def _rule_drawer_regrasp_recovery(task: str, plan: str, subgoal: str, est, state
                     "fingers closed on nothing, so the grasp missed")
 
 
+# GRADUATED: WashFruitColander -- drop a redundant carry CONTINUATION and run the next step.
+#
+#   arm (same 20 episode ids)                       success   total turns
+#   baseline, no rules                                9/20        438
+#   verified rules only                               5/20        485
+#   verified + this rule, run a                      12/20        380
+#   verified + this rule, run b                      13/20        375
+#   pooled with the rule                             25/40 = 62.5%
+#
+#   vs the verified arm    z=+2.74  p=0.006     <- the paired control: identical official-rule
+#                                                  profile (sink_faucet_est / est_resolve /
+#                                                  repeat_cap all fire at the same rates), only
+#                                                  this rule added
+#   vs the no-rules arm    z=+1.29  p=0.20
+#   P(both runs >= 12 by chance): 1e-5 at the verified rate, 0.017 at the baseline rate.
+#   The rule fired 14x / 12x across 20 episodes, and total turns fell 22% -- episodes end in
+#   success instead of grinding to max_turns.
+#
+# READ THE GAIN HONESTLY: the official rules HURT this task (9/20 -> 5/20), so most of this is
+# recovering a self-inflicted loss -- 62.5% is only modestly above the 45% no-rules baseline, and
+# the comparison against it is not significant. _rule_sink_faucet_est is the prime suspect: it is
+# gated on SUBGOAL TEXT, not on task, so it fires here (173 est proposals in 20 episodes) even
+# though it was written for TurnOnSinkFaucet, where it measured 0/3. Scoping it to its own task is
+# the open follow-up and may capture much of the same gain on other tasks too.
+#
+# WHY IT WORKS -- not the reason predicted. The turn saving is trivial (repeat_cap already caps the
+# carry continuation at 3, so at most 2 turns on 8 episodes) and cannot convert an episode, because
+# every failure then burns 6-19 turns in a faucet-handle loop that this rule never touches. The
+# effective channel is PHYSICAL: releasing the colander after ONE carry segment instead of up to
+# four changes where it lands in the basin, and correct placement is a precondition for the
+# fruit-washing and faucet steps that follow.
+WFC = "WashFruitColander"
+# RAW-subgoal match. _norm() strips the "continue to " prefix, so a normalised match could not tell
+# the FIRST issue of the carry from a re-issue -- and only the re-issue is redundant. Requires both
+# "colander" and "sink" so the fruit carries ("continue to carry the tangerine to the colander",
+# which also occur) can never match.
+_WFC_CONT_CARRY_RE = re.compile(r"^\s*continue\s+to\s+(carry|move|bring|lift\s+and\s+carry)\b",
+                                 re.IGNORECASE)
+_WFC_CARRY_STEP_RE = re.compile(r"\b(carry|move|bring)\b", re.IGNORECASE)
+_WFC_RELEASE_STEP_RE = re.compile(r"\b(lower|release|place)\b", re.IGNORECASE)
+WFC_MAX_FIRES = int(os.environ.get("SYS2_RULES_WFC_MAX_FIRES", "1"))
+_WFC_STATE_KEY = "wfc_carry_skip_n"
+
+
+def _rule_wfc_skip_carry_continue(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """WashFruitColander: "continue to carry the colander to the sink" -> run the NEXT step."""
+    if task != WFC:
+        return {}
+    raw = subgoal or ""
+    low = raw.lower()
+    if not _WFC_CONT_CARRY_RE.match(raw) or "colander" not in low or "sink" not in low:
+        return {}
+    n = state.get(_WFC_STATE_KEY, 0)
+    if n >= WFC_MAX_FIRES:
+        return {"interventions": [{"rule": "wfc_skip_carry_continue", "kind": "cap_declined",
+                                   "detail": f"already fired {n}x this episode "
+                                             f"(WFC_MAX_FIRES={WFC_MAX_FIRES}) -- leave the rest "
+                                             "to repeat_cap",
+                                   "before": raw, "after": raw}]}
+    # Only advance off the CARRY step. If the current step is already the lower/release one
+    # (repeat_cap got there first), advancing would skip the release and strand the colander in the
+    # gripper -- which is unrecoverable, so this branch declines rather than guessing.
+    cur = current_fine_id(plan)
+    cur_text = next((f["text"] for b in _blocks(plan) for f in b["fine"] if f["fid"] == cur), "")
+    ct = cur_text.lower()
+    if not cur_text or "colander" not in ct or not _WFC_CARRY_STEP_RE.search(ct) \
+            or _WFC_RELEASE_STEP_RE.search(ct):
+        return {"interventions": [{"rule": "wfc_skip_carry_continue", "kind": "advance_declined",
+                                   "detail": f"current fine step {cur} is not the colander carry "
+                                             f"({cur_text!r}) -- advancing would skip the release",
+                                   "before": raw, "after": raw}]}
+    out = _advance_current_step(
+        plan, raw, "wfc_skip_carry_continue",
+        "System2 judged the colander carry incomplete; give it no second segment -- mark the carry "
+        "done and run the release instead")
+    if any(i.get("kind") == "plan_revised" for i in out.get("interventions", [])):
+        state[_WFC_STATE_KEY] = n + 1
+    return out
+
+
+# GRADUATED: GetToastedBread -- a WAIT subgoal runs a forced segment; the slot approach gets an est
+# floor. Authored and measured on a second machine; the numbers below are read from the shared
+# results mount.
+#
+#   arm (same 20 episode ids)                        success
+#   verified rules only (estbump sweep)               15/20
+#   debug-rules-v4-estbump / debug-cap800             16/20
+#   verified + these rules (debug-...-wait1200)       17/20
+#
+# THE SUCCESS DELTA IS NOT THE EVIDENCE: 17/20 vs 15/20 is p=0.43, and this task has sat at 15-17/20
+# across four recent runs -- squarely inside the n=20 band. The rule's own author says a 1-2 episode
+# outcome must not be read as a win or a loss, and that is respected here.
+#
+# WHAT JUSTIFIES GRADUATION is a STRUCTURAL DEFECT the rule fixes, measured directly. The stop rule
+# is "progress at threshold AND the arm has gone quiescent". While waiting for a toaster the arm
+# commands no motion BY DEFINITION, so quiescence is satisfied on the first window and the segment
+# ends after a few dozen steps with the toaster still running. In the recorded runs the wait segments
+# ended on the STOP RULE or lookahead -- voluntarily, not out of budget -- at a mean of 425 steps,
+# and System2 then re-issued "continue to wait" 14 times at a mean of 136 steps each. That re-issue
+# storm is the symptom. Forcing the segment length is the fix; no est bump can reach it, because est
+# only raises the budget and the budget was never what cut the wait short.
+# Confirmed in the run: 13 forced segments, all exactly 1200 steps.
+#
+# NOT ACTUALLY TASK-SPECIFIC -- the open follow-up. Any task whose plan contains a wait/hold has this
+# same defect, so scoping the fix to one task leaves the others broken. sys2_client.is_wait_subgoal
+# already recognises the family (hold/pause/stay/settle/remain) and SYS2_GTB_WAIT_ANY=1 selects it
+# here for measurement. The right end state is probably a task-agnostic wait rule, or a stop rule
+# that does not treat a deliberately still arm as converged.
+#
+# force_steps BYPASSES --max-steps-cap by design (see run_s1_segment), so the wait gets its full
+# length whatever the global cap is. The dense _check_success() break is NOT suppressed: if the bread
+# pops mid-wait the episode ends there, which is the entire point of waiting.
+GTB = "GetToastedBread"
+GTB_WAIT_FORCE_STEPS = int(os.environ.get("SYS2_GTB_WAIT_STEPS", "1200"))
+GTB_SLOT_EST = int(os.environ.get("SYS2_GTB_SLOT_EST", "200"))
+# 1 = widen the wait family to sys2_client.is_wait_subgoal (hold/pause/stay/settle/remain anywhere).
+# Default 0: only "wait" was measured, and forcing 1200 steps of the wrong subgoal is expensive.
+GTB_WAIT_ANY = bool(os.environ.get("SYS2_GTB_WAIT_ANY"))
+
+# ANY occurrence of "wait" arms the rule -- the waiting is what needs the forced budget even as the
+# tail of a compound subgoal ("reach to the toaster slot and wait"). \bwait also covers waits/waiting.
+_GTB_WAIT_ANYWHERE_RE = re.compile(r"\bwait")
+# ...EXCEPT a subgoal OPENING with "continue to wait", which is System2 re-issuing a wait that has
+# already had its forced segment. Matched on the RAW text: _norm() strips "continue to ", so a
+# normalised match could not tell a fresh wait from a re-issue.
+_GTB_CONT_WAIT_RE = re.compile(r"^continue\s+to\s+wait\b")
+# "move the gripper over/above/onto ... slot" -- loose enough to survive rewording, but the slot must
+# be the target so it cannot collide with the lever steps that action_overrides owns.
+_GTB_SLOT_RE = re.compile(r"^move\s+the\s+gripper\s+(over|above|onto)\b.*\bslot\b")
+
+
+def _gtb_is_wait(subgoal: str | None) -> bool:
+    """True for a wait subgoal that has not already been re-issued as "continue to wait ..."."""
+    raw = re.sub(r"\s+", " ", (subgoal or "").strip().lower().rstrip("."))
+    if _GTB_CONT_WAIT_RE.match(raw):
+        return False
+    if GTB_WAIT_ANY:
+        # Imported lazily so this module keeps a stdlib-only import footprint (it is unit-tested on
+        # its own, and sys2_client pulls in the media/encoding stack).
+        from sys2_client import is_wait_subgoal
+        return bool(is_wait_subgoal(raw))
+    return bool(_GTB_WAIT_ANYWHERE_RE.search(raw))
+
+
+def _rule_gtb_wait_force_steps(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """GetToastedBread: a wait subgoal runs a forced GTB_WAIT_FORCE_STEPS steps.
+
+    Overrides BOTH the stop rule and --max-steps-cap; see the banner for why no est bump can do this.
+    """
+    if task != GTB or not _gtb_is_wait(subgoal):
+        return {}
+    return {"force_steps": GTB_WAIT_FORCE_STEPS,
+            "interventions": [{"rule": "gtb_wait_force_steps", "kind": "force_steps",
+                               "detail": f"wait subgoal -- run a forced {GTB_WAIT_FORCE_STEPS} "
+                                         "steps (stop rule suppressed; a quiescent arm satisfies it "
+                                         "immediately while the toaster is still running). Dense "
+                                         "_check_success still ends the segment on completion.",
+                               "before": "stop rule + budget",
+                               "after": f"forced {GTB_WAIT_FORCE_STEPS} steps"}]}
+
+
+def _rule_gtb_slot_est(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """GetToastedBread: "move the gripper over the toaster slot" gets est_length >= GTB_SLOT_EST.
+
+    A FLOOR, not an exact value: apply_rules resolves the largest proposal, and _rule_est_bump also
+    fires on this task, so a System2 est already >= the floor keeps the bump's higher bucket.
+    """
+    if task != GTB or not _GTB_SLOT_RE.match(_norm(subgoal)):
+        return {}
+    if isinstance(est, int) and est >= GTB_SLOT_EST:
+        return {}
+    return {"est_proposal": GTB_SLOT_EST,
+            "interventions": [{"rule": "gtb_slot_est", "kind": "est_proposed",
+                               "detail": f"positioning over the toaster slot -- est floor "
+                                         f"{GTB_SLOT_EST} so System1 moves slower and more precisely "
+                                         "(conditioning tag, resolved as the largest proposal)",
+                               "before": est, "after": GTB_SLOT_EST}]}
+
+
+# GRADUATED: WeighIngredients -- the extra carry as a BORROWED TURN, and M1's location carried down
+# onto the M1 reach subgoal.
+#
+#   arm (same 20 episode ids)                       success   mean turns
+#   baseline, no rules                                4/20       14.3
+#   verified rules only                               2/20       14.4
+#   ref control (today's code, no experiments)        1/20        -
+#   the SAME extra carry as a PLAN INSERT             2/20       14.7
+#   these two rules (borrowed turn + located reach)   6/20       13.2
+#
+# READ WITH THE CAVEAT: +4 over the verified arm sits exactly AT the n=20 resolution limit (~+-4 at
+# 2SD), and this task's own near-replicates span 1-4/20, so ONE run cannot separate a real +4 from a
+# lucky draw. Graduated on the session owner's decision without a confirming repeat. The two rules
+# also ran TOGETHER and fired in overlapping episodes, so the gain is NOT attributed between them.
+# What is solid is the mechanism trace: 9/20 episodes took a borrowed turn (tx_sg_incomplete 9,
+# tx_resume 9) with System2's own re-issues consuming the budget 10 times (tx_counted), 9 reach
+# subgoals were located across 6/20 episodes, and the plan stayed byte-identical throughout.
+#
+# BORROWED TURN vs PLAN INSERT is the informative comparison: identical targeted mechanism, 6/20
+# against 2/20. The plan insert fired in 20/20 episodes and System2 executed the inserted step 51
+# times, so its 2/20 was not a plumbing failure -- putting the continuation in the checklist is simply
+# worse than borrowing one turn for it, which is the opposite of the PickPlaceCounterToCabinet result
+# and is why that rule keeps its plan-insert form.
+#
+# WHY THE CARRY. _check_success needs FOUR things: gripper far, object in the digital-scale
+# receptacle, object upright, cabinet closed. ep0 ends with the jam ON ITS SIDE beside the scale while
+# System2's thought reads "the jam is now resting on the digital scale" -- it cannot see the miss, so
+# the placement condition is never met and no amount of door-pushing could succeed. A second carry
+# segment before the release is what addresses that.
+#
+# WHY THE LOCATION. System2 states where the object is in the milestone and usually drops it from the
+# fine step, so System1 is told to "reach to the honey bottle" with no location. Roughly half the M1
+# texts carry a phrase ("grasp the jam from the cabinet" 207, "grasp the canned food from the shelf"
+# 60) and half carry none ("grasp the honey bottle" 255), where this is a no-op.
+#
+# THE UNFIXED SINK, which neither rule touches: 14 of 20 still end in max_turns, and the terminal
+# "continue to push the cabinet door closed" loop accounts for 13 of 18 failures in the verified arm.
+# 125 door-push segments over 20 episodes, mean 97 steps, and 106 of 125 end on the STOP RULE rather
+# than on budget -- an arm stalled against a door commands no motion, so action quiescence reads
+# "converged". That is the same structural defect as the graduated GetToastedBread wait, and
+# force_steps is the lever for it; an est bump cannot help, since only 11 of 125 were budget-limited.
+WI = "WeighIngredients"
+# The carry step, matched on TEXT rather than a milestone id: System2 numbers it M2.1 in every observed
+# plan, but the id is not guaranteed and the phrasing varies ("lift and carry the yogurt to the
+# digital scale").
+_WI_CARRY_RE = re.compile(r"\bcarry\b.*\bscale\b", re.IGNORECASE)
+# M1's trailing location phrase, captured WITH its preposition so it can be appended verbatim.
+_WI_M1_PHRASE_RE = re.compile(r"\b((?:from|in|out\s+of|on)\s+the\s+[a-z][a-z\s]*)$", re.IGNORECASE)
+_WI_REACH_RE = re.compile(r"^(?:continue\s+to\s+)?reach\b", re.IGNORECASE)
+# Door/handle reaches belong to the closing milestone, never to M1. This matters: the reach subgoals
+# in this task are DOMINATED by the door ("continue to reach to the cabinet door" 143, "reach to the
+# cabinet door" 59, against "reach to the honey bottle" 21), and locating those would be nonsense.
+_WI_DOOR_RE = re.compile(r"\b(door|handle|drawer)\b", re.IGNORECASE)
+# 1 = rewrite a leading "from" as "in" ("reach to the jam in the cabinet"), System2's own idiom for a
+# located reach. Default 0: the milestone's phrase is appended verbatim, which is what was measured.
+WI_PHRASE_IN = bool(os.environ.get("SYS2_WI_PHRASE_IN"))
+
+
+def _rule_wi_extra_carry_turn(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """WeighIngredients: borrow ONE turn for "continue to carry ... to the digital scale".
+
+    Plan-preserving: the checklist is untouched, System2's subgoal is held and resumed on the next
+    turn, and System2's own "continue to ..." re-issue consumes the same single-injection budget so
+    the two can never stack. missing_means_done=True is required -- System2 DROPS a milestone's fine
+    steps when it marks the milestone [x], so the carry step vanishes rather than becoming [x].
+    """
+    if task != WI:
+        return {}
+    return _inject_after_step(
+        "wi_carry", plan, subgoal, state, None, _WI_CARRY_RE,
+        extra_fn=lambda t: f"continue to {t}", rule="wi_extra_carry_turn",
+        tx_label="tx_sg_incomplete", max_injections=1, missing_means_done=True,
+        why="one more carry segment before the release, so the object ends ON the digital scale "
+            "rather than beside it (the placement condition the ep0-shape failures never satisfy)")
+
+
+def _rule_wi_reach_locate(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """WeighIngredients: append M1's location phrase to the M1 reach subgoal.
+
+    SUBGOAL ONLY -- the plan is not modified. No-op when M1 states no location, when the reach already
+    names it, or when the current step is a door reach.
+    """
+    if task != WI:
+        return {}
+    if not _WI_REACH_RE.match((subgoal or "").strip()):
+        return {}
+    if _WI_DOOR_RE.search(subgoal or ""):
+        return {}
+    cur = current_fine_id(plan)
+    if not cur or not cur.startswith("M1."):
+        return {}
+    m1 = next((b["text"] for b in _blocks(plan) if b["mid"] == "M1"), "")
+    hit = _WI_M1_PHRASE_RE.search((m1 or "").strip().rstrip("."))
+    if not hit:
+        return {}
+    phrase = re.sub(r"\s+", " ", hit.group(1).strip())
+    if WI_PHRASE_IN:
+        phrase = re.sub(r"^from\b", "in", phrase, flags=re.IGNORECASE)
+    # Already located -> nothing to do. Compare the location NOUN, not the whole phrase: System2
+    # writes "reach to the jam IN the cabinet" while M1 says "FROM the cabinet", so a full-phrase
+    # match misses it and produced "reach to the jam in the cabinet from the cabinet".
+    noun = re.sub(r"^(?:from|in|out\s+of|on)\s+the\s+", "", phrase, flags=re.IGNORECASE).strip()
+    if noun and re.search(rf"\b{re.escape(noun)}\b", subgoal or "", re.IGNORECASE):
+        return {}
+    new = f"{(subgoal or '').strip().rstrip('.')} {phrase}"
+    return {"subgoal": new, "subgoal_detail": new,
+            "interventions": [{"rule": "wi_reach_locate", "kind": "subgoal_override",
+                               "detail": f"M1 says where the object is ({m1.strip()!r}) but the reach "
+                                         "step drops it; carry the phrase down so System1 is told "
+                                         "where to reach. Plan untouched.",
+                               "before": subgoal, "after": new}]}
+
+
+# =============================================================================================
+# GRADUATED: PackIdenticalLunches -- a width-gated re-grasp recovery, plus a reach continuation.
+#
+# MEASUREMENT (20 episodes, the manifest set, s1-progact270k / S2 ep3-11416, max_steps_cap 400)
+#     baseline, no rules at all                                   4/20
+#     verified rules only (no PIL rule)                           2/20
+#     + re-grasp, window 3, miss<0.010, bare "grasp X again"       2/20   (debug-PIL-regrasp-v1)
+#     + re-grasp, window 2, miss<0.015, far form + est 125         8/20   (debug-PIL-regrasp-v3)
+# Paired vs the verified-rules arm on all 20: 6 GAINED (eps 5, 8, 11, 13, 18, 19), 0 LOST,
+# exact McNemar p=0.031. task_finish 13 -> 9, so 4 of the 6 came out of the dominant failure
+# bucket. Against v1: 7 gained / 1 lost, p=0.070. Zero regressions across 20 paired episodes is
+# what carries this; +6 is outside the +-4.5-episode (2SD) noise band for n=20 on this task.
+#
+# WHY IT WORKS. The failure is not a failed grasp: 77 of 80 grasp segments end with the fingers
+# around the object (width >=0.015). The object is lost ON THE LIFT -- 33 of the 35 sub-0.010
+# segments are the ones AFTER the grasp ("retract the arm with X" at 0.001, then "search for the
+# counter") -- so the robot navigates and "places" nothing. 11 of 20 episodes show it and neither
+# of the two successes does.
+#
+# THE THREE SETTINGS THAT MATTERED, and why v1 -> v3 moved 2/20 to 8/20:
+#   * WINDOW 2, not 3. A recovery is only worth taking before the robot starts SEARCHING; all four
+#     of v1's grasp+3 injections had an intervening "search for ..." turn, displaced a "go to ..."
+#     navigation subgoal, and all four failed.
+#   * MISS WIDTH 0.015, not 0.010. The width distribution is bimodal with a clean gap
+#     (0.0041 -> 0.0107 -> 0.0118 -> 0.0166), so 0.015 sits inside the gap: no false positives, and
+#     it admits the four marginal 0.0107-0.0118 cases.
+#   * FAR FORM. At offset 1 the arm is still at the object, so a bare "grasp X again" can re-close.
+#     At offset 2 it has retracted, so a bare re-grasp closes from the wrong pose: the recovery
+#     becomes "reach and grasp X again" with an est floor of 125 to cover the approach. This fired
+#     5 times in v3 and is the most likely single cause of the gain.
+#
+# HONEST LIMITS, recorded so this is not re-litigated from memory:
+#   * v3 changed FOUR things at once (window, threshold, far form, and the reach continuation), so
+#     the credit is not apportioned between them. One arm at window 2 + 0.010 + no est-125 would
+#     isolate the far form.
+#   * v3 ran at max_steps_cap 400 vs the reference arm's 800. PIL has ZERO segments over 400 steps,
+#     so this is believed inert, but it is not strictly single-variable.
+#   * NO REPLICATE was run. A second independent 20 is the cheap confirmation and was recommended.
+#   * The re-grasp is only a partial fix: in v1, 7 of 12 injected turns verifiably re-acquired the
+#     object (width 0.011-0.068) and NONE of those episodes succeeded, because an episode needs all
+#     four placements. task_finish is still 9/20 here.
+#
+# The reach continuation is graduated because it was part of the measured 8/20 arm, but note it was
+# INERT on those episodes: it fired 7 times and every one was tx_counted (System2 had already issued
+# "continue to reach ..." itself, so the budget was spent without borrowing a turn). It has never
+# actually added a turn in a measured run.
+# =============================================================================================
+
+PIL = "PackIdenticalLunches"
+# "grasp X" and "reach and grasp X"; NOT "reach for X", which is positioning with the gripper open.
+_PIL_GRASP_RE = re.compile(r"^(reach\s+and\s+)?grasp\b", re.IGNORECASE)
+# Fingers closed below this = closed on NOTHING (see the bimodal gap above).
+PIL_MISS_WIDTH = float(os.environ.get("SYS2_RULES_PIL_MISS_WIDTH", "0.015"))
+# The recovery must land immediately after the grasp (offset 1) or right after the lift (offset 2).
+PIL_REGRASP_WINDOW = int(os.environ.get("SYS2_RULES_PIL_REGRASP_WINDOW", "2"))
+# est floor for a FAR recovery (offset 2), which has to travel back to the object first.
+PIL_FAR_EST = int(os.environ.get("SYS2_RULES_PIL_FAR_EST", "125"))
+_PIL_BARE_GRASP_RE = re.compile(r"^grasp\b", re.IGNORECASE)
+_PIL_REACH_GRASP_RE = re.compile(r"^reach\s+and\s+grasp\b", re.IGNORECASE)
+# Pure positioning reach for the continuation rule.
+_PIL_REACH_RE = re.compile(r"^reach\s+(to|for)\b", re.IGNORECASE)
+PIL_REACH_EST = int(os.environ.get("SYS2_RULES_PIL_REACH_EST", "50"))
+# On by default (it was part of the measured arm); SYS2_RULES_PIL_REACH_CONTINUE=0 disables it.
+PIL_REACH_CONTINUE = (os.environ.get("SYS2_RULES_PIL_REACH_CONTINUE", "1") not in ("", "0"))
+
+
+def _rule_pil_reach_continue(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """PackIdenticalLunches: ONE borrowed "continue to reach ..." turn after a short reach.
+
+    Scope is deliberately narrow: only ``reach to/for X`` (never "reach and grasp X", where a
+    continuation would re-close the fingers), only inside a "pick up ..." milestone, and only when
+    System2 budgeted the reach at the smallest bucket (est 50) -- a reach it already thinks is long
+    needs no lengthening, est_length being a conditioning tag.
+
+    Budget 1 PER REACH STEP (``pilrc_<fid>``): this task has four picks, so one fixed key would let
+    the first reach spend the whole episode's budget. System2's own "continue to <step>" counts
+    against that budget (tx_counted), so a borrowed turn is never stacked on a continuation it
+    already asked for. The plan is never modified; System2's subgoal is held and resumes after.
+    """
+    if task != PIL or not PIL_REACH_CONTINUE:
+        return {}
+    if "pick up" not in current_milestone_text(plan):
+        return {}
+    step = _target_step(plan, None, _PIL_REACH_RE)
+    if step is not None:
+        fid = step["fid"]
+        if current_fine_id(plan) == fid or step["mark"] == "~":
+            state["pilrc_active_fid"] = fid
+            # est here is the REACH's own estimate; at injection time `est` belongs to the subgoal
+            # being displaced, so the gate has to read what was recorded on this turn.
+            state[f"pilrc_{fid}_est"] = est
+    else:
+        fid = state.get("pilrc_active_fid")
+        if not fid:
+            return {}
+    key = f"pilrc_{fid}"
+    return _inject_after_step(
+        key, plan, subgoal, state, None, _PIL_REACH_RE,
+        extra_fn=lambda t: f"continue to {t}", rule="pil_reach_continue",
+        tx_label="tx_sg_incomplete",
+        phase2_gate=lambda: state.get(f"{key}_est") == PIL_REACH_EST,
+        max_injections=1, missing_means_done=True,
+        why=lambda: f"reach budgeted at est {PIL_REACH_EST} (the smallest bucket) -- one extra turn "
+                    "to close the remaining distance before the grasp")
+
+
+def _rule_pil_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """PackIdenticalLunches: one injected re-grasp per grasp whose fingers closed on nothing.
+
+    Keyed PER GRASP STEP (``pil_<fid>``) because this task has four picks; keyed on the fid rather
+    than the step text because a plan can contain "grasp the lemon" twice (M1.x and M9.x).
+    """
+    if task != PIL:
+        return {}
+    # Own turn counter (the rule is called exactly once per turn, from apply_rules).
+    state["pil_turn"] = turn = state.get("pil_turn", 0) + 1
+    # At most one grasp step is ever visible: System2 lists fine steps only for the milestone in
+    # progress and DROPS them when it closes that milestone.
+    step = _target_step(plan, None, _PIL_GRASP_RE)
+    if step is not None:
+        fid = step["fid"]
+        if current_fine_id(plan) == fid or step["mark"] == "~":
+            state["pil_active_fid"] = fid
+            state[f"pil_{fid}_gturn"] = turn        # the window starts here
+    else:
+        fid = state.get("pil_active_fid")
+        if not fid:
+            return {}
+    key = f"pil_{fid}"
+    gturn = state.get(f"{key}_gturn")
+    offset = (turn - gturn) if gturn is not None else None
+    far = offset is not None and offset > 1
+
+    # RECOVERY ONLY, as a PHASE-2 gate: state["grip_width"] is the width left by the PREVIOUS
+    # segment, so during the grasp turn itself it is still the open-gripper value from the reach and
+    # a check made in the remember phase could never fire.
+    def _missed() -> bool:
+        w = state.get("grip_width")
+        if w is None or w >= PIL_MISS_WIDTH:
+            return False
+        return gturn is not None and (turn - gturn) <= PIL_REGRASP_WINDOW
+
+    def _extra(t: str) -> str:
+        """offset 1 -> "<step> again"; offset 2 -> "reach and grasp X again" (must travel back)."""
+        if not far or _PIL_REACH_GRASP_RE.match(t):
+            return f"{t} again"
+        return f"{_PIL_BARE_GRASP_RE.sub('reach and grasp', t, count=1)} again"
+
+    r = _inject_after_step(
+        key, plan, subgoal, state, None, _PIL_GRASP_RE,
+        extra_fn=_extra, rule="pil_regrasp_recovery",
+        tx_label="tx_sg_failed", phase2_gate=_missed, max_injections=1,
+        missing_means_done=True,
+        why=lambda: f"gripper width {state.get('grip_width'):.4f} < {PIL_MISS_WIDTH} -- the fingers "
+                    f"are closed on nothing {turn - state[f'{key}_gturn']} turn(s) after {fid}, so "
+                    "the object was never held or was dropped on the lift"
+                    + (" (arm has already left the object: reach first)" if far else ""))
+    # A FAR recovery needs the steps to reach back first. est is PROPOSED, so apply_rules resolves it
+    # as the largest of this and System2's own value -- 125 is a FLOOR, not an assignment.
+    if far and any(iv.get("kind") == "tx_sg_failed" for iv in r.get("interventions", [])):
+        r["est_proposal"] = PIL_FAR_EST
+        r["interventions"].append(
+            {"rule": "pil_regrasp_recovery", "kind": "est_proposed",
+             "detail": f"far recovery ({offset} turns after the grasp): est floor {PIL_FAR_EST} to "
+                       "cover reaching back to the object before closing",
+             "before": est, "after": PIL_FAR_EST})
+    return r
+
+
 _RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
           _rule_microwave_again, _rule_repeat_cap, _rule_sink_faucet_est,
           _rule_est_bump, _rule_mixer_est_floor, _rule_coffee_m2_est,
           # GRADUATED (see the tables above)
           _rule_coffee_split_release, _rule_coffee_split_reach_grasp, _rule_coffee_grasp_est,
           _rule_ppc2c_skip_failed, _rule_ppc2c_extra_carry, _rule_ppc2c_grasp_est,
-          _rule_drawer_regrasp_recovery)
+          _rule_drawer_regrasp_recovery, _rule_wfc_skip_carry_continue,
+          _rule_gtb_wait_force_steps, _rule_gtb_slot_est,
+          _rule_wi_extra_carry_turn, _rule_wi_reach_locate,
+          # The reach continuation acts BEFORE the grasp, the recovery after it; they key on
+          # different fine steps and different state, so neither consumes the other's budget.
+          _rule_pil_reach_continue, _rule_pil_regrasp_recovery)
 
-# EXPERIMENTAL PATCH LAYER. Unverified per-task rules live in sys2_rules_exp.py and are appended
-# here if that module is importable. This is the ONLY hook they need: an experiment is added,
-# revised or thrown away by editing that one file, and DELETING it reverts to the verified rule set
-# above -- the import simply fails and nothing is appended. Kept last so an experiment sees the
-# checklist the verified rules produced, and set SYS2_RULES_NO_EXP=1 to ignore the file without
-# deleting it (e.g. to re-measure the verified baseline).
+# ---- PLAN-MODE rules -------------------------------------------------------------------------
+# apply_rules above runs on EXECUTION turns only. A rule that must replace the checklist System2
+# produces in PLAN mode has no way in from there, because the plan call happens once before the
+# exec loop (combined_eval.do_plan_cold) and never passes through the rule layer.
+#
+# These run exactly once per episode, on the plan-mode output. During execution the plan is then
+# maintained as usual -- System2's own plan_update marks progress and nothing re-forces the
+# checklist, so the marks stay System2's and no rule has to reconstruct them.
+# GRADUATED (plan mode): StackBowlsCabinet -- force the stack-first checklist.
+#
+#   arm (same 20 episode ids)                              success
+#   baseline, no rules                                       7/20
+#   verified rules only                                      9/20
+#   with this rule, launch 1 (complete 20)                  16/20   <- see PROVENANCE below
+#   with this rule, launch 2 (16 completed of 19 attempted) 11/16
+#   one clean single-episode check (ep2, own label)           1/1
+#
+#   verifiable on disk (13/18)   vs baseline p=0.022   vs verified p=0.090
+#   incl. launch 1  (27/36)      vs baseline p=0.003   vs verified p=0.025
+#
+# PROVENANCE, stated because it is not a clean 20/20: launch 1 and launch 2 ran under the SAME
+# RUN_LABEL, and without RESUME=1 a repeated label re-runs episodes and OVERWRITES their
+# episode.json -- so 19 of launch 1's files no longer exist and its 16/20 is not auditable from
+# disk. Launch 2 was then truncated (3 episodes killed mid-execution). The no-rules baseline
+# comparison is significant on the surviving data alone; the verified-arm comparison is not, and
+# depends on the overwritten launch. A same-code -ref control for this task was queued and
+# cancelled, so today's-code control is missing too.
+#
+# NO MECHANISM, and that is on the record: the rule's own diagnosis found 24 of 24 failures across
+# both reference runs are NOT planning failures -- the plan runs to completion, both bowls land in
+# the cabinet, and then 6-8 turns go to "continue to retract the arm" until max_turns while
+# env_success never latches. 5 of the 11 verified failures already ran this exact stack-first plan.
+# The plan-family split (stack-first 42% vs cabinet-first 27% pooled over 5 methods) is also a
+# deterministic function of the scene, hence confounded with scene difficulty, and inside the paired
+# run the two families are indistinguishable (44% vs 45%). So the predicted effect was ~0 and the
+# measured one is larger; the retract loop remains the untouched failure mode.
+#
+# PLAN MODE ONLY. Runs once, before the exec loop, so System2's marks are never reconstructed: the
+# checklist it is handed on turn 0 is the forced one, and execution then maintains it normally
+# (verified in a real rollout -- System2 advanced M1->M4 and added its own fine steps under M4).
+SBC = "StackBowlsCabinet"
+# Milestones only, no fine steps -- the shape of every recorded cold plan on this task, so it is
+# in-distribution for the turn-0 prompt ("Unroll the current milestone into fine steps"). A
+# milestone without fine steps makes current_fine_id() -> None, so every EXECUTION rule degrades to
+# a no-op (repeat_cap takes its cap_declined branch) rather than corrupting anything.
+SBC_FORCED_PLAN = (
+    "- [ ] M1: grasp the smaller bowl\n"
+    "- [ ] M2: place the smaller bowl into the larger bowl\n"
+    "- [ ] M3: grasp the larger bowl\n"
+    "- [ ] M4: place the stacked bowls into the open cabinet"
+)
+
+
+def _plan_rule_stackbowls_force(task: str, plan: str) -> dict:
+    """StackBowlsCabinet, PLAN MODE: replace the cold plan with the stack-first checklist.
+
+    Returns nothing when System2's plan is already byte-identical, so an episode that planned this
+    itself is recorded as untouched (``episode.json["plan"]["s2_plan_before_rules"]`` stays absent).
+    """
+    if task != SBC:
+        return {}
+    if (plan or "").strip() == SBC_FORCED_PLAN:
+        return {}
+    return {"plan": SBC_FORCED_PLAN,
+            "interventions": [{"rule": "sbc_force_plan", "kind": "plan_mode_override",
+                               "detail": "forced the canonical stack-first 4-milestone checklist "
+                                         "(stack on the counter, then carry the stack into the "
+                                         "cabinet); execution then maintains it as usual",
+                               "before": (plan or "").strip(), "after": SBC_FORCED_PLAN}]}
+
+
+_PLAN_RULES: tuple = (_plan_rule_stackbowls_force,)
+
+
+def apply_plan_rules(task: str, *, plan: str) -> dict:
+    """Revise the PLAN-MODE checklist. Returns {plan, interventions}.
+
+    ``interventions`` is empty when nothing fired -- byte-identical to not calling this at all.
+    """
+    cur = plan
+    ivs: list[dict] = []
+    for fn in _PLAN_RULES + tuple(_EXP_PLAN_RULES):
+        r = fn(task, cur) or {}
+        if r.get("interventions"):
+            ivs.extend(r["interventions"])
+        if "plan" in r:
+            cur = r["plan"]
+    return {"plan": cur, "interventions": ivs}
+
+
+# EXPERIMENTAL PATCH LAYER. Unverified per-task rules live in sys2_rules_exp*.py and are appended
+# here. EVERY matching module is loaded, so parallel work on different tasks can each own a private
+# file (sys2_rules_exp_ArrangeTea.py, ...) instead of several editors clobbering one shared file --
+# which is how two CoffeeSetupMug rules were nearly lost. Deleting a file removes exactly its rules;
+# SYS2_RULES_NO_EXP=1 ignores them all without deleting anything.
+#
+# Loaded LAST so an experiment sees the checklist the verified rules produced. A broken or missing
+# patch file must never break a real run, so each import failure is swallowed with a warning.
+_EXP_RULES: tuple = ()
+_EXP_PLAN_RULES: tuple = ()
 if not os.environ.get("SYS2_RULES_NO_EXP"):
-    try:
-        from sys2_rules_exp import EXP_RULES as _EXP_RULES
-    except Exception:  # noqa: BLE001 - absent or broken patch file must never break a real run
-        _EXP_RULES = ()
+    import glob as _glob
+    import importlib as _importlib
+    import os.path as _osp
+    for _f in sorted(_glob.glob(_osp.join(_osp.dirname(_osp.abspath(__file__)), "sys2_rules_exp*.py"))):
+        _mod = _osp.splitext(_osp.basename(_f))[0]
+        try:
+            _m = _importlib.import_module(_mod)
+            _EXP_RULES = _EXP_RULES + tuple(getattr(_m, "EXP_RULES", ()))
+            _EXP_PLAN_RULES = _EXP_PLAN_RULES + tuple(getattr(_m, "EXP_PLAN_RULES", ()))
+        except Exception as _e:  # a bad patch file must never break a real run
+            print(f"WARNING: experimental rules in {_mod} not loaded: {_e}", flush=True)
     _RULES = _RULES + tuple(_EXP_RULES)
-else:
-    _EXP_RULES = ()
 
 # Tasks with task-SPECIFIC rules. _rule_repeat_cap additionally applies to EVERY task.
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
-                    "OpenStandMixerHead", "CoffeeSetupMug", "<all: repeat_cap>")
+                    "OpenStandMixerHead", "CoffeeSetupMug", "PickPlaceCounterToCabinet",
+                    "GetToastedBread", "WashFruitColander",
+                    "StackBowlsCabinet (plan mode)", "WeighIngredients",
+                    "PackIdenticalLunches",
+                    "<all: repeat_cap>")
 
 
 def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
@@ -1119,8 +1705,12 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
     # tx_label marks a turn a rule INJECTED rather than one System2 asked for -- "tx_sg_failed" for a
     # recovery after a detected failure, "tx_sg_incomplete" for a continuation. Recorded per turn so
     # the GUI track can tell the two apart.
+    # force_steps: an exact segment length that overrides BOTH the stop rule and --max-steps-cap
+    # (combined_eval.run_s1_segment). 0 = untouched. Unlike est, it is taken as-is rather than
+    # resolved against other proposals: it is an explicit "run exactly this long", so the LAST rule
+    # to set it wins and there is nothing to reconcile.
     cur = {"plan": plan, "subgoal": subgoal, "subgoal_detail": subgoal_detail, "est": est,
-           "skip_s1": False, "tx_label": None}
+           "skip_s1": False, "tx_label": None, "force_steps": 0}
     ivs: list[dict] = []
     est_proposals: list[tuple] = []
     for fn in _RULES:
@@ -1135,7 +1725,7 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
             # proposal. They are resolved once, below, by taking the largest.
             est_proposals.append((r["est_proposal"], r["interventions"][0]["rule"]
                                   if r.get("interventions") else "?"))
-        for k in ("plan", "subgoal", "subgoal_detail", "skip_s1", "tx_label"):
+        for k in ("plan", "subgoal", "subgoal_detail", "skip_s1", "tx_label", "force_steps"):
             if k in r:
                 cur[k] = r[k]
         if cur["skip_s1"]:
