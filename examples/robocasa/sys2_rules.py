@@ -798,7 +798,7 @@ def _rule_ppc2c_skip_failed(task: str, plan: str, subgoal: str, est, state) -> d
     if not _REGRASP_RE.match(subgoal or ""):
         return {}
     return _advance_current_step(
-        plan, subgoal, "exp_ppc2c_skip_failed",
+        plan, subgoal, "ppc2c_skip_failed",
         f"subgoal_failed re-grasp is a false positive (judge={state.get('judge')!r}); "
         "advance rather than repeat a finished grasp")
 
@@ -900,7 +900,7 @@ def _rule_coffee_split_release(task: str, plan: str, subgoal: str, est, state) -
         return {}
     return _split_fine_step(plan, subgoal, _COFFEE_AND_RELEASE_RE,
                             second_text_fn=lambda m: COFFEE_RELEASE_SUBGOAL,
-                            milestone="M2", rule="exp_coffee_split_release")
+                            milestone="M2", rule="coffee_split_release")
 
 
 def _rule_coffee_split_reach_grasp(task: str, plan: str, subgoal: str, est, state) -> dict:
@@ -911,7 +911,7 @@ def _rule_coffee_split_reach_grasp(task: str, plan: str, subgoal: str, est, stat
         plan, subgoal, _COFFEE_REACH_GRASP_RE,
         first_text_fn=lambda m: f"reach to {m.group('obj').strip()}",
         second_text_fn=lambda m: f"grasp {m.group('obj').strip()}",
-        rule="exp_coffee_split_reach_grasp")
+        rule="coffee_split_reach_grasp")
 
 
 def _rule_coffee_grasp_est(task: str, plan: str, subgoal: str, est, state) -> dict:
