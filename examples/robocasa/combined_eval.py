@@ -930,11 +930,13 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             s2_subgoal, s2_sg_detail, s2_est, s2_plan = subgoal, sg_detail, est, plan
             rule_ivs: list[dict] = []
             skip_s1 = False
+            tx_label = None
             if args.task_rules:
                 rr = SR.apply_rules(task_name, plan=plan, subgoal=subgoal,
                                     subgoal_detail=sg_detail, est=est, state=rule_state)
                 plan, subgoal, sg_detail, est = rr["plan"], rr["subgoal"], rr["subgoal_detail"], rr["est"]
                 skip_s1 = rr["skip_s1"]
+                tx_label = rr.get("tx_label")
                 rule_ivs = rr["interventions"]
                 if rule_ivs:
                     ep_rule_log.append({"turn": turn, "interventions": rule_ivs})
@@ -962,6 +964,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 # Full audit trail: what System2 actually said, and every override applied to it.
                 # Empty list == no rule fired, so an unrevised turn is unambiguous.
                 "rules": {"enabled": bool(args.task_rules), "interventions": rule_ivs,
+                          # set when a rule INJECTED this turn rather than System2 asking for it
+                          "tx_label": tx_label,
                           # What System1 was ACTUALLY given, after any override. Equal to the "s2"
                           # block above when no rule fired, so the two are always comparable.
                           "effective": {"subgoal": subgoal, "subgoal_detail": sg_detail,
@@ -1036,6 +1040,15 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
 
             frames = roll.pop("_clean_frames")
             steps = roll.pop("_step_records")
+            # Expose the gripper WIDTH left by this segment to the rules, so a rule can react to the
+            # physical outcome rather than only to System2's text. Read on the NEXT turn, when the
+            # env is still in the pose this segment ended in -- e.g. a near-zero width after a grasp
+            # means the fingers closed on nothing. Taken from the recorded steps rather than a fresh
+            # observation, so it costs no extra render.
+            _gw = [x.get("grip_width") for x in steps if x.get("grip_width") is not None]
+            if _gw:
+                rule_state["grip_width"] = float(_gw[-1])
+                rule_state["grip_width_min"] = float(min(_gw))
             motion = roll.pop("_motion")
             seg_grip_cmds = roll.get("grip_cmds") or []
             last_cmd_grip = roll["last_cmd_grip"]

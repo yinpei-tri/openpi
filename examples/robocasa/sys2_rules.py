@@ -766,6 +766,12 @@ def _advance_current_step(plan: str, subgoal: str, rule: str, detail: str):
 # =============================================================================================
 
 PPC2C = "PickPlaceCounterToCabinet"
+# extra_carry ALTERS the checklist (it inserts a real "continue to <M2.1>" step), and that is the
+# point rather than a side effect: adding a step means the repeated retract is no longer the LAST
+# plan step, so repeat_cap can ADVANCE instead of declining, which is where retract turns 64 -> 24
+# came from. A borrowed-turn replacement was tried and rejected -- one injection 16/20, two with
+# System2's subgoal held 16/20 and 17/20, all leaving retract at 40-49 -- so this is FIXED here with
+# no toggle. The comparison is settled; recover the toggle from git if it ever needs re-running.
 
 # 1. judge == subgoal_failed. All 7 observed were "grasp X again" -- the same false positive seen on
 #    CoffeeSetupMug, where the object is in fact already held, so re-doing the grasp repeats a
@@ -922,12 +928,162 @@ def _rule_coffee_grasp_est(task: str, plan: str, subgoal: str, est, state) -> di
                                "before": est, "after": new}]}
 
 
+
+# PickPlaceDrawerToCounter. M2.2 is "grasp <object>" in every observed plan (the pizza cutter 15x,
+# the tongs 12x, the measuring cup 8x, the rolling pin 5x, the peeler 5x, ...).
+DRAWER = "PickPlaceDrawerToCounter"
+_DRAWER_TARGET_RE = re.compile(r"^grasp\b", re.I)
+_AGAIN_SUFFIX = " again"
+# RECOVERY TRIGGER: only re-grasp when the gripper closed on NOTHING. Measured end-of-segment widths
+# over 20 grasp segments (|q14-q15|; 0.0799 = fully open):
+#     success episodes (16): 0.0104 .. 0.0520
+#     failed  episodes (4):  0.0019, 0.0072, 0.0254, 0.0303
+# 0.010 fires on exactly the two near-zero cases -- both failures -- and on NO success. Deliberately
+# tight: width conflates a MISS with a genuinely thin object, and 0.015 would already catch two
+# successful measuring-cup grasps.
+DRAWER_MISS_WIDTH = float(os.environ.get("SYS2_RULES_DRAWER_MISS_WIDTH", "0.010"))
+
+
+# =============================================================================================
+# GRADUATED: PickPlaceDrawerToCounter -- a MONITORED recovery re-grasp that never touches the plan.
+#
+# Measured on the same 20 episodes:
+#     baseline (no rules)                          14/20   mean  7.6 turns
+#     verified rules only                          16/20   mean  8.7   (also 19, 18, 18 in three
+#                                                                        further runs of that config)
+#     + "grasp X again" INSERTED into the plan      17/20   mean 10.7  <- rejected: +2 turns, and
+#                                                                        inside the verified spread
+#     + this rule, run a                           19/20   mean  8.2
+#     + this rule, run b                           20/20   mean  8.2  <- replicated, no turn cost
+#
+# WHY NOT PLAN SURGERY HERE, when PickPlaceCounterToCabinet needs exactly that: a CONTINUATION is
+# part of the intended sequence and benefits from being a real step (and gives repeat_cap a non-last
+# step to advance into); a RECOVERY is a response to a physical failure and should not rewrite the
+# plan System2 authored. So this one is monitored and injected, and the carry continuation is not.
+#
+# The gate is deliberately tight and therefore rare -- it tripped on 2 of 20 grasp segments in one
+# run and 1 of 20 in each of these two. At n=20 its own contribution cannot be separated from the
+# verified rules; what is established is that it costs nothing when it does not fire. Widening is NOT
+# free: 0.015 would catch two successful measuring-cup grasps, and re-grasping a held object risks
+# dropping it.
+# =============================================================================================
+
+
+def _target_step(plan: str, milestone: str, target_re):
+    """The first not-yet-done fine step in ``milestone`` matching ``target_re``, or None."""
+    for b in _blocks(plan):
+        if b["mid"] != milestone:
+            continue
+        for f in b["fine"]:
+            t = f["text"].rstrip(".").lower()
+            if target_re.match(t) and not t.endswith("again") and not t.startswith("continue to"):
+                return f
+    return None
+
+
+def _inject_after_step(task_key: str, plan: str, subgoal: str, state, milestone: str,
+                       target_re, extra_fn, rule: str, why, tx_label: str,
+                       phase2_gate=None, max_injections: int = 1) -> dict:
+    """Borrow turn(s) for an extra attempt once the target step completes. Plan NEVER modified.
+
+    System2's own subgoal is HELD, not discarded: it is stashed on the first borrowed turn and
+    executed once the injections are done. Without that, System2 would re-plan on the next turn
+    having seen the clip of a segment it never asked for, so the borrowed turn would perturb its
+    decision instead of merely delaying it.
+
+    ``tx_label`` marks the borrowed turns in the record ("tx_sg_failed" for a recovery after a
+    detected failure, "tx_sg_incomplete" for a continuation), so the GUI track can distinguish an
+    injected turn from one System2 asked for.
+
+    ``phase2_gate`` is checked ONLY at injection time -- never on the remember phase, where a
+    condition on the previous segment's outcome is not yet meaningful.
+    """
+    done = state.get(f"{task_key}_injected", 0)
+    step = _target_step(plan, milestone, target_re)
+
+    # Release: injections finished, so run the subgoal System2 proposed before we interrupted it.
+    if done and state.get(f"{task_key}_held"):
+        held = state.pop(f"{task_key}_held")
+        if done >= max_injections:
+            return {"subgoal": held, "subgoal_detail": held,
+                    "interventions": [{"rule": rule, "kind": "tx_resume",
+                                       "detail": f"borrowed {done} turn(s); resuming the subgoal "
+                                                 "System2 proposed before the interruption",
+                                       "before": subgoal, "after": held}]}
+        state[f"{task_key}_held"] = held      # more injections to come, keep holding
+
+    if done >= max_injections or step is None:
+        return {}
+    cur = current_fine_id(plan)
+    # Phase 1 -- target in progress: remember it, and COUNT System2's own re-issues.
+    #
+    # A borrowed turn must never overlap what System2 already asked for. If System2 itself says
+    # "continue to <step>" or "<step> again" while the step is still in progress, that IS the extra
+    # attempt, so it consumes one of the max_injections rather than being stacked on top. Counting
+    # has to happen HERE and not at injection time: during a re-issue the step is still marked "~",
+    # so this phase is the only place those turns are visible.
+    if cur == step["fid"] or step["mark"] == "~":
+        state[f"{task_key}_fid"] = step["fid"]
+        base = step["text"].rstrip(".")
+        state[f"{task_key}_text"] = base
+        raw = (subgoal or "").strip().rstrip(".")
+        if _norm(raw) == _norm(base) and raw.lower() != base.lower():
+            # same instruction, re-issued -- "continue to ..." or "... again"
+            state[f"{task_key}_injected"] = done + 1
+            return {"interventions": [{"rule": rule, "kind": "tx_counted",
+                                       "detail": f"System2 re-issued {step['fid']} itself "
+                                                 f"({done + 1}/{max_injections} attempts used); "
+                                                 "no borrowed turn added",
+                                       "before": subgoal, "after": subgoal}]}
+        return {}
+    # Phase 2 -- a target we saw in progress is now done: borrow this turn.
+    if not state.get(f"{task_key}_text") or step["mark"] != "x":
+        return {}
+    if phase2_gate is not None and not phase2_gate():
+        return {}
+    extra = extra_fn(state[f"{task_key}_text"])
+    if _norm(subgoal) == _norm(extra):
+        state[f"{task_key}_injected"] = done + 1    # System2 asked for it already
+        return {}
+    state.setdefault(f"{task_key}_held", subgoal)   # hold System2's output (first borrowed turn)
+    state[f"{task_key}_injected"] = done + 1
+    return {"subgoal": extra, "subgoal_detail": extra, "tx_label": tx_label,
+            "interventions": [{"rule": rule, "kind": tx_label,
+                               "detail": f"{state[f'{task_key}_fid']} completed; borrowed turn "
+                                         f"{done + 1}/{max_injections} "
+                                         f"({why() if callable(why) else why}). Plan untouched; "
+                                         "System2's subgoal is held and resumes after.",
+                               "before": subgoal, "after": extra}]}
+
+
+def _rule_drawer_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """PickPlaceDrawerToCounter: one injected "grasp X again" turn after the M2 grasp completes."""
+    if task != DRAWER:
+        return {}
+    # RECOVERY ONLY: inject when the grasp closed on nothing. state["grip_width"] is the width left by
+    # the PREVIOUS segment (plumbed by combined_eval) -- at injection time that is the grasp being
+    # judged. Passed as a phase-2 gate, NOT checked up front: during the grasp turn the recorded width
+    # is still the open-gripper value from the reach, so an up-front check would block the remember
+    # phase and the rule could never fire.
+    def _missed():
+        w = state.get("grip_width")
+        return w is not None and w < DRAWER_MISS_WIDTH
+
+    return _inject_after_step(
+        "drawer", plan, subgoal, state, "M2", _DRAWER_TARGET_RE,
+        extra_fn=lambda t: f"{t} again", rule="drawer_regrasp_recovery",
+        tx_label="tx_sg_failed", phase2_gate=_missed,
+        why=lambda: f"gripper width {state.get('grip_width'):.4f} < {DRAWER_MISS_WIDTH} -- the "
+                    "fingers closed on nothing, so the grasp missed")
+
+
 _RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
           _rule_microwave_again, _rule_repeat_cap, _rule_sink_faucet_est,
           _rule_est_bump, _rule_mixer_est_floor, _rule_coffee_m2_est,
           # GRADUATED (see the tables above)
           _rule_coffee_split_release, _rule_coffee_split_reach_grasp, _rule_coffee_grasp_est,
-          _rule_ppc2c_skip_failed, _rule_ppc2c_extra_carry, _rule_ppc2c_grasp_est)
+          _rule_ppc2c_skip_failed, _rule_ppc2c_extra_carry, _rule_ppc2c_grasp_est,
+          _rule_drawer_regrasp_recovery)
 
 # EXPERIMENTAL PATCH LAYER. Unverified per-task rules live in sys2_rules_exp.py and are appended
 # here if that module is importable. This is the ONLY hook they need: an experiment is added,
@@ -960,8 +1116,11 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
     running without this module.
     """
     st = state if state is not None else {}
+    # tx_label marks a turn a rule INJECTED rather than one System2 asked for -- "tx_sg_failed" for a
+    # recovery after a detected failure, "tx_sg_incomplete" for a continuation. Recorded per turn so
+    # the GUI track can tell the two apart.
     cur = {"plan": plan, "subgoal": subgoal, "subgoal_detail": subgoal_detail, "est": est,
-           "skip_s1": False}
+           "skip_s1": False, "tx_label": None}
     ivs: list[dict] = []
     est_proposals: list[tuple] = []
     for fn in _RULES:
@@ -976,7 +1135,7 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
             # proposal. They are resolved once, below, by taking the largest.
             est_proposals.append((r["est_proposal"], r["interventions"][0]["rule"]
                                   if r.get("interventions") else "?"))
-        for k in ("plan", "subgoal", "subgoal_detail", "skip_s1"):
+        for k in ("plan", "subgoal", "subgoal_detail", "skip_s1", "tx_label"):
             if k in r:
                 cur[k] = r[k]
         if cur["skip_s1"]:
