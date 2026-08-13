@@ -485,6 +485,12 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
         return {}
     prev, count = state.get("rep_sg"), state.get("rep_n", 0)
     count = count + 1 if n == prev else 1
+    # A NEW subgoal starts a FRESH decline budget. Without this reset rep_declines accumulated over the
+    # whole episode, so a second terminal subgoal inherited the first one's declines and stopped after 5
+    # executed attempts instead of the documented 6 -- and an episode whose plan System2 later extended
+    # could be terminated by declines belonging to an already-abandoned step.
+    if n != prev:
+        state["rep_declines"] = 0
     state["rep_sg"], state["rep_n"] = n, count
     # A pure REACH gets a tighter cap. Reaching is positioning, not effort accumulation: if System1
     # has not arrived in two turns it is not converging, and more reaching only burns turns. The
@@ -731,6 +737,13 @@ def _rule_coffee_m2_est(task: str, plan: str, subgoal: str, est, state) -> dict:
 _TOASTER_GRIP_STEPS = ("M1.1", "M1.2")
 
 
+# action_overrides() is called DIRECTLY by combined_eval, not through _RULES, so it needs its own
+# registry check: without it a "general rules only" arm still applied the GetToastedBread gripper pin,
+# and the arm was not general-only at all.
+def _task_rules_active() -> bool:
+    return any(f in _RULES for f in _TASK_RULES)
+
+
 def action_overrides(task: str, plan: str, subgoal: str) -> dict:
     """Per-STEP overrides applied to System1's commanded action for this segment.
 
@@ -741,6 +754,8 @@ def action_overrides(task: str, plan: str, subgoal: str) -> dict:
 
     Empty dict == no override, which is the untouched path.
     """
+    if not _task_rules_active():
+        return {}
     if task == "GetToastedBread" and current_fine_id(plan) in _TOASTER_GRIP_STEPS:
         return {"grip": 1.0,
                 "why": f"GetToastedBread {current_fine_id(plan)}: pin gripper CLOSED to press "
@@ -1066,6 +1081,12 @@ def _target_step(plan: str, milestone: str | None, target_re):
             continue
         for f in b["fine"]:
             t = f["text"].rstrip(".").lower()
+            # SKIP steps already marked [x]. Without this the docstring's "not-yet-done" was a lie:
+            # in a multi-grasp milestone ([x] grasp the apple / [~] grasp the banana) the COMPLETED
+            # apple was returned and the banana never monitored. Returning None once the step is
+            # done is what missing_means_done already expects, so single-grasp plans are unchanged.
+            if f["mark"] == "x":
+                continue
             if target_re.match(t) and not t.endswith("again") and not t.startswith("continue to"):
                 return f
     return None
