@@ -1828,7 +1828,12 @@ _TASK_RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_ret
                _rule_wi_extra_carry_turn, _rule_wi_reach_locate,
                _rule_pil_reach_continue)
 
-_RULES = _GENERAL_RULES + _TASK_RULES
+# ONLY the general set is registered right now, at the session owner's request: the run in flight is
+# a general-rules-only arm. _TASK_RULES above is intact and unregistered -- re-enable with
+#     _RULES = _GENERAL_RULES + _TASK_RULES
+# and likewise _PLAN_RULES below. Plan-mode counts as task-specific: its one rule is gated on
+# StackBowlsCabinet.
+_RULES = _GENERAL_RULES
 
 # ---- PLAN-MODE rules -------------------------------------------------------------------------
 # apply_rules above runs on EXECUTION turns only. A rule that must replace the checklist System2
@@ -1901,7 +1906,10 @@ def _plan_rule_stackbowls_force(task: str, plan: str) -> dict:
                                "before": (plan or "").strip(), "after": SBC_FORCED_PLAN}]}
 
 
-_PLAN_RULES: tuple = (_plan_rule_stackbowls_force,)
+_PARKED_PLAN_RULES: tuple = (_plan_rule_stackbowls_force,)
+# Not registered: plan-mode is task-specific (StackBowlsCabinet only). Re-enable with
+#     _PLAN_RULES = _PARKED_PLAN_RULES
+_PLAN_RULES: tuple = ()
 
 
 def apply_plan_rules(task: str, *, plan: str) -> dict:
