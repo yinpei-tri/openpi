@@ -1709,11 +1709,19 @@ REGRASP_FAR_EST = int(os.environ.get("SYS2_RULES_REGRASP_FAR_EST", "125"))
 
 # Matched with \b...\b word boundaries, NOT substrings: "straw" must not catch strawberry (0.0419,
 # thick) and "pot" must not catch potato (0.0523) or sweet potato (0.0361).
-_REGRASP_VERY_THIN = ("mug", "cup", "knob", "ladle", "handle", "bowl")
+# 0.003: held BELOW 0.0075 in successful episodes, so only the near-closed floor separates them.
+# straw (median 0.0129 held, 38 readings under 0.0075) and ice cube / sugar cube / level are here for
+# the same reason -- they are the smallest things in the suite.
+_REGRASP_VERY_THIN = ("mug", "cup", "knob", "ladle", "handle", "bowl",
+                      "ice cube", "sugar cube", "straw", "level")
+# 0.0075: held below the 0.015 default but never below this.
+# NOTE "drumstick" was here and is REMOVED: a chicken drumstick is a large object (median 0.0472 held),
+# and the tight bar delayed detection by a turn -- PackIdenticalLunches ep0 ended t27 at 0.0118, above
+# the 0.0075 bar, so the drop was not caught until t29 and had to use the expensive reach-back form
+# instead of the cheap in-place one at t28. It was added on only 2 misfires; the default 0.015 is right.
 _REGRASP_THIN = ("lemon", "kettle", "container", "spatula", "basket", "mushroom", "shrimp",
                  "bell pepper", "yogurt", "dish brush", "cheese stick", "spoon", "tupperware",
-                 "pitcher", "colander", "ice cube", "straw", "chocolate", "sugar cube", "teapot",
-                 "level", "pot", "jar", "meat", "drumstick", "whisk")
+                 "pitcher", "colander", "chocolate", "teapot", "pot", "jar", "meat", "whisk")
 def _wordset(words):
     return re.compile(r"\b(" + "|".join(re.escape(w) for w in words) + r")\b", re.IGNORECASE)
 _REGRASP_VERY_THIN_RE = _wordset(_REGRASP_VERY_THIN)
