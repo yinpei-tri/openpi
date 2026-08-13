@@ -35,6 +35,15 @@ try:
     from combined_eval import TARGET_TASK_SPLIT
 except Exception:
     TARGET_TASK_SPLIT = {}
+# REFINED rate: the same episodes re-scored under RoboCasa's official per-task step horizon. One
+# implementation, in horizon_gate, shared with scripts/build_refined_results.py so the audit JSONs and
+# the numbers the GUI renders can never disagree. Absent (older checkout, missing horizon table) the
+# refined fields are simply all-zero and the GUI's toggle has nothing to show.
+try:
+    from horizon_gate import mark_refined
+except Exception as _e:
+    print(f"  NOTE: refined (official-horizon) scoring unavailable: {_e}")
+    mark_refined = None
 
 SPLITS = ("atomic_seen", "composite_seen", "composite_unseen", "other")
 
@@ -46,19 +55,34 @@ RESULTS_DIR = Path(os.environ.get("SYS1_RESULTS_DIR") or _DATA / "sys1_eval_resu
 
 
 def _stat_block(eps: list[dict]) -> dict:
-    """success/n/rate + timing + turn stats for a group of episodes."""
+    """success/n/rate + timing + turn stats for a group of episodes.
+
+    ``n_success_refined`` / ``rate_refined`` re-score the same episodes under RoboCasa's official
+    per-task step horizon (see horizon_gate.mark_refined). Same denominator ``n`` -- the horizon can only demote a
+    success, never create one, so the refined rate is always <= rate.
+    """
     n = len(eps)
     s = sum(1 for e in eps if e.get("episode_success"))
     secs = [e["seconds"] for e in eps if isinstance(e.get("seconds"), int | float)]
     turns = [e["n_turns"] for e in eps if isinstance(e.get("n_turns"), int)]
+    sr = sum(1 for e in eps if e.get("refined_success"))
+    unk = sum(1 for e in eps if e.get("refined_unknown"))
     return {
         "n": n,
         "n_success": s,
         "rate": (s / n) if n else None,
+        "n_success_refined": sr,
+        "rate_refined": (sr / n) if n else None,
+        # Successes whose step-to-success could not be resolved (episode.json pruned, or no
+        # success_step recorded). NOT counted as refined successes, and surfaced rather than folded
+        # in, so a refined rate is never quietly computed over episodes nobody could score.
+        "n_refined_unknown": unk,
         "avg_seconds": round(sum(secs) / len(secs), 2) if secs else None,
         "total_seconds": round(sum(secs), 1) if secs else None,
         "avg_turns": round(sum(turns) / len(turns), 2) if turns else None,
     }
+
+
 
 
 def extract_method(method_dir: Path) -> dict | None:
@@ -74,6 +98,11 @@ def extract_method(method_dir: Path) -> dict | None:
     eps = doc.get("episodes") or []
     if not eps:
         return None
+
+    # Adds refined_success / refined_unknown to each record in memory (reads only the successful
+    # episodes' episode.json). The eval tree itself is never written to.
+    if mark_refined is not None:
+        mark_refined(method_dir, eps)
 
     by_split: dict[str, list[dict]] = collections.defaultdict(list)
     by_task: dict[str, list[dict]] = collections.defaultdict(list)
@@ -135,6 +164,8 @@ def main() -> None:
         })
         print(f"  {md.name}: {o['n_success']}/{o['n']} = "
               f"{(100 * o['rate']):.1f}%  {o['avg_seconds']}s/ep"
+              + (f"  refined {o['n_success_refined']}/{o['n']} = "
+                 f"{(100 * o['rate_refined']):.1f}%" if o.get("rate_refined") is not None else "")
               + (f"  ({rec['n_error']} errored)" if rec["n_error"] else ""))
 
     (a.out_dir / "SUMMARY.json").write_text(json.dumps(

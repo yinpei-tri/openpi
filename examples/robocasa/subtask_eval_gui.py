@@ -1088,6 +1088,15 @@ async function load(){
     if(window._showDebug===undefined)window._showDebug=false;    // default OFF
     if(window._showMemory===undefined)window._showMemory=true;   // default ON
     if(window._show1000===undefined)window._show1000=false;      // default OFF -- 1500 runs only
+    // REFINED: render the SAME episodes re-scored under RoboCasa's official per-task step horizon --
+    // a success counts only if the env's success check fired within `horizon` cumulative env steps
+    // (examples/robocasa/horizon_gate.py; precomputed per method by extract_combine_results.py).
+    // PRESENTATION ONLY: it gates which episodes count as successes and touches no eval data. Both #0
+    // and #0b switch together, including the ranking, so a screenshot is never half refined. Default
+    // OFF -- the raw rate is what every earlier note quotes -- but the choice is remembered, because
+    // it is the mode you want for anything comparable with a published RoboCasa number.
+    if(window._refined===undefined)
+      window._refined=(localStorage.getItem('cmbRefined')==='1');
     const ms=ALL.filter(m=>(window._showDebug||!isDebugMethod(m))
                         && (window._showMemory||!isMemoryMethod(m))
                         && (window._show1000||isEval30(m)||isDebugMethod(m)));
@@ -1101,10 +1110,18 @@ async function load(){
         +`<input type="checkbox" id="cmbmemcb" ${window._showMemory?'checked':''} `
         +`style="margin-right:4px">show ${MEM.length} *-memory run${MEM.length>1?'s':''} `
         +`<span style="color:#aaa">(different pipeline)</span></label>`);
-      if(OLD.length)boxes.push(`<label style="cursor:pointer;color:#888">`
+      if(OLD.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px">`
         +`<input type="checkbox" id="cmb1000cb" ${window._show1000?'checked':''} `
         +`style="margin-right:4px">show ${OLD.length} 1000-episode run${OLD.length>1?'s':''} `
         +`<span style="color:#aaa">(20/task; the 1500 set is 30/task)</span></label>`);
+      boxes.push(`<label style="cursor:pointer;color:${window._refined?'#b45309':'#888'}" `
+        +`title="A success counts only if the env's success check fired within RoboCasa's official `
+        +`per-task step horizon (450-4350 env steps, robocasa dataset_registry). Our loop budgets per `
+        +`subgoal and per turn, never over total env steps, so an episode can run past it. `
+        +`Presentation only -- gates which episodes count, changes no data.">`
+        +`<input type="checkbox" id="cmbrefcb" ${window._refined?'checked':''} `
+        +`style="margin-right:4px">refined `
+        +`<span style="color:#aaa">(official RoboCasa step horizon)</span></label>`);
       dbgBar.innerHTML=boxes.join('');
     }
     const cb=document.getElementById('cmbdbgcb');
@@ -1113,6 +1130,9 @@ async function load(){
     if(mcb)mcb.onchange=()=>{window._showMemory=mcb.checked; load();};
     const ocb=document.getElementById('cmb1000cb');
     if(ocb)ocb.onchange=()=>{window._show1000=ocb.checked; load();};
+    const rcb=document.getElementById('cmbrefcb');
+    if(rcb)rcb.onchange=()=>{window._refined=rcb.checked;
+      localStorage.setItem('cmbRefined', window._refined?'1':'0'); load();};
     // Guard on EITHER kind being hidden: with only *-memory runs present and its box unticked,
     // DBG.length alone would be 0 and the page would claim there are no runs at all.
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
@@ -1138,24 +1158,43 @@ async function load(){
     const sp=['atomic_seen','composite_seen','composite_unseen','other'];
     // Only show a split column some method actually has episodes for ('other' is normally empty).
     const spShown=sp.filter(x=>ms.some(m=>((C[m].per_split||{})[x]||{}).n));
+    // SUC reads a stat block through the refined toggle, and is the ONLY place the two scorings are
+    // chosen between -- #0, #0b and the ranking all go through it, so they cannot disagree.
+    // Returns null for an empty block, and {na:true} when refined was asked for but the block has no
+    // refined fields (a method extracted before the gate existed, or one whose raw episodes were
+    // pruned so the step-to-success is unrecoverable). Denominator `n` is identical either way: the
+    // horizon can only demote a success, never create one.
+    const SUC=b=>{
+      if(!b||!b.n)return null;
+      if(!window._refined){const s=b.n_success??b.s??0;
+        return {n:b.n,s:s,r:(b.rate!=null?b.rate:s/b.n)};}
+      if(b.n_success_refined==null)return {n:b.n,na:true};
+      return {n:b.n,s:b.n_success_refined,
+              r:(b.rate_refined!=null?b.rate_refined:b.n_success_refined/b.n),
+              unk:b.n_refined_unknown||0,drop:(b.n_success??0)-b.n_success_refined};};
     // overall = the three splits combined, summed from per_split so it is always consistent with the
     // cells beside it (a partial sweep can fill the splits unevenly).
-    const overallOf=m=>{const P=C[m].per_split||{}; let on=0,os=0;
-      for(const x of sp){const b=P[x]; if(!b||!b.n)continue; on+=b.n; os+=(b.n_success??b.s??0);}
-      return on?{n:on,n_success:os,rate:os/on}:null;};
-    // Rank on the top-level rate, falling back to the split-derived one.
-    const rateOf=m=>{const v=C[m]; if(v&&v.rate!=null)return v.rate;
-      const o=overallOf(m); return o?o.rate:-1;};
+    const overallOf=m=>{const P=C[m].per_split||{}; let on=0,os=0,na=false;
+      for(const x of sp){const b=SUC(P[x]); if(!b)continue; on+=b.n;
+        if(b.na){na=true;}else{os+=b.s;}}
+      return on?(na?{n:on,na:true}:{n:on,n_success:os,rate:os/on}):null;};
+    // Rank on the top-level rate, falling back to the split-derived one. Under the toggle this ranks
+    // by the refined rate, so the order matches the numbers on screen.
+    const rateOf=m=>{const t=SUC(C[m]); if(t&&!t.na&&t.r!=null)return t.r;
+      const o=overallOf(m); return (o&&o.rate!=null)?o.rate:-1;};
     const ranked=ms.slice().sort((a,b)=>rateOf(b)-rateOf(a));
     // Named cellSp, NOT cell: #0b below declares its own `cell` in this same block scope, and a
     // duplicate `const` is a SyntaxError that kills the whole script -- the page then hangs forever
     // on "loading stats..." because load() never runs.
     const cellSp=(b,bold)=>{
-      if(!b||!b.n)return '<td style="color:#ccc">–</td>';
-      const ok=b.n_success??b.s??0, r=b.rate!=null?b.rate:ok/b.n;
-      return `<td title="${b.avg_seconds!=null?b.avg_seconds+'s/ep':''}"`
+      const u=SUC(b);
+      if(!u)return '<td style="color:#ccc">–</td>';
+      if(u.na)return `<td style="color:#ccc" title="not scorable under the horizon gate — `
+        +`re-run scripts/extract_combine_results.py, or the raw episodes were pruned">n/a</td>`;
+      const drop=u.drop?` · refined: ${u.drop} win${u.drop>1?'s':''} outside the horizon`:'';
+      return `<td title="${b.avg_seconds!=null?b.avg_seconds+'s/ep':''}${drop}"`
         +`${bold?' style="background:#eef2fb"':''}>`
-        +`<b>${pct(r)}</b><br><span style="color:#888;font-size:11px">${ok}/${b.n}</span></td>`;};
+        +`<b>${pct(u.r)}</b><br><span style="color:#888;font-size:11px">${u.s}/${u.n}</span></td>`;};
     let h="<table class=cmbmain><tr><th>#</th><th class='exp'>method</th><th>overall</th>"
       +spShown.map(x=>`<th>${x.replace('_','-')}</th>`).join('')
       +"<th>avg s/ep</th><th>avg turns</th></tr>";
@@ -1164,13 +1203,21 @@ async function load(){
                  .map(([k,n])=>`${k}: ${n}`).join(' · ');
       // Prefer the top-level record for the overall cell (it is what the extractor computed over
       // every episode); fall back to the split sum when a method predates per_split.
-      const ov=(v.rate!=null&&v.n)?{n:v.n,n_success:v.n_success,rate:v.rate,
-                                    avg_seconds:v.avg_seconds}:overallOf(m);
-      h+=`<tr><td style="color:#888">${i+1}</td><td class='exp'>${mName2(m)}</td>`
-        +`<td title="errors: ${v.n_error??0} · terminations — ${tt||'n/a'}"`
+      const t0=SUC(v);
+      const ov=(t0&&v.n)?(t0.na?{n:v.n,na:true}:{n:v.n,n_success:t0.s,rate:t0.r}):overallOf(m);
+      // Under the toggle the name says "(refined)" too, so a screenshot of this table cannot be
+      // mistaken for the raw one.
+      const nm=mName2(m)+(window._refined?' <span style="color:#b45309">(refined)</span>':'');
+      const dropTip=(window._refined&&t0&&!t0.na&&t0.drop)
+        ? ` · horizon gate removed ${t0.drop} win${t0.drop>1?'s':''}`
+        : (window._refined&&t0&&t0.na?' · not scorable under the horizon gate':'');
+      h+=`<tr><td style="color:#888">${i+1}</td><td class='exp'>${nm}</td>`
+        +`<td title="errors: ${v.n_error??0} · terminations — ${tt||'n/a'}${dropTip}"`
         +` style="background:#eef2fb">`
-        +`<b>${pct(ov?ov.rate:null)}</b><br><span style="color:#888;font-size:11px">`
-        +`${ov?ov.n_success:'?'}/${ov?ov.n:'?'}</span></td>`
+        +(ov&&ov.na?'<span style="color:#ccc">n/a</span>'
+          :`<b>${pct(ov?ov.rate:null)}</b><br><span style="color:#888;font-size:11px">`
+           +`${ov?ov.n_success:'?'}/${ov?ov.n:'?'}</span>`)
+        +`</td>`
         +spShown.map(x=>cellSp(P[x],false)).join('')
         +`<td>${v.avg_seconds??'–'}</td><td>${v.avg_turns??'–'}</td></tr>`;});
     h+="</table><div style='color:#888;font-size:11px;margin-top:3px'>Ranked best → worst by overall "
@@ -1184,7 +1231,19 @@ async function load(){
       +"older 1000-episode runs (20 per task, the same episodes as the first 20 of each task) are one "
       +"click away above — their rates are computed on a subset, so ranking them beside a 1500-run is "
       +"a comparison of two different denominators. "
-      +"Source: eval_results/combine_results/*.json via scripts/extract_combine_results.py.</div>";
+      +(window._refined
+        ? "<b style='color:#b45309'>REFINED is ON</b> — a success counts only if the env's success "
+          +"check fired within RoboCasa's official per-task step horizon (450–4350 env steps, from "
+          +"its dataset_registry). Our loop budgets per subgoal and per turn and never over total env "
+          +"steps, so an episode can run past it; the gate only ever removes wins, so the denominator "
+          +"is unchanged and refined ≤ raw. #0b follows the same toggle. This is the mode to use for "
+          +"anything compared with a published RoboCasa number. It re-scores the recorded rollouts "
+          +"and changes no data — and note the rollouts were GENERATED without the horizon, so a "
+          +"policy tuned for it could behave differently. "
+        : "")
+      +"Source: eval_results/combine_results/*.json via scripts/extract_combine_results.py"
+      +" (refined: examples/robocasa/horizon_gate.py; audit trail per episode in "
+      +"eval_results/combine_refined/*.json).</div>";
     document.getElementById('cmbtab').innerHTML=h;
     document.getElementById('cmbsplit').innerHTML='';
     // #0b per-task matrix: rows = tasks grouped by split, cols = methods.
@@ -1194,12 +1253,16 @@ async function load(){
       for(const t in pt) info[t]=info[t]||pt[t].split||'other';});
     const tasks=Object.keys(info).sort((a,b)=>
       (order[info[a]]??9)-(order[info[b]]??9) || a.localeCompare(b));
+    // Same SUC as #0, so #0b follows the refined toggle in lockstep. A per-task block with no refined
+    // fields shows n/a rather than a green 0, which would read as "this task never succeeded".
     const cell=(b)=>{
-      if(!b||!b.n)return '<td style="color:#ccc">–</td>';
-      const r=b.rate!=null?b.rate:(b.n_success/b.n);
-      return `<td title="${(100*r).toFixed(1)}% · ${b.avg_seconds??'?'}s/ep" `
-        +`style="background:rgba(46,139,61,${(0.10+0.5*r).toFixed(2)})">`
-        +`${b.n_success}<span style="color:#888">/${b.n}</span></td>`;};
+      const u=SUC(b);
+      if(!u)return '<td style="color:#ccc">–</td>';
+      if(u.na)return '<td style="color:#ccc" title="not scorable under the horizon gate">n/a</td>';
+      const drop=u.drop?` · refined: -${u.drop} outside the ${b.horizon??'official'}-step horizon`:'';
+      return `<td title="${(100*u.r).toFixed(1)}% · ${b.avg_seconds??'?'}s/ep${drop}" `
+        +`style="background:rgba(46,139,61,${(0.10+0.5*u.r).toFixed(2)})">`
+        +`${u.s}<span style="color:#888">/${u.n}</span></td>`;};
     // Method COLUMNS follow #0's ranking (left = best overall), not alphabetical order, so a task's
     // row reads in the same left-to-right order as the summary table above it. `ranked` is the exact
     // array #0 rendered, so the two tables can never disagree.
@@ -2075,6 +2138,14 @@ def _combine_stats() -> dict:
             o = rec.get("overall") or {}
             out[rec.get("method", f.stem)] = {
                 "n": o.get("n"), "n_success": o.get("n_success"), "rate": o.get("rate"),
+                # REFINED = the same episodes re-scored under RoboCasa's official per-task step
+                # horizon (horizon_gate.py). per_split / per_task below pass through whole, so they
+                # already carry their own refined fields. None for a method extracted before this
+                # existed, or one whose raw tree was pruned -- #0's toggle renders that as "n/a"
+                # rather than as 0%.
+                "n_success_refined": o.get("n_success_refined"),
+                "rate_refined": o.get("rate_refined"),
+                "n_refined_unknown": o.get("n_refined_unknown"),
                 "avg_seconds": o.get("avg_seconds"), "total_seconds": o.get("total_seconds"),
                 "avg_turns": o.get("avg_turns"), "n_error": rec.get("n_error"),
                 "terminations": rec.get("terminations") or {},
