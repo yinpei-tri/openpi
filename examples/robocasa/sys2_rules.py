@@ -1675,24 +1675,59 @@ def _rule_pil_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -
 _REGRASP_RE = re.compile(r"^(reach\s+and\s+)?grasp\b", re.IGNORECASE)
 _REGRASP_BARE_RE = re.compile(r"^grasp\b", re.IGNORECASE)
 _REGRASP_REACH_RE = re.compile(r"^reach\s+and\s+grasp\b", re.IGNORECASE)
-# Fingers closed below this = closed on nothing. Same bar as the two graduated per-task copies.
+# WIDTH LADDER, not a single bar. A binary skip list threw away real drops: PickPlaceDrawerToCounter's
+# three successful re-grasps were on a pizza cutter (0.0021), a measuring cup (0.0024) and a dish brush
+# (0.0043) -- and two of those objects were on the skip list, so skipping them lost the very cases the
+# rule exists for. Instead every object gets a bar, and thin objects simply get a TIGHTER one:
+#
+#   0.015   default -- normal objects (pan, bread, knife, toast, drumstick, strawberry, potato, ...)
+#   0.0075  thin-ish: held below the default bar, but never below this one
+#   0.003   very thin: essentially "the jaws met with nothing between them" (measured min is ~0.0009
+#           for every group, so this is the object-independent floor)
+#
+# Tiers assigned from the measured "held in a SUCCESSFUL episode" count below each candidate bar, over
+# both 1500-episode v2 sweeps at offsets +1/+2:
+#   0.003 group -- mug 18 held-OK readings below 0.0075, cup 18, knob 14, ladle 7 of 12, handle 3,
+#     bowl 4. A genuinely held ladle reads 0.0057, thinner than a mug, so only 0.003 separates it.
+#   0.0075 group -- 0-3 held-OK readings below that bar, so the default was simply too loose for them.
+#     jar / meat / drumstick / whisk join here: each misfired 2-4 times at 0.015 and 0 times at 0.0075.
+#
+# IRREDUCIBLE, on the record: 15 of the 24 measured misfires survive even at 0.003 -- sponge, croissant,
+# broccoli, bread, pan, onion, sink spout. Those are compressible foods, or the width was read at a
+# moment the gripper had legitimately released. No ladder fixes them; 15 in 2558 grasp turns is 0.6%,
+# each costing one borrowed turn.
 REGRASP_MISS_WIDTH = float(os.environ.get("SYS2_RULES_REGRASP_MISS_WIDTH", "0.015"))
+REGRASP_BAR_THIN = float(os.environ.get("SYS2_RULES_REGRASP_BAR_THIN", "0.0075"))
+REGRASP_BAR_VERY_THIN = float(os.environ.get("SYS2_RULES_REGRASP_BAR_VERY_THIN", "0.003"))
+# How many turns after the grasp a drop still counts. Offset 0 is HEALTHY in the cases that fail (the
+# object is lost during the NEXT segment), and beyond +2 the arm has moved on.
 REGRASP_WINDOW = int(os.environ.get("SYS2_RULES_REGRASP_WINDOW", "2"))
+# est floors for the retry, from what those segments actually consume (grasp p90 75; reach-and-grasp
+# p90 150, median 100). Floors, resolved as max(floor, the failed grasp est, System2 est for the turn).
 REGRASP_NEAR_EST = int(os.environ.get("SYS2_RULES_REGRASP_NEAR_EST", "75"))
 REGRASP_FAR_EST = int(os.environ.get("SYS2_RULES_REGRASP_FAR_EST", "125"))
-# Set SYS2_RULES_REGRASP_SKIP to override (comma list), or to "" to monitor every object.
-_REGRASP_SKIP_WORDS = tuple(w.strip() for w in os.environ.get(
-    "SYS2_RULES_REGRASP_SKIP",
-    "mug,ice cube,handle,chocolate,cup,lemon,ladle,sugar cube,tupperware,yogurt,bell pepper,bowl,"
-    "mushroom,pot,colander,dish brush,cheese stick,spoon,shrimp,kettle,basket,teapot,pitcher,"
-    "straw,knob,spatula,container,level").split(",") if w.strip())
-_REGRASP_SKIP_RE = (re.compile(r"\b(" + "|".join(re.escape(w) for w in _REGRASP_SKIP_WORDS) + r")\b",
-                               re.IGNORECASE) if _REGRASP_SKIP_WORDS else None)
+
+# Matched with \b...\b word boundaries, NOT substrings: "straw" must not catch strawberry (0.0419,
+# thick) and "pot" must not catch potato (0.0523) or sweet potato (0.0361).
+_REGRASP_VERY_THIN = ("mug", "cup", "knob", "ladle", "handle", "bowl")
+_REGRASP_THIN = ("lemon", "kettle", "container", "spatula", "basket", "mushroom", "shrimp",
+                 "bell pepper", "yogurt", "dish brush", "cheese stick", "spoon", "tupperware",
+                 "pitcher", "colander", "ice cube", "straw", "chocolate", "sugar cube", "teapot",
+                 "level", "pot", "jar", "meat", "drumstick", "whisk")
+def _wordset(words):
+    return re.compile(r"\b(" + "|".join(re.escape(w) for w in words) + r")\b", re.IGNORECASE)
+_REGRASP_VERY_THIN_RE = _wordset(_REGRASP_VERY_THIN)
+_REGRASP_THIN_RE = _wordset(_REGRASP_THIN)
 
 
-def regrasp_skipped(text: str | None) -> bool:
-    """True if this grasp target is one whose held width is legitimately below the bar."""
-    return bool(_REGRASP_SKIP_RE and _REGRASP_SKIP_RE.search(text or ""))
+def regrasp_bar(text: str | None) -> float:
+    """The width below which THIS object counts as dropped. Tightest matching tier wins."""
+    t = text or ""
+    if _REGRASP_VERY_THIN_RE.search(t):
+        return REGRASP_BAR_VERY_THIN
+    if _REGRASP_THIN_RE.search(t):
+        return REGRASP_BAR_THIN
+    return REGRASP_MISS_WIDTH
 
 
 def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> dict:
@@ -1700,12 +1735,11 @@ def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> di
     state["rg_turn"] = turn = state.get("rg_turn", 0) + 1
     step = _target_step(plan, None, _REGRASP_RE)
     if step is not None:
-        if regrasp_skipped(step["text"]):
-            return {}
         fid = step["fid"]
         if current_fine_id(plan) == fid or step["mark"] == "~":
             state["rg_active_fid"] = fid
             state[f"rg_{fid}_gturn"] = turn
+            state[f"rg_{fid}_bar"] = regrasp_bar(step["text"])
             # Remember the est the FAILED grasp asked for: the retry should get at least that.
             if isinstance(est, int) and est > 0:
                 state[f"rg_{fid}_gest"] = est
@@ -1722,7 +1756,8 @@ def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> di
         # PHASE-2 gate: grip_width is the previous segment's aperture, so during the grasp turn itself
         # it is still the open value from the reach and an up-front check could never fire.
         w = state.get("grip_width")
-        if w is None or w >= REGRASP_MISS_WIDTH:
+        bar = state.get(f"{key}_bar", REGRASP_MISS_WIDTH)
+        if w is None or w >= bar:
             return False
         return gturn is not None and 1 <= (turn - gturn) <= REGRASP_WINDOW
 
@@ -1737,7 +1772,8 @@ def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> di
         extra_fn=_extra, rule="regrasp_recovery",
         tx_label="tx_sg_failed", phase2_gate=_missed, max_injections=1,
         missing_means_done=True,
-        why=lambda: f"gripper width {state.get('grip_width'):.4f} < {REGRASP_MISS_WIDTH} -- the fingers "
+        why=lambda: f"gripper width {state.get('grip_width'):.4f} < "
+                    f"{state.get(f'{key}_bar', REGRASP_MISS_WIDTH)} (its tier) -- the fingers "
                     f"are closed on nothing {turn - state[f'{key}_gturn']} turn(s) after {fid}, so the "
                     "object was never held or was dropped"
                     + (" (the arm has moved on: reach back first)" if far else ""))
