@@ -1502,10 +1502,14 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                          "400 ARE step-for-step comparable with the 1000-episode no-rules baseline and "
                          "are NOT comparable with the -estbump sweep, which used 800.")
     ap.add_argument("--task-rules", action="store_true",
-                    help="apply the HARDCODED per-task System2 revisions in sys2_rules.py "
-                         f"(tasks: {', '.join(SR.TASKS_WITH_RULES)}). Off by default so the "
-                         "baseline path is unchanged; every intervention is recorded under "
-                         "turn.json:rules and episode.json:rule_interventions.")
+                    help="MASTER SWITCH for the whole sys2_rules.py layer -- despite the name it "
+                         "gates apply_rules() itself, so WITHOUT it not even the general rules that "
+                         "apply to every task run (a run launched with TASK_RULES=0 is a pure "
+                         "no-rules baseline, whatever sys2_rules._RULES contains). Which rules are "
+                         "active is decided ONLY by _RULES in that module; currently "
+                         f"{', '.join(SR.TASKS_WITH_RULES)}. Off by default so the baseline path is "
+                         "unchanged; every intervention is recorded under turn.json:rules and "
+                         "episode.json:rule_interventions.")
     ap.add_argument("--default-est-length", type=int, default=50,
                     help="fallback when System2 omits/garbles <estimated_step>")
     ap.add_argument("--replan-steps", type=int, default=16)

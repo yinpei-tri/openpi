@@ -1852,20 +1852,9 @@ def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> di
     return r
 
 
-# GENERAL rules -- not gated on a single task name. They run FIRST, in this order.
-#   repeat_cap         every task
-#   regrasp_recovery   every task, gated on the gripper width it observes
-#   microwave_again    any microwave subgoal (TEXT-gated)
-#   sink_faucet_est    any semantic "turn on the sink faucet" subgoal (TEXT-gated); covers the
-#                      atomic task and composite tasks, with Qwen3.5 and Qwen3-VL phrasings
-# "General" therefore means "not gated on one task name". The two text-gated rules describe the
-# physical operation rather than a benchmark task identity.
-_GENERAL_RULES = (
-    _rule_repeat_cap,
-    _rule_regrasp_recovery,
-    _rule_microwave_again,
-    _rule_sink_faucet_est,
-)
+# ACTIVE general rules. For the current arm, repeat_cap is deliberately the only registered rule.
+# The other general rules remain implemented above so they can be measured separately later.
+_GENERAL_RULES = (_rule_repeat_cap,)
 
 # TASK-SPECIFIC rules -- each gated on exactly one task (by name or a single-entry tuple).
 # NOTE the two per-task re-grasp copies are RETIRED: _rule_regrasp_recovery subsumes
@@ -2004,14 +1993,8 @@ if not os.environ.get("SYS2_RULES_NO_EXP"):
             print(f"WARNING: experimental rules in {_mod} not loaded: {_e}", flush=True)
     _RULES = _RULES + tuple(_EXP_RULES)
 
-# Tasks with task-SPECIFIC rules, plus labels for the broadly text-gated rules.
-# repeat_cap and regrasp_recovery additionally apply to every task.
-TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave",
-                    "OpenStandMixerHead", "CoffeeSetupMug", "PickPlaceCounterToCabinet",
-                    "GetToastedBread", "WashFruitColander",
-                    "StackBowlsCabinet (plan mode)", "WeighIngredients",
-                    "PackIdenticalLunches", "<sink-faucet activation subgoals>",
-                    "<all: repeat_cap>")
+# Human-readable scope shown in the --task-rules CLI help. Only repeat_cap is currently registered.
+TASKS_WITH_RULES = ("<all: repeat_cap>",)
 
 
 def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
