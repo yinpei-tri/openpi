@@ -184,8 +184,8 @@ EST_BUCKETS = (50, 75, 100, 125, 150, 175, 200, 250, 300, 350, 400, 500,
 # At and above this, est is left alone: the bump is a precision aid for short/medium motions, and
 # the rungs above 500 are large jumps on spans that are already long.
 EST_BUMP_CEILING = int(os.environ.get("SYS2_RULES_EST_BUMP_CEILING", "500"))
-# Which tasks get the bump. "all" = every task; the default is the three SINGLE-CONTACT PRECISION
-# tasks, measured one variable at a time (v3 -> v4, same 20 episodes per task, bump the only change):
+# Historical scope of the bucket bump, measured one variable at a time (v3 -> v4, same 20 episodes
+# per task, bump the only change):
 #     TurnOnMicrowave   11 -> 15   (+4)   press a button
 #     GetToastedBread   13 -> 16   (+3)   press a lever
 #     TurnOnSinkFaucet  17 -> 19   (+2)   turn a handle
@@ -208,10 +208,11 @@ EST_BUMP_CEILING = int(os.environ.get("SYS2_RULES_EST_BUMP_CEILING", "500"))
 # (all-max_turns), not by stopping short of a small contact, which is the only failure the bump
 # addresses. The composite sink/microwave tasks are long and max_turns-prone in the same way, so the
 # extension was judged unsupported. Recoverable from 61679dd if it is worth measuring later.
-_EST_BUMP_TASKS = tuple(
-    t.strip() for t in os.environ.get(
-        "SYS2_RULES_EST_BUMP_TASKS",
-        "TurnOnMicrowave,TurnOnSinkFaucet,GetToastedBread").split(",") if t.strip())
+#
+# The rule is now scoped to TurnOnMicrowave alone. TurnOnSinkFaucet is covered by the semantic
+# sink_faucet_est text gate below, including composite tasks that contain the same operation, while
+# GetToastedBread has dedicated wait and slot-positioning rules. Keeping those three mechanisms
+# separate avoids stacking two estimate rules on the same turn and makes their attribution clear.
 
 
 def bump_est(est):
@@ -597,28 +598,39 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
                  "before": subgoal, "after": new_sg}]}
 
 
+_SINK_FAUCET_ON_RE = re.compile(
+    r"^(?:"
+    r"(?:finish\s+)?turn(?:ing)?\s+on\s+the\s+sink\s+faucet(?:\s+handle)?"
+    r"|(?:finish\s+)?turn(?:ing)?\s+the\s+sink\s+faucet(?:\s+handle)?\s+on"
+    r"|push(?:ing)?\s+the\s+sink\s+faucet(?:\s+handle)?\s+to\s+turn\s+it\s+on"
+    r")$"
+)
+
+
 def _rule_sink_faucet_est(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """ANY task: the turn-on-the-sink-faucet-handle subgoal always gets 100 steps.
+    """ANY task: a subgoal semantically turning on the sink faucet gets est_length >= 100.
 
     System2 budgeted this 50 (18x) or re-issued it as "continue to ..." (33x) -- i.e. it kept
     running out of segment before the handle was over. 100 covers it in one segment.
     """
     # ANY task: gated on the SUBGOAL, not the task name, so the composite tasks that turn on the
     # same faucet are covered too (measured faucet-subgoal turns: WashLettuce 138, RinseSinkBasin
-    # 99, WashFruitColander 94, PreSoakPan 89, vs 51 on the atomic task). The phrasing is stable --
-    # "turn on the sink faucet handle" accounts for 471 of the turns across all five.
-    if _norm(subgoal) != "turn on the sink faucet handle":
+    # 99, WashFruitColander 94, PreSoakPan 89, vs 51 on the atomic task). Match both model families:
+    # Qwen3.5 usually emits "turn on the sink faucet handle", while Qwen3-VL often emits
+    # "push the sink faucet handle to turn it on". Deliberately exclude reach/grasp/hold/release,
+    # which mention the same fixture but are not the contact that turns on the water.
+    if not _SINK_FAUCET_ON_RE.match(_norm(subgoal)):
         return {}
-    if est == 100:
+    if isinstance(est, int) and est >= 100:
         return {}
     return {"est_proposal": 100,
             "interventions": [{"rule": "sink_faucet_est", "kind": "est_proposed",
-                               "detail": "handle rotation needs a full segment",
+                               "detail": "sink-faucet activation needs est_length >= 100",
                                "before": est, "after": 100}]}
 
 
-def _rule_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """_EST_BUMP_TASKS (default: the 3 single-contact precision tasks): raise est_length one bucket -- 50->75, 75->100, ... 400->500.
+def _rule_microwave_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """TurnOnMicrowave only: raise est_length one bucket -- 50->75, 75->100, ... 400->500.
     Retract-arm subgoals are exempt, and 500+ is left alone.
 
     MECHANISM. est_length is not only a budget multiplier: it is a POLICY CONDITIONING tag, rendered
@@ -635,10 +647,9 @@ def _rule_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
     reported stop_rule; the longer conditioned motion actually depresses it. Consistent with
     OpenStandMixerHead, whose est floor of 75 (from System2's flat 50) took it 13/20 -> 20/20.
 
-    SCOPE CAUTION. That evidence is ONE task and ONE failure mode (under-shooting a contact). A task
-    that fails for the opposite reason -- overshooting, or releasing late -- could regress, and every
-    segment that runs to budget gets up to 2x more sim steps. Hence _EST_BUMP_TASKS, so this can be
-    measured broadly before being trusted broadly.
+    SCOPE CAUTION. That evidence is ONE task and ONE failure mode (under-shooting a contact), so the
+    rule is gated on exactly that task. TurnOnSinkFaucet uses sink_faucet_est instead, and
+    GetToastedBread uses its dedicated wait/slot rules.
 
     PROGREG INTERACTION, worth knowing before running the regression head with this on: for
     progreg, est_length ALSO selects the progress threshold
@@ -646,10 +657,10 @@ def _rule_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
     the stop rule STRICTER (75->100 raises the bar 0.88 -> 0.92). These runs are progact, where the
     threshold is a flat 0.95 and only the conditioning and budget channels apply.
     """
-    if "all" not in _EST_BUMP_TASKS and task not in _EST_BUMP_TASKS:
+    if task != "TurnOnMicrowave":
         return {}
     if _RETRACT_RE.match(_norm(subgoal)):
-        return {"interventions": [{"rule": "est_bump", "kind": "est_exempt",
+        return {"interventions": [{"rule": "microwave_est_bump", "kind": "est_exempt",
                                    "detail": "retract-arm step -- a short move away, left at "
                                              "System2's estimate",
                                    "before": est, "after": est}]}
@@ -657,7 +668,7 @@ def _rule_est_bump(task: str, plan: str, subgoal: str, est, state) -> dict:
     if new == est:
         return {}
     return {"est_proposal": new,
-            "interventions": [{"rule": "est_bump", "kind": "est_proposed",
+            "interventions": [{"rule": "microwave_est_bump", "kind": "est_proposed",
                                "detail": f"one bucket up ({est} -> {new}); conditioning tag, so "
                                          "System1 moves slower and more precisely",
                                "before": est, "after": new}]}
@@ -1365,8 +1376,8 @@ def _rule_gtb_wait_force_steps(task: str, plan: str, subgoal: str, est, state) -
 def _rule_gtb_slot_est(task: str, plan: str, subgoal: str, est, state) -> dict:
     """GetToastedBread: "move the gripper over the toaster slot" gets est_length >= GTB_SLOT_EST.
 
-    A FLOOR, not an exact value: apply_rules resolves the largest proposal, and _rule_est_bump also
-    fires on this task, so a System2 est already >= the floor keeps the bump's higher bucket.
+    A FLOOR, not an exact value: apply_rules resolves it against System2's own estimate, so an
+    estimate already at or above the floor remains unchanged.
     """
     if task != GTB or not _GTB_SLOT_RE.match(_norm(subgoal)):
         return {}
@@ -1842,36 +1853,25 @@ def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> di
 
 
 # GENERAL rules -- not gated on a single task name. They run FIRST, in this order.
-#   regrasp_recovery   every task, gated on the gripper width it observes
 #   repeat_cap         every task
+#   regrasp_recovery   every task, gated on the gripper width it observes
 #   microwave_again    any microwave subgoal (TEXT-gated)
-#   sink_faucet_est    any faucet-handle subgoal (TEXT-gated) -- fires on 5 tasks; pooled +10/100 over
-#                      the tasks it touches, so it stays broad
-#   est_bump           a TUPLE of 3 precision tasks, so not single-task but not universal either
-#   flag_retract_emitted  record-only
-# "General" therefore means "not gated on one task name", which is the honest line to draw: two of
-# these are text-gated and one is tuple-gated. The GUI derives its general/task tag from this split
-# rather than from a hardcoded list.
-_GENERAL_RULES = (_rule_regrasp_recovery, _rule_repeat_cap, _rule_microwave_again)
-
-# PARKED -- kept for reference and easy revival, deliberately NOT registered:
-#   _rule_sink_faucet_est  est 100 on the exact subgoal "turn on the sink faucet handle". Text-gated,
-#     so it reached 5 tasks. Pooled over them it was +10/100 (WashLettuce +5, RinseSinkBasin +5,
-#     TurnOnSinkFaucet +3, PreSoakPan +1, WashFruitColander -4), but it only matches ONE phrasing:
-#     qwen35 says "turn on the sink faucet handle" (395 firings) while qwen3vl says "push the sink
-#     faucet handle to turn it on" and barely triggers it, so it silently made the two models
-#     non-comparable.
-#   _rule_est_bump  est up one bucket on ('TurnOnMicrowave','TurnOnSinkFaucet','GetToastedBread').
-#     Part of the 420 -> 460/1000 estbump sweep, so REMOVING IT IS EXPECTED TO COST SOMETHING on those
-#     three tasks; parked at the session owner's request to keep the general set to mechanisms that are
-#     genuinely task-agnostic.
-# Re-register by adding them back to _GENERAL_RULES; both functions are untouched above.
-_PARKED_RULES = (_rule_sink_faucet_est, _rule_est_bump)
+#   sink_faucet_est    any semantic "turn on the sink faucet" subgoal (TEXT-gated); covers the
+#                      atomic task and composite tasks, with Qwen3.5 and Qwen3-VL phrasings
+# "General" therefore means "not gated on one task name". The two text-gated rules describe the
+# physical operation rather than a benchmark task identity.
+_GENERAL_RULES = (
+    _rule_repeat_cap,
+    _rule_regrasp_recovery,
+    _rule_microwave_again,
+    _rule_sink_faucet_est,
+)
 
 # TASK-SPECIFIC rules -- each gated on exactly one task (by name or a single-entry tuple).
 # NOTE the two per-task re-grasp copies are RETIRED: _rule_regrasp_recovery subsumes
 # drawer_regrasp_recovery and pil_regrasp_recovery via the width ladder.
 _TASK_RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
+               _rule_microwave_est_bump,
                _rule_mixer_est_floor, _rule_coffee_m2_est,
                _rule_coffee_split_release, _rule_coffee_split_reach_grasp, _rule_coffee_grasp_est,
                _rule_ppc2c_skip_failed, _rule_ppc2c_extra_carry, _rule_ppc2c_grasp_est,
@@ -2004,14 +2004,13 @@ if not os.environ.get("SYS2_RULES_NO_EXP"):
             print(f"WARNING: experimental rules in {_mod} not loaded: {_e}", flush=True)
     _RULES = _RULES + tuple(_EXP_RULES)
 
-# Tasks with task-SPECIFIC rules. _rule_repeat_cap additionally applies to EVERY task.
-# TurnOnSinkFaucet drops off: its only rules were the now-parked sink_faucet_est and est_bump.
-# TurnOnMicrowave stays because microwave_again is text-gated and its task name matches.
+# Tasks with task-SPECIFIC rules, plus labels for the broadly text-gated rules.
+# repeat_cap and regrasp_recovery additionally apply to every task.
 TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave",
                     "OpenStandMixerHead", "CoffeeSetupMug", "PickPlaceCounterToCabinet",
                     "GetToastedBread", "WashFruitColander",
                     "StackBowlsCabinet (plan mode)", "WeighIngredients",
-                    "PackIdenticalLunches",
+                    "PackIdenticalLunches", "<sink-faucet activation subgoals>",
                     "<all: repeat_cap>")
 
 
