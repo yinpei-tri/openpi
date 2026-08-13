@@ -1653,6 +1653,11 @@ def _rule_pil_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -
 # post-condition (the PreSoakPan faucet finding).
 # Matched with \b...\b word boundaries, NOT substrings: "straw" must not catch strawberry (0.0419,
 # thick) and "pot" must not catch potato (0.0523) or sweet potato (0.0361).
+# "level" is included at the session owner's request. NOTE it matches nothing in either 1500-episode
+# sweep -- no grasp subgoal mentions "level" or "lever" -- so today it is a no-op guard for objects
+# this corpus has not produced. The near-neighbour that DOES occur is the kettle "lever", and only in
+# PRESS subgoals ("press the kettle lever down"), which this rule never examines: it looks at grasp
+# steps only.
 # Measured effect over 2558 recorded grasp turns: 1258 skipped (49%), 1300 monitored, and just 5 false
 # positives (0.2%) -- sponge x2, chicken drumstick, croissant, broccoli, all compressible foods that no
 # name list can fix.
@@ -1680,7 +1685,7 @@ _REGRASP_SKIP_WORDS = tuple(w.strip() for w in os.environ.get(
     "SYS2_RULES_REGRASP_SKIP",
     "mug,ice cube,handle,chocolate,cup,lemon,ladle,sugar cube,tupperware,yogurt,bell pepper,bowl,"
     "mushroom,pot,colander,dish brush,cheese stick,spoon,shrimp,kettle,basket,teapot,pitcher,"
-    "straw,knob,spatula,container").split(",") if w.strip())
+    "straw,knob,spatula,container,level").split(",") if w.strip())
 _REGRASP_SKIP_RE = (re.compile(r"\b(" + "|".join(re.escape(w) for w in _REGRASP_SKIP_WORDS) + r")\b",
                                re.IGNORECASE) if _REGRASP_SKIP_WORDS else None)
 
