@@ -162,6 +162,16 @@ REACH_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_REACH", "2"))
 # / 0.47% of the run and reclaims ~2100 turns; stopping at 1 would cost 0.93% / 1.80%, which is why
 # the default is 3 and not 1.
 MAX_CAP_DECLINES = int(os.environ.get("SYS2_RULES_MAX_CAP_DECLINES", "3"))
+# A RETRACT terminal step gets NO declines at all: it stops the moment the cap is exceeded, i.e. 3
+# executed attempts rather than 5. A retract either latches immediately or never -- measured over the
+# two 1500-episode sweeps, retract-terminal loops beyond 3 repeats number 240 episodes on qwen35 and 82
+# on qwen3vl and yield exactly ONE win each (SetUpCuttingStation ep22, PickPlaceCounterToCabinet ep22),
+# against 505/549 episodes at a single retract turn yielding 282/316 wins. So cutting here stops 203 and
+# 82 more episodes for 0.07% of the run apiece. Tasks most affected: PrepareCoffee, SeparateFreezerRack,
+# GarnishPancake, PanTransfer, CategorizeCondiments, ScrubCuttingBoard, StoreLeftoversInBowl.
+MAX_CAP_DECLINES_RETRACT = int(os.environ.get("SYS2_RULES_MAX_CAP_DECLINES_RETRACT", "0"))
+# _norm has already stripped a leading "continue to", so this matches the re-issues too.
+_RETRACT_TERMINAL_RE = re.compile(r"^retract\b")
 # OpenStandMixerHead est_length floor. est_length is a POLICY CONDITIONING tag (rendered into
 # System1's prompt as "Estimated Length"), not only a budget multiplier -- see _rule_mixer_est_floor.
 MIXER_EST_FLOOR = int(os.environ.get("SYS2_RULES_MIXER_EST_FLOOR", "75"))
@@ -530,20 +540,30 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
                                        "before": f"{cur_b['mid']} [{cur_b['mark']}]",
                                        "after": f"{cur_b['mid']} [x], next {later[0]['mid']}"}]}
         # TRULY the end of the plan: nothing to advance into, so the loop cannot be broken by moving
-        # the checklist. Tolerate MAX_CAP_DECLINES of them, then stop the episode rather than burn the
-        # remaining turn budget on a step that is not converging.
+        # the checklist. Tolerate a few declines, then stop the episode rather than burn the remaining
+        # turn budget on a step that is not converging.
+        #
+        # NOTE ON COUNTING: the stopping turn runs NO System1 segment (combined_eval sets s1=None and
+        # breaks), so the number of EXECUTED attempts is cap + limit, not cap + limit + 1:
+        #     ordinary terminal step   3 in-cap + 2 declines = 5 executed, stop on the 6th S2 turn
+        #     retract terminal step    3 in-cap + 0 declines = 3 executed, stop on the 4th S2 turn
+        _retract = bool(_RETRACT_TERMINAL_RE.match(n))
+        limit = MAX_CAP_DECLINES_RETRACT if _retract else MAX_CAP_DECLINES
         n_dec = state["rep_declines"] = state.get("rep_declines", 0) + 1
-        if n_dec >= MAX_CAP_DECLINES:
+        # >= not >: limit 3 stops ON the 3rd decline (5 executed attempts, the configuration
+        # the 0.33%/0.47% cost was measured against), and limit 0 stops on the first (3 executed).
+        if n_dec >= (limit or 1):
             return {"stop_episode": True,
                     "interventions": [{"rule": "repeat_cap", "kind": "max_cap",
                                        "detail": f"repeat #{count}, decline #{n_dec} at the END of "
-                                                 f"the plan (MAX_CAP_DECLINES={MAX_CAP_DECLINES}) -- "
+                                                 f"the plan ({'retract terminal, ' if _retract else ''}"
+                                                 f"limit {limit}) -- "
                                                  "no step or milestone left to advance into, so the "
                                                  "episode is stopped instead of running to max_turns",
                                        "before": subgoal, "after": "STOP (max_cap)"}]}
         return {"interventions": [{"rule": "repeat_cap", "kind": "cap_declined",
-                                   "detail": f"repeat #{count}, decline #{n_dec} of "
-                                             f"{MAX_CAP_DECLINES} -- no next fine step AND no later "
+                                   "detail": f"repeat #{count}, decline #{n_dec} of {limit} -- no "
+                                             "next fine step AND no later "
                                              "milestone; advancing would strand System2 (see the "
                                              "TurnOnMicrowave retract finding)",
                                    "before": subgoal, "after": subgoal}]}
