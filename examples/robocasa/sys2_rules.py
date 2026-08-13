@@ -1800,14 +1800,26 @@ def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> di
 # "General" therefore means "not gated on one task name", which is the honest line to draw: two of
 # these are text-gated and one is tuple-gated. The GUI derives its general/task tag from this split
 # rather than from a hardcoded list.
-_GENERAL_RULES = (_rule_regrasp_recovery, _rule_repeat_cap, _rule_microwave_again,
-                  _rule_sink_faucet_est, _rule_est_bump, _rule_flag_retract_emitted)
+_GENERAL_RULES = (_rule_regrasp_recovery, _rule_repeat_cap, _rule_microwave_again)
 
-# TASK-SPECIFIC rules -- each gated on exactly one task name, checked as its first statement.
-# NOTE the two per-task re-grasp copies are RETIRED: _rule_regrasp_recovery above subsumes
-# drawer_regrasp_recovery and pil_regrasp_recovery, with the same width bar, the same borrowed-turn
-# machinery and the same one-injection-per-grasp-step budget.
-_TASK_RULES = (_rule_drawer_base_align, _rule_strip_retract_plan,
+# PARKED -- kept for reference and easy revival, deliberately NOT registered:
+#   _rule_sink_faucet_est  est 100 on the exact subgoal "turn on the sink faucet handle". Text-gated,
+#     so it reached 5 tasks. Pooled over them it was +10/100 (WashLettuce +5, RinseSinkBasin +5,
+#     TurnOnSinkFaucet +3, PreSoakPan +1, WashFruitColander -4), but it only matches ONE phrasing:
+#     qwen35 says "turn on the sink faucet handle" (395 firings) while qwen3vl says "push the sink
+#     faucet handle to turn it on" and barely triggers it, so it silently made the two models
+#     non-comparable.
+#   _rule_est_bump  est up one bucket on ('TurnOnMicrowave','TurnOnSinkFaucet','GetToastedBread').
+#     Part of the 420 -> 460/1000 estbump sweep, so REMOVING IT IS EXPECTED TO COST SOMETHING on those
+#     three tasks; parked at the session owner's request to keep the general set to mechanisms that are
+#     genuinely task-agnostic.
+# Re-register by adding them back to _GENERAL_RULES; both functions are untouched above.
+_PARKED_RULES = (_rule_sink_faucet_est, _rule_est_bump)
+
+# TASK-SPECIFIC rules -- each gated on exactly one task (by name or a single-entry tuple).
+# NOTE the two per-task re-grasp copies are RETIRED: _rule_regrasp_recovery subsumes
+# drawer_regrasp_recovery and pil_regrasp_recovery via the width ladder.
+_TASK_RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
                _rule_mixer_est_floor, _rule_coffee_m2_est,
                _rule_coffee_split_release, _rule_coffee_split_reach_grasp, _rule_coffee_grasp_est,
                _rule_ppc2c_skip_failed, _rule_ppc2c_extra_carry, _rule_ppc2c_grasp_est,
@@ -1933,7 +1945,9 @@ if not os.environ.get("SYS2_RULES_NO_EXP"):
     _RULES = _RULES + tuple(_EXP_RULES)
 
 # Tasks with task-SPECIFIC rules. _rule_repeat_cap additionally applies to EVERY task.
-TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave", "TurnOnSinkFaucet",
+# TurnOnSinkFaucet drops off: its only rules were the now-parked sink_faucet_est and est_bump.
+# TurnOnMicrowave stays because microwave_again is text-gated and its task name matches.
+TASKS_WITH_RULES = ("PickPlaceDrawerToCounter", "TurnOnMicrowave",
                     "OpenStandMixerHead", "CoffeeSetupMug", "PickPlaceCounterToCabinet",
                     "GetToastedBread", "WashFruitColander",
                     "StackBowlsCabinet (plan mode)", "WeighIngredients",
