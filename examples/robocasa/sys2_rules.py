@@ -157,11 +157,14 @@ MAX_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_SUBGOAL", "3"))
 REACH_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_REACH", "2"))
 # How many END-OF-PLAN cap declines to tolerate before force-stopping the episode as "max_cap".
 # An episode that trips the cap with nothing left to advance into is effectively dead: measured over
-# the two 1500-episode v2 sweeps, episodes with >=3 such declines succeeded 6/400 (qwen35) and 7/302
-# (qwen3vl) -- 1.5% and 2.3%, against ~65% for episodes that never trip it. Stopping at 3 costs 0.40%
-# / 0.47% of the run and reclaims ~2100 turns; stopping at 1 would cost 0.93% / 1.80%, which is why
-# the default is 3 and not 1.
-MAX_CAP_DECLINES = int(os.environ.get("SYS2_RULES_MAX_CAP_DECLINES", "3"))
+# the two 1500-episode v2 sweeps, such episodes succeed 1.5-2.3% of the time against ~65% for episodes
+# that never trip it. The DEFAULT 4 gives SIX executed attempts on the terminal subgoal (3 inside the
+# cap plus 3 executed declines; the stopping turn itself runs no System1 segment). Measured cost of
+# that cut, stir excluded: 5 wins on qwen35 (0.33%) and 5 on qwen3vl (0.33%) -- the episodes that
+# needed a 7th attempt. Tightening to 3 declines / 5 attempts would cost qwen3vl 7 wins (0.47%) by
+# additionally losing TurnOnSinkFaucet ep01 and WashFruitColander ep10, and stopping at the FIRST
+# decline would cost 0.93% / 1.80%. Six is the setting the session owner chose.
+MAX_CAP_DECLINES = int(os.environ.get("SYS2_RULES_MAX_CAP_DECLINES", "4"))
 # A RETRACT terminal step gets NO declines at all: it stops the moment the cap is exceeded, i.e. 3
 # executed attempts rather than 5. A retract either latches immediately or never -- measured over the
 # two 1500-episode sweeps, retract-terminal loops beyond 3 repeats number 240 episodes on qwen35 and 82
@@ -545,7 +548,7 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
         #
         # NOTE ON COUNTING: the stopping turn runs NO System1 segment (combined_eval sets s1=None and
         # breaks), so the number of EXECUTED attempts is cap + limit, not cap + limit + 1:
-        #     ordinary terminal step   3 in-cap + 2 declines = 5 executed, stop on the 6th S2 turn
+        #     ordinary terminal step   3 in-cap + 3 declines = 6 executed, stop on the 7th S2 turn
         #     retract terminal step    3 in-cap + 0 declines = 3 executed, stop on the 4th S2 turn
         _retract = bool(_RETRACT_TERMINAL_RE.match(n))
         limit = MAX_CAP_DECLINES_RETRACT if _retract else MAX_CAP_DECLINES
