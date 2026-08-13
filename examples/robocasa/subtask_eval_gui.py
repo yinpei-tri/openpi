@@ -848,13 +848,10 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
     <summary style="cursor:pointer;font-size:15px;font-weight:700;color:#b0431c">▸ Ablation tag legend — what each method-name token means (click to expand)</summary>
     <div id="tagdoc-body" style="margin-top:10px;font-size:13px;line-height:1.55"></div>
   </details>
-  <h2>#0 COMBINED System2+System1 <span style="font-size:11px;color:#888;font-weight:400">— closed-loop hierarchical rollouts (/combine) · success, wall-clock, and full-benchmark ETA</span></h2>
+  <h2>#0 COMBINED System2+System1 <span style="font-size:11px;color:#888;font-weight:400">— closed-loop hierarchical rollouts (/combine) · ranked best → worst · rate and #success/#episodes, overall and per split</span></h2>
   <div id="cmbdebug" style="font-size:11px;margin:0 0 4px"></div>
   <div id="cmbtab" style="overflow-x:auto"></div>
-  <div id="cmbsplit" style="overflow-x:auto;margin-top:8px"></div>
-  <div style="color:#888;font-size:11px;margin-top:-4px">success rate by target split; overall = the
-    three splits combined. Hover a cell for the underlying #success/#episodes and s/ep — the counts
-    are tabulated in #0b below.</div>
+  <div id="cmbsplit" style="overflow-x:auto"></div>
   <h2>#0b Per-task COMBINED success <span style="font-size:11px;color:#888;font-weight:400">— task × method · #successful / #episodes (hover for % and s/ep) · OVERALL row = the three splits combined, then per-split totals and their tasks</span></h2>
   <div id="cmbtask" style="overflow-x:auto"></div>
   <h2>#2 Episode success rate <span style="font-size:11px;color:#888;font-weight:400">— % (n episodes)</span></h2>
@@ -937,13 +934,21 @@ function renderTagDoc(){
   h+='<div style="color:#888;font-size:12px;margin-top:6px">granularity/verbosity (<code>granfine</code>, <code>verbsimp</code>) describe the subgoal text source; all current runs use fine+simple.</div>';
   box.innerHTML=h;
 }
-// Hidden-by-default methods. Two kinds, both of which would otherwise sit beside a finished
-// 1000-episode cold run and invite a false comparison:
-//   debug-*   throwaway runs (small n, often unfinished)
-//   *-memory  the memory VARIANT (narrate -> recipe -> warm plan); a different pipeline, not a
-//             different checkpoint, so comparing it row-by-row with the cold runs is misleading.
-// Both stay LOADED and one checkbox away -- only the default view is filtered.
-const isDebugMethod=m=>/^debug-/i.test(String(m||''))||/-memory$/i.test(String(m||''));
+// Hidden-by-default methods: debug-* only (throwaway runs, small n, often unfinished), which would
+// otherwise sit beside a finished 1000-episode cold run and invite a false comparison. They stay
+// LOADED and one checkbox away -- only the default view is filtered.
+//
+// *-memory used to be hidden here too, on the argument that the memory VARIANT (narrate -> recipe ->
+// warm plan) is a different PIPELINE rather than a different checkpoint, so a row-by-row comparison
+// with the cold runs misleads. It is shown again by request: the variant is a first-class result, and
+// the row is labelled "[memory]" in the /combine picker so the distinction is still visible. The
+// caveat stands when reading the table -- a memory row and a cold row differ by pipeline, not by
+// checkpoint.
+const isDebugMethod=m=>/^debug-/i.test(String(m||''));
+// The memory VARIANT (narrate -> recipe -> warm plan). Its own toggle in #0, default ON: it is a real
+// result, but it is a different PIPELINE (not a different checkpoint) and is usually run on a single
+// split, so its overall is not comparable with a cold run's -- hence the ability to drop it.
+const isMemoryMethod=m=>/-memory$/i.test(String(m||''));
 const pct=v=>v==null?'–':(100*v).toFixed(1)+'%';
 const f4=v=>v==null?'–':(+v).toFixed(4);
 async function load(){
@@ -1057,68 +1062,104 @@ async function load(){
     // 1000-episode runs inviting a false comparison. They stay LOADED and one click away, but are
     // hidden by default. Re-rendering on toggle keeps #0 and #0b consistent, since both derive
     // their method list from `ms` below.
+    // Two INDEPENDENT toggles, because the two kinds of run are hidden for different reasons:
+    //   debug-*   throwaway runs (small n, often unfinished) -- default OFF, their rate is noise.
+    //   *-memory  the memory VARIANT (narrate -> recipe -> warm plan). A different PIPELINE, not a
+    //             different checkpoint, and it is typically run on one split only, so its "overall"
+    //             is not comparable with a cold run's overall. Default ON (it is a real result), but
+    //             one click removes it when comparing cold runs head to head.
     const ALL=Object.keys(C);
     const DBG=ALL.filter(isDebugMethod);
-    if(window._showDebug===undefined)window._showDebug=false;   // default OFF
-    const ms=ALL.filter(m=>window._showDebug||!isDebugMethod(m));
+    const MEM=ALL.filter(isMemoryMethod);
+    if(window._showDebug===undefined)window._showDebug=false;    // default OFF
+    if(window._showMemory===undefined)window._showMemory=true;   // default ON
+    const ms=ALL.filter(m=>(window._showDebug||!isDebugMethod(m))
+                        && (window._showMemory||!isMemoryMethod(m)));
     const dbgBar=document.getElementById('cmbdebug');
-    if(dbgBar)dbgBar.innerHTML = DBG.length
-      ? `<label style="cursor:pointer;color:#888"><input type="checkbox" id="cmbdbgcb" `
-        +`${window._showDebug?'checked':''} style="margin-right:4px">show ${DBG.length} debug-* `
-        +`run${DBG.length>1?'s':''}</label>`
-      : '';
+    if(dbgBar){
+      const boxes=[];
+      if(DBG.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px">`
+        +`<input type="checkbox" id="cmbdbgcb" ${window._showDebug?'checked':''} `
+        +`style="margin-right:4px">show ${DBG.length} debug-* run${DBG.length>1?'s':''}</label>`);
+      if(MEM.length)boxes.push(`<label style="cursor:pointer;color:#888">`
+        +`<input type="checkbox" id="cmbmemcb" ${window._showMemory?'checked':''} `
+        +`style="margin-right:4px">show ${MEM.length} *-memory run${MEM.length>1?'s':''} `
+        +`<span style="color:#aaa">(different pipeline)</span></label>`);
+      dbgBar.innerHTML=boxes.join('');
+    }
     const cb=document.getElementById('cmbdbgcb');
     if(cb)cb.onchange=()=>{window._showDebug=cb.checked; load();};
+    const mcb=document.getElementById('cmbmemcb');
+    if(mcb)mcb.onchange=()=>{window._showMemory=mcb.checked; load();};
+    // Guard on EITHER kind being hidden: with only *-memory runs present and its box unticked,
+    // DBG.length alone would be 0 and the page would claim there are no runs at all.
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
-      '<span style="color:#888">'+(DBG.length
-        ? 'Only hidden runs present (debug-* / *-memory) — tick the box above to see them.'
+      '<span style="color:#888">'+((DBG.length||MEM.length)
+        ? 'Only hidden runs present (debug-* / *-memory) — tick a box above to see them.'
         : 'No combined runs yet — see /combine.')+'</span>';return;}
-    // NOTE: keep the header and the row below in 1:1 correspondence. The row used to omit the
-    // `errors` cell while the header declared it, which silently shifted every later column one to
-    // the left (terminations rendered under "ETA 8 GPU"). The terminations breakdown is now a
-    // tooltip on the errors cell instead of its own column -- it was wide, monospaced and pushed
-    // the numeric columns off screen.
-    let h="<table class=cmbmain><tr><th class='exp'>method</th><th>episodes</th><th>success</th><th>rate</th>"
-      +"<th>avg s/ep</th><th>avg turns</th><th>errors</th><th>total</th><th>ETA serial</th><th>ETA 8 GPU</th></tr>";
-    ms.sort().forEach(m=>{const v=C[m], b=v.bench||{};
-      const tt=Object.entries(v.terminations||{}).sort((a,b2)=>b2[1]-a[1])
-                 .map(([k,n])=>`${k}: ${n}`).join(' · ');
-      h+=`<tr><td class='exp'>${mName2(m)}</td><td>${v.n}</td><td>${v.n_success}</td>`
-        +`<td><b>${pct(v.rate)}</b></td><td>${v.avg_seconds??'–'}</td><td>${v.avg_turns??'–'}</td>`
-        +`<td title="terminations — ${tt||'n/a'}">${v.n_error??'–'}</td>`
-        +`<td>${v.total_seconds!=null?(v.total_seconds/60).toFixed(1)+' min':'–'}</td>`
-        +`<td>${b.eta_serial_h!=null?b.eta_serial_h+' h':'–'}</td>`
-        +`<td><b>${b.eta_8gpu_h!=null?b.eta_8gpu_h+' h':'–'}</b></td></tr>`;});
-    h+="</table><div style='color:#888;font-size:11px;margin-top:3px'>ETA extrapolates the measured "
-      +"mean episode time to all "+(ms.length?(C[ms[0]].bench||{}).episodes:0)+" benchmark episodes "
-      +"(50 tasks × ~506); 8-GPU column assumes one full stack per GPU. "
-      +"errors = episodes that threw (counted in n, never successful); hover it for the "
-      +"termination breakdown (env_success / task_finish / max_turns / no_subgoal / error). "
-      +"Source: eval_results/combine_results/*.json via scripts/extract_combine_results.py.</div>";
-    document.getElementById('cmbtab').innerHTML=h;
-    // per-split breakdown
+    // ONE table: overall + per-split, RANKED best -> worst by overall rate.
+    //
+    // Previously this was two tables (overall/timing, then per-split rates), which meant reading a
+    // method's headline number in one and its split breakdown in another, with the rows in
+    // alphabetical order so the best run was wherever its name happened to sort. Merged and ranked.
+    //
+    // DROPPED COLUMNS: errors / total / ETA serial / ETA 8 GPU. The ETAs extrapolated a measured
+    // mean to a 25,307-episode benchmark that is not the denominator anyone uses now (the manifest
+    // is 1500), and `total` was wall-clock for the sweep, which is an operational number rather than
+    // a result. `errors` is preserved as a tooltip on the rate cell together with the termination
+    // breakdown, so nothing is actually lost -- it is just no longer taking a numeric column.
+    //
+    // EVERY cell carries BOTH the percentage and the #success/#episodes it came from: a bare rate is
+    // unreadable when the denominators differ across methods (1500 vs 320 vs 20) and across splits
+    // (540 vs 480), which is exactly the situation here.
     const sp=['atomic_seen','composite_seen','composite_unseen','other'];
-    let h2="<table><tr><th class='exp'>method</th><th>overall</th>"
-      +sp.map(x=>`<th>${x.replace('_','-')}</th>`).join('')+"</tr>";
-    // Rate only -- this table is for comparing rates across splits at a glance. The raw
-    // success/episode counts live in #0b (split-total rows + OVERALL), and stay in the tooltip here.
+    // Only show a split column some method actually has episodes for ('other' is normally empty).
+    const spShown=sp.filter(x=>ms.some(m=>((C[m].per_split||{})[x]||{}).n));
+    // overall = the three splits combined, summed from per_split so it is always consistent with the
+    // cells beside it (a partial sweep can fill the splits unevenly).
+    const overallOf=m=>{const P=C[m].per_split||{}; let on=0,os=0;
+      for(const x of sp){const b=P[x]; if(!b||!b.n)continue; on+=b.n; os+=(b.n_success??b.s??0);}
+      return on?{n:on,n_success:os,rate:os/on}:null;};
+    // Rank on the top-level rate, falling back to the split-derived one.
+    const rateOf=m=>{const v=C[m]; if(v&&v.rate!=null)return v.rate;
+      const o=overallOf(m); return o?o.rate:-1;};
+    const ranked=ms.slice().sort((a,b)=>rateOf(b)-rateOf(a));
+    // Named cellSp, NOT cell: #0b below declares its own `cell` in this same block scope, and a
+    // duplicate `const` is a SyntaxError that kills the whole script -- the page then hangs forever
+    // on "loading stats..." because load() never runs.
     const cellSp=(b,bold)=>{
       if(!b||!b.n)return '<td style="color:#ccc">–</td>';
       const ok=b.n_success??b.s??0, r=b.rate!=null?b.rate:ok/b.n;
-      return `<td title="${ok}/${b.n} · ${b.avg_seconds??'?'}s/ep"${bold?' style="font-weight:700;background:#eef2fb"':''}>`
-        +`${pct(r)}</td>`;};
-    ms.sort().forEach(m=>{const P=C[m].per_split||{};
-      // "overall" = the three splits combined. Summed from per_split (not read off the top-level
-      // record) so the column is always consistent with the cells beside it, including for a
-      // partial sweep where the splits are unevenly filled.
-      let on=0,os=0,osec=0,osn=0;
-      for(const x of sp){const b=P[x]; if(!b||!b.n)continue;
-        on+=b.n; os+=(b.n_success??b.s??0);
-        if(typeof b.avg_seconds==='number'){osec+=b.avg_seconds*b.n; osn+=b.n;}}
-      const ov=on?{n:on,n_success:os,rate:os/on,avg_seconds:osn?+(osec/osn).toFixed(2):null}:null;
-      h2+=`<tr><td class='exp'>${mName2(m)}</td>`+cellSp(ov,true)
-        +sp.map(x=>cellSp(P[x],false)).join('')+`</tr>`;});
-    document.getElementById('cmbsplit').innerHTML=h2+"</table>";
+      return `<td title="${b.avg_seconds!=null?b.avg_seconds+'s/ep':''}"`
+        +`${bold?' style="background:#eef2fb"':''}>`
+        +`<b>${pct(r)}</b><br><span style="color:#888;font-size:11px">${ok}/${b.n}</span></td>`;};
+    let h="<table class=cmbmain><tr><th>#</th><th class='exp'>method</th><th>overall</th>"
+      +spShown.map(x=>`<th>${x.replace('_','-')}</th>`).join('')
+      +"<th>avg s/ep</th><th>avg turns</th></tr>";
+    ranked.forEach((m,i)=>{const v=C[m], P=v.per_split||{};
+      const tt=Object.entries(v.terminations||{}).sort((a,b2)=>b2[1]-a[1])
+                 .map(([k,n])=>`${k}: ${n}`).join(' · ');
+      // Prefer the top-level record for the overall cell (it is what the extractor computed over
+      // every episode); fall back to the split sum when a method predates per_split.
+      const ov=(v.rate!=null&&v.n)?{n:v.n,n_success:v.n_success,rate:v.rate,
+                                    avg_seconds:v.avg_seconds}:overallOf(m);
+      h+=`<tr><td style="color:#888">${i+1}</td><td class='exp'>${mName2(m)}</td>`
+        +`<td title="errors: ${v.n_error??0} · terminations — ${tt||'n/a'}"`
+        +` style="background:#eef2fb">`
+        +`<b>${pct(ov?ov.rate:null)}</b><br><span style="color:#888;font-size:11px">`
+        +`${ov?ov.n_success:'?'}/${ov?ov.n:'?'}</span></td>`
+        +spShown.map(x=>cellSp(P[x],false)).join('')
+        +`<td>${v.avg_seconds??'–'}</td><td>${v.avg_turns??'–'}</td></tr>`;});
+    h+="</table><div style='color:#888;font-size:11px;margin-top:3px'>Ranked best → worst by overall "
+      +"success rate. Every cell shows the rate above and the #success/#episodes it was computed "
+      +"from — denominators differ between methods (a finished 1500-episode sweep vs a partial run) "
+      +"and between splits, so the counts are what make the rates comparable. overall = the three "
+      +"splits combined. Hover the overall cell for the error count and the termination breakdown "
+      +"(env_success / task_finish / max_turns / no_subgoal), and a split cell for its s/ep. "
+      +"Per-task counts are in #0b below. "
+      +"Source: eval_results/combine_results/*.json via scripts/extract_combine_results.py.</div>";
+    document.getElementById('cmbtab').innerHTML=h;
+    document.getElementById('cmbsplit').innerHTML='';
     // #0b per-task matrix: rows = tasks grouped by split, cols = methods.
     const order={atomic_seen:0,composite_seen:1,composite_unseen:2,other:3};
     const info={};
@@ -1132,12 +1173,15 @@ async function load(){
       return `<td title="${(100*r).toFixed(1)}% · ${b.avg_seconds??'?'}s/ep" `
         +`style="background:rgba(46,139,61,${(0.10+0.5*r).toFixed(2)})">`
         +`${b.n_success}<span style="color:#888">/${b.n}</span></td>`;};
+    // Method COLUMNS follow #0's ranking (left = best overall), not alphabetical order, so a task's
+    // row reads in the same left-to-right order as the summary table above it. `ranked` is the exact
+    // array #0 rendered, so the two tables can never disagree.
     let h3="<table class=cmbtask><tr><th class='exp'>task</th>"
-      +ms.map(m=>`<th>${mName2(m)}</th>`).join('')+"</tr>";
+      +ranked.map(m=>`<th>${mName2(m)}</th>`).join('')+"</tr>";
     // OVERALL row first: the three splits combined, summed from per_split so it always agrees with
     // the split-total rows below it (and with a partial sweep's uneven splits).
     h3+=`<tr><td class='exp' style="background:#cdd8ee;font-weight:700">OVERALL</td>`
-      +ms.map(m=>{const P=C[m].per_split||{};
+      +ranked.map(m=>{const P=C[m].per_split||{};
         let n=0,s=0,sec=0,sn=0;
         for(const x of ['atomic_seen','composite_seen','composite_unseen','other']){
           const b=P[x]; if(!b||!b.n)continue;
@@ -1150,9 +1194,9 @@ async function load(){
       const rows=tasks.filter(t=>info[t]===sp);
       if(!rows.length)return;
       h3+=`<tr><td class='exp' style="background:#dfe6f5;font-weight:700">${sp.replace('_','-')}</td>`
-        +ms.map(m=>cell((C[m].per_split||{})[sp])).join('')+`</tr>`;
+        +ranked.map(m=>cell((C[m].per_split||{})[sp])).join('')+`</tr>`;
       rows.forEach(t=>{h3+=`<tr><td class='exp' style="padding-left:14px">${t}</td>`
-        +ms.map(m=>cell((C[m].per_task||{})[t])).join('')+`</tr>`;});
+        +ranked.map(m=>cell((C[m].per_task||{})[t])).join('')+`</tr>`;});
     });
     document.getElementById('cmbtask').innerHTML=h3+"</table>";
   })();
@@ -2196,7 +2240,11 @@ COMBINE_HTML = """<!doctype html><meta charset=utf-8>
  .nav button:disabled{opacity:.4;cursor:default}
  .nav button:not(:disabled):hover{background:#f0f3fa}
  .pos{font-family:ui-monospace,monospace;font-size:12px;color:#555;min-width:96px}
- .epsum{font-size:12px;color:#666;margin-left:auto;font-family:ui-monospace,monospace}
+ /* Method name + episode summary sit together at the right end of the header bar. margin-left:auto
+    lives on .epmeth (the FIRST of the pair) so the two stay adjacent instead of being pushed apart. */
+ .epmeth{font-size:12px;color:#b0431c;font-weight:700;margin-left:auto;
+         font-family:ui-monospace,monospace}
+ .epsum{font-size:12px;color:#666;font-family:ui-monospace,monospace}
  /* ---- track: one segment per turn, width ~ steps executed ---- */
  #track{margin-top:6px}
  .lane{display:flex;align-items:center;gap:8px;margin-top:3px}
@@ -2309,6 +2357,7 @@ COMBINE_HTML = """<!doctype html><meta charset=utf-8>
       <span class=pos id=pos></span>
       <button id=next>next &rsaquo;</button>
     </span>
+    <span class=epmeth id=epmethod title="the run these rollouts came from (the method dropdown above)"></span>
     <span class=epsum id=epsum></span>
   </div>
   <div id=track></div>
@@ -2342,7 +2391,9 @@ async function loadMethods(){
   // whole point of /combine -- they just must not be the DEFAULT selection, which would silently
   // open a 2-episode throwaway instead of a real sweep. So: keep every option, sort debug last,
   // and default to the first non-debug method.
-  const isDbg=m=>/^debug-/i.test(String(m||''))||/-memory$/i.test(String(m||''));
+  // debug-* sorts last and is never the default selection; *-memory is a first-class run and sorts
+  // with the rest (it keeps its "[memory]" tag below so the different pipeline stays visible).
+  const isDbg=m=>/^debug-/i.test(String(m||''));
   const ordered=ms.slice().sort((a,b)=>(isDbg(a.method)?1:0)-(isDbg(b.method)?1:0));
   $('#method').innerHTML=ordered.map(m=>`<option value="${m.method}">${/-memory$/i.test(m.method)?'[memory] ':isDbg(m.method)?'[debug] ':''}${m.method} (${m.n_success??'?'}/${m.n_episodes??'?'})</option>`).join('');
   if(!ms.length){$('#left').innerHTML='<div class=card><span class=muted>No combined runs under eval_results/combine yet.</span></div>';return;}
@@ -2407,6 +2458,10 @@ async function selectEpisode(i){
   const hasMem=!!(d.plan||{}).memory;
   S.turns=(hasMem?[{kind:'memory'}]:[]).concat([{kind:'plan'}],
     (d.turns||[]).map(t=>({kind:'exec',...t})));
+  // Method name in front of the episode summary: with several sweeps in the dropdown it is otherwise
+  // easy to read a rollout and forget WHICH run it belongs to (the dropdown scrolls out of view once
+  // the turn track and video are open). Taken from S.method, i.e. the run actually loaded.
+  $('#epmethod').textContent=S.method?`${S.method} ·`:'';
   $('#epsum').textContent=`${d.task_name} · ${d.episode_success?'SUCCESS':'FAIL'} · ${d.n_turns} turns · ${d.termination} · ${d.seconds}s`;
   drawTrack();
   selectTurn(0);
@@ -2710,7 +2765,8 @@ async function renderExec(t){
   };
   S.fps=(s1.video_raw&&s1.video_raw.fps)||20;
   $('#right').innerHTML=
-   `<div class=card><h3>System1 input<span id=promptpos>${esc(s1.stop_reason)}</span></h3>
+   `<div class=card><h3>System1 input<span id=promptpos>${esc(s1.stop_reason)}</span>${ruleBadge(T)}</h3>
+      ${ruleWhy(T)}
       <div class=sg>${esc(s1.prompt_text)}</div>
       <div class=kv>
         <span class=pill>est_length ${s1.est_length}</span>
@@ -2990,6 +3046,63 @@ function gotoStep(i){
 
 
 // The plan a turn was HANDED (i.e. the previous turn's plan_after, or the initial plan for turn 0).
+// WHY the instruction System1 got differs from what System2 asked for. Collapsed by default -- the
+// prompt itself is what you normally read -- and revealed by the badge in the card's top-right corner.
+// The state is global and persisted, so paging through turns keeps it open once you have opened it.
+// Every override is recorded per turn (rule / kind / detail / before / after) and ``detail`` carries
+// the rule's own reasoning, so it is shown verbatim. A DECLINED rule is included: one that saw a
+// problem and chose NOT to act (repeat_cap with no next step) is otherwise invisible.
+window.SHOW_RULE_WHY = (localStorage.getItem('showRuleWhy')==='1');
+function toggleRuleWhy(){
+  window.SHOW_RULE_WHY=!window.SHOW_RULE_WHY;
+  localStorage.setItem('showRuleWhy', window.SHOW_RULE_WHY?'1':'0');
+  selectTurn(S.ti);          // re-render the current turn in place
+}
+function _ruleIvs(T){
+  const R=T.rules||{}; if(!R.enabled) return [];
+  return (R.interventions||[]).filter(i=>i&&i.rule);
+}
+function ruleBadge(T){
+  const ivs=_ruleIvs(T); const R=T.rules||{};
+  const eff=(R.effective||{}).subgoal, s2=(T.s2||{}).subgoal;
+  const changed = eff!=null && s2!=null && eff!==s2;
+  if(!ivs.length && !changed) return '';
+  const col = changed?'#0a7d33':'#6b7280';
+  const lbl = (changed?'overridden':'rule') + (ivs.length>1?(' x'+ivs.length):'');
+  // Its OWN element, NOT inside #promptpos: the rollout scrubber does
+  //     document.getElementById('promptpos').textContent = 'step N .. replan@M'
+  // on every frame, which silently wiped the badge the moment the video rendered.
+  return `<span class=pill id=rulebadge title="click to show the rules that applied"
+    style="float:right;cursor:pointer;margin-right:8px;border-color:${col};color:${col}"
+    onclick="toggleRuleWhy()">${lbl} ${window.SHOW_RULE_WHY?'&#9652;':'&#9662;'}</span>`;
+}
+function ruleWhy(T){
+  if(!window.SHOW_RULE_WHY) return '';
+  const ivs=_ruleIvs(T); const R=T.rules||{};
+  const eff=(R.effective||{}).subgoal, s2=(T.s2||{}).subgoal;
+  const changed = eff!=null && s2!=null && eff!==s2;
+  if(!ivs.length && !changed) return '';
+  const col=k=>/declin|exempt/.test(k||'')?'#6b7280':(/^tx_/.test(k||'')?'#b0431c':'#0a7d33');
+  // UNIVERSAL rules run on every task; the rest are gated on this task alone. Worth distinguishing
+  // at a glance, because "repeat_cap fired" and "a task rule fired" mean very different things.
+  const UNIV=['repeat_cap','est_bump','est_resolve','sink_faucet_est','microwave_again',
+              'flag_retract_emitted','retract_emitted_despite_plan'];
+  // Keep it to ONE short line per rule: the reason strings carry a long justification after ": " or
+  // " -- ", which belongs on hover, not on screen.
+  const brief=d=>{const t=String(d||'').split(' -- ')[0].split(': ')[0];
+                  return t.length>84?t.slice(0,84)+'\u2026':t;};
+  const rows=ivs.map(i=>`<div style="margin-top:2px;line-height:1.35">
+      <span class=pill style="border-color:${col(i.kind)};color:${col(i.kind)}">${esc(i.kind)}</span>
+      <span class=k>${esc(i.rule)}</span>
+      <span class=muted style="font-size:11px">${UNIV.includes(i.rule)?'general':'task'}</span>
+      <span title="${esc(String(i.detail||''))}">&mdash; ${esc(brief(i.detail))}</span></div>`).join('');
+  return `<div class=kv style="display:block;background:#faf7f2;border:1px solid #e6ddd0;
+      border-radius:6px;padding:5px 8px;margin-bottom:6px;font-size:12px">
+    ${changed?`<div class=muted>System2 asked: <b>${esc(s2)}</b></div>`:''}
+    ${R.tx_label?`<div class=muted>rule-injected turn &middot; ${esc(R.tx_label)}</div>`:''}
+    ${rows}</div>`;
+}
+
 function planBefore(t){
   // A PLAN-MODE rule can replace System2's checklist before the exec loop starts, so on turn 0 the
   // plan HANDED IN is the forced one -- doc.plan.plan stays the faithful record of what System2

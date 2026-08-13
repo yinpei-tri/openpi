@@ -155,6 +155,13 @@ MAX_CONSEC_SKIPS = 2
 MAX_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_SUBGOAL", "3"))
 # Tighter cap for a pure "reach to/for X": positioning either converges quickly or not at all.
 REACH_SAME_SUBGOAL = int(os.environ.get("SYS2_RULES_MAX_SAME_REACH", "2"))
+# How many END-OF-PLAN cap declines to tolerate before force-stopping the episode as "max_cap".
+# An episode that trips the cap with nothing left to advance into is effectively dead: measured over
+# the two 1500-episode v2 sweeps, episodes with >=3 such declines succeeded 6/400 (qwen35) and 7/302
+# (qwen3vl) -- 1.5% and 2.3%, against ~65% for episodes that never trip it. Stopping at 3 costs 0.40%
+# / 0.47% of the run and reclaims ~2100 turns; stopping at 1 would cost 0.93% / 1.80%, which is why
+# the default is 3 and not 1.
+MAX_CAP_DECLINES = int(os.environ.get("SYS2_RULES_MAX_CAP_DECLINES", "3"))
 # OpenStandMixerHead est_length floor. est_length is a POLICY CONDITIONING tag (rendered into
 # System1's prompt as "Estimated Length"), not only a budget multiplier -- see _rule_mixer_est_floor.
 MIXER_EST_FLOOR = int(os.environ.get("SYS2_RULES_MIXER_EST_FLOOR", "75"))
@@ -205,7 +212,14 @@ def bump_est(est):
     return next((b for b in EST_BUCKETS if b > est), est)
 
 
-_REACH_RE = re.compile(r"^reach\s+(to|for)\b")
+# Positioning/transport moves, which get the TIGHTER repeat cap (REACH_SAME_SUBGOAL). The name is
+# historical -- it started as reach-only. CARRY was added because the same argument applies: moving
+# an object from A to B either converges or it does not, and re-issuing it is not effort
+# accumulation the way stirring or pressing a door is. "lift and carry ..." is included for the
+# same reason -- it is the identical motion with a lift prefix, and excluding it would make the cap
+# depend on System2's wording (3022 turns say "carry ...", another 1420 say "lift and carry ...").
+# Still EXCLUDES "reach and grasp ..." -- there the grasp is the real work and must not be rushed.
+_REACH_RE = re.compile(r"^(reach\s+(to|for)|(lift\s+and\s+)?carry)\b")
 
 
 # --------------------------------------------------------------------------------------------
@@ -465,7 +479,12 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
     # cabinet door" -- 14 repeats -- while "push the right cabinet door closed" sat untouched.
     # Matches "reach to"/"reach for" only, NOT compounds like "reach and grasp the kettle", where
     # the grasp is the real work.
-    cap = REACH_SAME_SUBGOAL if _REACH_RE.match(n) else MAX_SAME_SUBGOAL
+    # Name the cap that is actually in force, not just the general one: a pure reach is capped at
+    # REACH_SAME_SUBGOAL and reporting it as MAX_SAME_SUBGOAL produced the nonsense "repeat #3 >
+    # MAX_SAME_SUBGOAL=3" in the audit trail, which reads as if a non-reach had been mis-classified.
+    _is_reach = bool(_REACH_RE.match(n))
+    cap = REACH_SAME_SUBGOAL if _is_reach else MAX_SAME_SUBGOAL
+    _capname = "REACH_SAME_SUBGOAL" if _is_reach else "MAX_SAME_SUBGOAL"
     if count <= cap:
         return {}
     if "stir" in n:
@@ -479,10 +498,54 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
     cur_id = current_fine_id(plan)
     idx = next((i for i, (_, f) in enumerate(flat) if f["fid"] == cur_id), None)
     if idx is None or idx + 1 >= len(flat):
+        # NO NEXT FINE STEP. That used to end the rule, on the reasoning that advancing would strand
+        # System2 -- but System2 unrolls fine steps ONE MILESTONE AT A TIME, so the last unrolled step
+        # is routinely NOT the end of the plan. Measured on the qwen35 v2 sweep: of 2879 such declines,
+        # 636 (47 episodes) had a later unfinished MILESTONE sitting right there, and those episodes
+        # succeeded 1/47. ArrangeBreadBasket ep0 is the type case: 16 declines and 19 turns burnt on
+        # "continue to pull the left cabinet door open" while M2..M7 were still pending.
+        _num = lambda mid: int(re.sub(r"[^0-9]", "", mid) or 0)
+        cur_b = next((b for b, f in flat if f["fid"] == cur_id), None) if idx is not None else \
+            next((b for b in blocks if b["mark"] == "~"), next((b for b in blocks if b["mark"] == " "), None))
+        later = [b for b in blocks
+                 if cur_b is not None and _num(b["mid"]) > _num(cur_b["mid"]) and b["mark"] != "x"]
+        if later and cur_b is not None:
+            # Close the current milestone so System2 unrolls the NEXT one. The subgoal is left alone:
+            # this turn still executes (skipping freezes the env), and System2 sees the [x] next turn
+            # and proposes a step from the following milestone.
+            for f in cur_b["fine"]:
+                f["mark"] = "x"
+            cur_b["mark"] = "x"
+            # Reset the repeat counter: the checklist has moved on, so the next turn starts a fresh
+            # count. This also BOUNDS the branch -- without it, re-applying the rules to the revised
+            # plan would find the next bare milestone and close that one too, walking the whole plan.
+            state["rep_n"] = 1
+            return {"plan": _render(blocks), "requery_s2": True,
+                    "interventions": [{"rule": "repeat_cap", "kind": "milestone_closed",
+                                       "detail": f"repeat #{count} and no next fine step, but "
+                                                 f"{later[0]['mid']} is still pending -- closing "
+                                                 f"{cur_b['mid']} and re-asking System2, so this turn "
+                                                 "runs ITS next-milestone subgoal instead of the "
+                                                 "exhausted one",
+                                       "before": f"{cur_b['mid']} [{cur_b['mark']}]",
+                                       "after": f"{cur_b['mid']} [x], next {later[0]['mid']}"}]}
+        # TRULY the end of the plan: nothing to advance into, so the loop cannot be broken by moving
+        # the checklist. Tolerate MAX_CAP_DECLINES of them, then stop the episode rather than burn the
+        # remaining turn budget on a step that is not converging.
+        n_dec = state["rep_declines"] = state.get("rep_declines", 0) + 1
+        if n_dec >= MAX_CAP_DECLINES:
+            return {"stop_episode": True,
+                    "interventions": [{"rule": "repeat_cap", "kind": "max_cap",
+                                       "detail": f"repeat #{count}, decline #{n_dec} at the END of "
+                                                 f"the plan (MAX_CAP_DECLINES={MAX_CAP_DECLINES}) -- "
+                                                 "no step or milestone left to advance into, so the "
+                                                 "episode is stopped instead of running to max_turns",
+                                       "before": subgoal, "after": "STOP (max_cap)"}]}
         return {"interventions": [{"rule": "repeat_cap", "kind": "cap_declined",
-                                   "detail": f"repeat #{count} but no next fine step exists -- "
-                                             "advancing would strand System2 with nothing to "
-                                             "propose (see TurnOnMicrowave retract finding)",
+                                   "detail": f"repeat #{count}, decline #{n_dec} of "
+                                             f"{MAX_CAP_DECLINES} -- no next fine step AND no later "
+                                             "milestone; advancing would strand System2 (see the "
+                                             "TurnOnMicrowave retract finding)",
                                    "before": subgoal, "after": subgoal}]}
     _, cur_f = flat[idx]
     _, nxt_f = flat[idx + 1]
@@ -496,7 +559,7 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
     return {"plan": _render(blocks), "subgoal": new_sg, "subgoal_detail": new_sg,
             "interventions": [
                 {"rule": "repeat_cap", "kind": "plan_revised",
-                 "detail": f"repeat #{count} > MAX_SAME_SUBGOAL={MAX_SAME_SUBGOAL}: marked "
+                 "detail": f"repeat #{count} > {_capname}={cap}: marked "
                            f"{cur_f['fid']} done, advanced to {nxt_f['fid']}",
                  "before": f"{cur_f['fid']}: {cur_f['text']}",
                  "after": f"{nxt_f['fid']}: {nxt_f['text']}"},
@@ -1710,7 +1773,8 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
     # resolved against other proposals: it is an explicit "run exactly this long", so the LAST rule
     # to set it wins and there is nothing to reconcile.
     cur = {"plan": plan, "subgoal": subgoal, "subgoal_detail": subgoal_detail, "est": est,
-           "skip_s1": False, "tx_label": None, "force_steps": 0}
+           "skip_s1": False, "tx_label": None, "force_steps": 0,
+           "stop_episode": False, "requery_s2": False}
     ivs: list[dict] = []
     est_proposals: list[tuple] = []
     for fn in _RULES:
@@ -1725,7 +1789,8 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
             # proposal. They are resolved once, below, by taking the largest.
             est_proposals.append((r["est_proposal"], r["interventions"][0]["rule"]
                                   if r.get("interventions") else "?"))
-        for k in ("plan", "subgoal", "subgoal_detail", "skip_s1", "tx_label", "force_steps"):
+        for k in ("plan", "subgoal", "subgoal_detail", "skip_s1", "tx_label", "force_steps",
+                  "stop_episode", "requery_s2"):
             if k in r:
                 cur[k] = r[k]
         if cur["skip_s1"]:

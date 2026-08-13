@@ -1100,6 +1100,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             skip_s1 = False
             tx_label = None
             force_steps = 0
+            rr_stop = False
+            s2_requery = None          # the SECOND System2 response, when a rule asked for one
             if args.task_rules:
                 rr = SR.apply_rules(task_name, plan=plan, subgoal=subgoal,
                                     subgoal_detail=sg_detail, est=est, state=rule_state)
@@ -1112,12 +1114,50 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 # quiescence fires immediately and the segment ends while the toaster is still
                 # running. Only a rule can know a subgoal is a wait, hence the channel.
                 force_steps = int(rr.get("force_steps") or 0)
+                rr_stop = bool(rr.get("stop_episode"))
                 rule_ivs = rr["interventions"]
                 if rule_ivs:
                     ep_rule_log.append({"turn": turn, "interventions": rule_ivs})
                     for _iv in rule_ivs:
                         print(f"  RULE [{_iv['kind']}] {_iv['rule']}: "
                               f"{_iv['before']} -> {_iv['after']}", flush=True)
+
+            # -- RULE RE-QUERY: the plan moved on, so ask System2 again THIS turn ---------------
+            # repeat_cap closed a stuck milestone because there was no next fine step to advance into.
+            # Re-running the exhausted subgoal would waste the turn, so System2 is asked again with the
+            # revised checklist and ITS new subgoal is what System1 executes. One extra S2 call (~2-4s)
+            # and at most ONE per turn: the rule resets its repeat counter when it closes a milestone,
+            # so the re-applied rules cannot ask again and walk the whole plan.
+            if args.task_rules and rr.get("requery_s2"):
+                _t2 = time.perf_counter()
+                if turn == 0:
+                    s2_requery = s2_client.exec_first(instruction, plan,
+                                                      tdir / "s2_input_scene_full.png")
+                    s2_user = S2C.user_exec_first(instruction, plan)
+                else:
+                    s2_requery = s2_client.exec_turn(instruction, plan, prev_clip_path,
+                                                     prev_clip_frames, task_status, grip_status)
+                    s2_user = S2C.user_exec_turn(instruction, plan, task_status, grip_status)
+                ep_timings["s2_exec"].append(time.perf_counter() - _t2)
+                s2_prev, s2 = s2, s2_requery
+                judge = s2.get("judge")
+                subgoal = (s2.get("subgoal") or "").strip()
+                sg_detail = (s2.get("subgoal_detail") or "").strip()
+                est = s2.get("estimated_step")
+                plan = S2C.apply_plan_update(plan, s2.get("plan_update"))
+                s2_subgoal, s2_sg_detail, s2_est, s2_plan = subgoal, sg_detail, est, plan
+                rr = SR.apply_rules(task_name, plan=plan, subgoal=subgoal,
+                                    subgoal_detail=sg_detail, est=est, state=rule_state)
+                plan, subgoal, sg_detail, est = (rr["plan"], rr["subgoal"],
+                                                 rr["subgoal_detail"], rr["est"])
+                skip_s1, tx_label = rr["skip_s1"], rr.get("tx_label")
+                force_steps = int(rr.get("force_steps") or 0)
+                rr_stop = bool(rr.get("stop_episode"))
+                rule_ivs = rule_ivs + rr["interventions"]
+                if rr["interventions"]:
+                    ep_rule_log.append({"turn": turn, "requery": True,
+                                        "interventions": rr["interventions"]})
+                print(f"  RULE re-queried System2 after the milestone close -> {subgoal!r}", flush=True)
 
             turn_rec: dict = {
                 "turn": turn, "dir": tdir.name,
@@ -1128,6 +1168,11 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                     "thought": s2.get("thought"), "judge": judge, "judge_raw": s2.get("judge_raw"),
                     # PRE-rule: what System2 itself emitted (see s2_* capture above).
                     "plan_update": s2.get("plan_update"), "estimated_step": s2_est,
+                    # Set when a rule closed a milestone and System2 was asked again the same turn:
+                    # this is the FIRST (superseded) response; the block around it is the second.
+                    "superseded_by_requery": ({"subgoal": s2_prev.get("subgoal"),
+                                               "response_raw": s2_prev.get("raw")}
+                                              if s2_requery is not None else None),
                     "subgoal": s2_subgoal, "subgoal_detail": s2_sg_detail,
                     "latency_s": s2.get("latency_s"), "usage": s2.get("usage"),
                     "nframes_requested": s2.get("nframes"),
@@ -1154,6 +1199,22 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 _write_json(tdir / "turn.json", turn_rec)
                 doc["turns"].append({k: turn_rec[k] for k in ("turn", "dir", "plan_after")}
                                     | {"judge": judge, "subgoal": None, "n_steps": 0})
+                turn += 1
+                break
+            # -- RULE STOP: the repeat cap gave up on a loop it cannot break --------------------
+            # A rule asked to end the episode. Today only repeat_cap does, when the same subgoal has
+            # been re-issued past the cap AND there is no next fine step and no later milestone to
+            # advance into, MAX_CAP_DECLINES times over. Such an episode is effectively dead --
+            # measured over two 1500-episode sweeps it succeeded 1.5% / 2.3% of the time, against ~65%
+            # for episodes that never trip the cap -- so the remaining turn budget is better not spent.
+            # Recorded as its OWN termination ("max_cap"), never as max_turns, so the two are always
+            # distinguishable in the results.
+            if rr_stop:
+                term = "max_cap"
+                turn_rec["s1"] = None
+                _write_json(tdir / "turn.json", turn_rec)
+                doc["turns"].append({k: turn_rec[k] for k in ("turn", "dir", "plan_after")}
+                                    | {"judge": judge, "subgoal": subgoal, "n_steps": 0})
                 turn += 1
                 break
             if not subgoal:
