@@ -1071,31 +1071,54 @@ async function load(){
     const ALL=Object.keys(C);
     const DBG=ALL.filter(isDebugMethod);
     const MEM=ALL.filter(isMemoryMethod);
+    // MANIFEST SIZE, the third toggle. The eval set grew from 50x20=1000 episodes to 50x30=1500 (the
+    // leaderboard denominator), and runs of both sizes sit in this table. Their overalls are not the
+    // same measurement: the 1500 set CONTAINS the 1000 set as its first 20 episodes per task, so an
+    // old run's rate is computed on a subset and ranking the two together silently compares a rate on
+    // 1000 episodes with a rate on 1500. Default view is the 1500-episode runs only.
+    //
+    // Detected from the DATA, not from the method name: no 20-per-task run can have a task with more
+    // than 20 episodes, so max-per-task > 20 identifies the 1500 manifest even for a sweep that is
+    // only part-way through. debug-* runs are exempt -- they are tiny by design and already behind
+    // their own opt-in box, so this filter would hide them a second time for the wrong reason.
+    const maxTaskN=m=>{const pt=(C[m]||{}).per_task||{}; let x=0;
+      for(const t in pt){const n=pt[t].n||0; if(n>x)x=n;} return x;};
+    const isEval30=m=>maxTaskN(m)>20;
+    const OLD=ALL.filter(m=>!isEval30(m)&&!isDebugMethod(m));
     if(window._showDebug===undefined)window._showDebug=false;    // default OFF
     if(window._showMemory===undefined)window._showMemory=true;   // default ON
+    if(window._show1000===undefined)window._show1000=false;      // default OFF -- 1500 runs only
     const ms=ALL.filter(m=>(window._showDebug||!isDebugMethod(m))
-                        && (window._showMemory||!isMemoryMethod(m)));
+                        && (window._showMemory||!isMemoryMethod(m))
+                        && (window._show1000||isEval30(m)||isDebugMethod(m)));
     const dbgBar=document.getElementById('cmbdebug');
     if(dbgBar){
       const boxes=[];
       if(DBG.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px">`
         +`<input type="checkbox" id="cmbdbgcb" ${window._showDebug?'checked':''} `
         +`style="margin-right:4px">show ${DBG.length} debug-* run${DBG.length>1?'s':''}</label>`);
-      if(MEM.length)boxes.push(`<label style="cursor:pointer;color:#888">`
+      if(MEM.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px">`
         +`<input type="checkbox" id="cmbmemcb" ${window._showMemory?'checked':''} `
         +`style="margin-right:4px">show ${MEM.length} *-memory run${MEM.length>1?'s':''} `
         +`<span style="color:#aaa">(different pipeline)</span></label>`);
+      if(OLD.length)boxes.push(`<label style="cursor:pointer;color:#888">`
+        +`<input type="checkbox" id="cmb1000cb" ${window._show1000?'checked':''} `
+        +`style="margin-right:4px">show ${OLD.length} 1000-episode run${OLD.length>1?'s':''} `
+        +`<span style="color:#aaa">(20/task; the 1500 set is 30/task)</span></label>`);
       dbgBar.innerHTML=boxes.join('');
     }
     const cb=document.getElementById('cmbdbgcb');
     if(cb)cb.onchange=()=>{window._showDebug=cb.checked; load();};
     const mcb=document.getElementById('cmbmemcb');
     if(mcb)mcb.onchange=()=>{window._showMemory=mcb.checked; load();};
+    const ocb=document.getElementById('cmb1000cb');
+    if(ocb)ocb.onchange=()=>{window._show1000=ocb.checked; load();};
     // Guard on EITHER kind being hidden: with only *-memory runs present and its box unticked,
     // DBG.length alone would be 0 and the page would claim there are no runs at all.
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
-      '<span style="color:#888">'+((DBG.length||MEM.length)
-        ? 'Only hidden runs present (debug-* / *-memory) — tick a box above to see them.'
+      '<span style="color:#888">'+((DBG.length||MEM.length||OLD.length)
+        ? 'Only hidden runs present (debug-* / *-memory / 1000-episode) — tick a box above to see '
+          +'them.'
         : 'No combined runs yet — see /combine.')+'</span>';return;}
     // ONE table: overall + per-split, RANKED best -> worst by overall rate.
     //
@@ -1157,6 +1180,10 @@ async function load(){
       +"splits combined. Hover the overall cell for the error count and the termination breakdown "
       +"(env_success / task_finish / max_turns / no_subgoal), and a split cell for its s/ep. "
       +"Per-task counts are in #0b below. "
+      +"By default only runs on the 1500-episode manifest (30 episodes per task) are listed; the "
+      +"older 1000-episode runs (20 per task, the same episodes as the first 20 of each task) are one "
+      +"click away above — their rates are computed on a subset, so ranking them beside a 1500-run is "
+      +"a comparison of two different denominators. "
       +"Source: eval_results/combine_results/*.json via scripts/extract_combine_results.py.</div>";
     document.getElementById('cmbtab').innerHTML=h;
     document.getElementById('cmbsplit').innerHTML='';
