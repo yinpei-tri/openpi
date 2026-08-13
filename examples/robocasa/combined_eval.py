@@ -1301,9 +1301,14 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
 
             # RAW rollout video (every executed step, 20 fps) — what actually happened.
             _t = time.perf_counter()
-            # SAVED at display resolution (128x384). The model never reads this file; it exists so
-            # the GUI player can scrub one frame per executed step.
-            raw_info = (S2C.write_clip(S2C.downscale(frames), tdir / "s1_rollout_raw.mp4",
+            # SAVED AT FULL CAPTURED RESOLUTION (TILE_HW, 256x768 = 3 cameras of 256x256 hstacked),
+            # i.e. NO downscale. This file is for HUMAN inspection in the GUI, and 128x384 was too
+            # coarse for what it is most used for: telling a held object from a dropped one. The model
+            # never reads it -- System2's input is the separate 4-fps clip below, already at TILE_HW.
+            # Cost measured on the v2 sweep: downscaled files averaged 56 KB, ~1.1 GB per 1500-episode
+            # run; at 4x the pixels expect ~3 GB. SYS2_RAW_VIDEO_DOWNSCALE=1 restores the small copies.
+            _raw = S2C.downscale(frames) if os.environ.get("SYS2_RAW_VIDEO_DOWNSCALE") else frames
+            raw_info = (S2C.write_clip(_raw, tdir / "s1_rollout_raw.mp4",
                                        fps=S2C.SIM_FPS) if frames else None)
             # CONDENSED 4-fps clip = exactly what System2 sees next turn. Static frames are
             # dropped for motion subgoals and KEPT for wait/hold subgoals.
