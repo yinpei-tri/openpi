@@ -1618,18 +1618,164 @@ def _rule_pil_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -
     return r
 
 
-_RULES = (_rule_drawer_base_align, _rule_strip_retract_plan, _rule_flag_retract_emitted,
-          _rule_microwave_again, _rule_repeat_cap, _rule_sink_faucet_est,
-          _rule_est_bump, _rule_mixer_est_floor, _rule_coffee_m2_est,
-          # GRADUATED (see the tables above)
-          _rule_coffee_split_release, _rule_coffee_split_reach_grasp, _rule_coffee_grasp_est,
-          _rule_ppc2c_skip_failed, _rule_ppc2c_extra_carry, _rule_ppc2c_grasp_est,
-          _rule_drawer_regrasp_recovery, _rule_wfc_skip_carry_continue,
-          _rule_gtb_wait_force_steps, _rule_gtb_slot_est,
-          _rule_wi_extra_carry_turn, _rule_wi_reach_locate,
-          # The reach continuation acts BEFORE the grasp, the recovery after it; they key on
-          # different fine steps and different state, so neither consumes the other's budget.
-          _rule_pil_reach_continue, _rule_pil_regrasp_recovery)
+# =============================================================================================
+# GENERAL: width-gated re-grasp recovery, for EVERY task.
+#
+# Generalised from two graduated per-task copies (_rule_pil_regrasp_recovery, PackIdenticalLunches
+# 2/20 -> 8/20; _rule_drawer_regrasp_recovery, part of PickPlaceDrawerToCounter 14/20 -> 19/20) plus a
+# PreSoakPan port. The mechanism is not task-specific: if the fingers closed on nothing, the object was
+# never held or was dropped, and one re-grasp is the cheapest possible recovery.
+#
+# WHAT IT KEYS ON. state["grip_width"] is the aperture |q[14]-q[15]| left by the PREVIOUS segment, so
+# it reads the PHYSICAL outcome rather than System2's text. Below REGRASP_MISS_WIDTH the fingers are
+# closed on nothing (~0.001) as opposed to closed on an object (~0.02-0.06) or open (~0.0799).
+#
+# THE OFFSET WINDOW IS 1-2 TURNS, and both matter: measured over the qwen35 v2 sweep, offset 0 is
+# HEALTHY in the cases that fail -- the object is grasped, then lost during the NEXT segment (the lift
+# or the carry). So a check at the grasp turn itself sees nothing wrong. Beyond +2 the episode has
+# moved on and a re-grasp is spent from the wrong pose.
+#     offset 1 -> "<step> again"                 est floor REGRASP_NEAR_EST (75)
+#     offset 2 -> "reach and grasp X again"      est floor REGRASP_FAR_EST (125)
+# The far form must travel back before closing, hence the higher floor. Both are floors resolved as
+# max(floor, the failed grasp's OWN est, System2's est for this turn) -- the grasp est is remembered
+# when the step is first seen, because "at least what this object needed the first time" is a statement
+# about the object, whereas the current turn's est describes whatever System2 is doing now.
+# Empirical basis (v2, n=2028 grasp / 530 reach-and-grasp segments): grasp est median 50 / p90 75,
+# consuming 46 steps median; reach-and-grasp est median 100 / p90 150, consuming 100. Only 1.1-1.7% of
+# these segments are budget-bound, so the floors change System1's CONDITIONING far more than its
+# runtime.
+#
+# SKIP LIST -- objects whose CORRECT end state is a thin or open gripper, so the width test cannot
+# distinguish success from failure. Measured medians at offset +1: mug 0.0109, cup 0.0078, smaller bowl
+# 0.0163, spatula 0.0173, straw 0.0129, basket 0.0148, shrimp 0.0152 -- all below the bar while held.
+# Door and drawer HANDLES and stove KNOBS read 0.078-0.079 for the opposite reason: the gripper
+# legitimately reopens once the handle has been turned, so "closed on nothing" is their normal
+# post-condition (the PreSoakPan faucet finding).
+# Matched with \b...\b word boundaries, NOT substrings: "straw" must not catch strawberry (0.0419,
+# thick) and "pot" must not catch potato (0.0523) or sweet potato (0.0361).
+# Measured effect over 2558 recorded grasp turns: 1258 skipped (49%), 1300 monitored, and just 5 false
+# positives (0.2%) -- sponge x2, chicken drumstick, croissant, broccoli, all compressible foods that no
+# name list can fix.
+#
+# ONE injection per grasp STEP (keyed per fid), so several grasps in one episode each get their own
+# recovery rather than the first consuming the only budget. Borrowed turn: the plan is never modified,
+# System2's subgoal is held and resumed, its own "grasp X again" re-issues count against the same
+# budget, and the turn is labelled tx_sg_failed.
+#
+# WHAT THIS CANNOT DO, on the record: on ScrubCuttingBoard the per-task version recovered the sponge
+# outright (0.0010 -> 0.0648) and all three episodes still died in an untouched retract loop. A
+# recovery only converts an episode when the grasp is what was failing.
+# =============================================================================================
+
+_REGRASP_RE = re.compile(r"^(reach\s+and\s+)?grasp\b", re.IGNORECASE)
+_REGRASP_BARE_RE = re.compile(r"^grasp\b", re.IGNORECASE)
+_REGRASP_REACH_RE = re.compile(r"^reach\s+and\s+grasp\b", re.IGNORECASE)
+# Fingers closed below this = closed on nothing. Same bar as the two graduated per-task copies.
+REGRASP_MISS_WIDTH = float(os.environ.get("SYS2_RULES_REGRASP_MISS_WIDTH", "0.015"))
+REGRASP_WINDOW = int(os.environ.get("SYS2_RULES_REGRASP_WINDOW", "2"))
+REGRASP_NEAR_EST = int(os.environ.get("SYS2_RULES_REGRASP_NEAR_EST", "75"))
+REGRASP_FAR_EST = int(os.environ.get("SYS2_RULES_REGRASP_FAR_EST", "125"))
+# Set SYS2_RULES_REGRASP_SKIP to override (comma list), or to "" to monitor every object.
+_REGRASP_SKIP_WORDS = tuple(w.strip() for w in os.environ.get(
+    "SYS2_RULES_REGRASP_SKIP",
+    "mug,ice cube,handle,chocolate,cup,lemon,ladle,sugar cube,tupperware,yogurt,bell pepper,bowl,"
+    "mushroom,pot,colander,dish brush,cheese stick,spoon,shrimp,kettle,basket,teapot,pitcher,"
+    "straw,knob,spatula,container").split(",") if w.strip())
+_REGRASP_SKIP_RE = (re.compile(r"\b(" + "|".join(re.escape(w) for w in _REGRASP_SKIP_WORDS) + r")\b",
+                               re.IGNORECASE) if _REGRASP_SKIP_WORDS else None)
+
+
+def regrasp_skipped(text: str | None) -> bool:
+    """True if this grasp target is one whose held width is legitimately below the bar."""
+    return bool(_REGRASP_SKIP_RE and _REGRASP_SKIP_RE.search(text or ""))
+
+
+def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """ALL tasks: one injected re-grasp per grasp step whose fingers closed on nothing."""
+    state["rg_turn"] = turn = state.get("rg_turn", 0) + 1
+    step = _target_step(plan, None, _REGRASP_RE)
+    if step is not None:
+        if regrasp_skipped(step["text"]):
+            return {}
+        fid = step["fid"]
+        if current_fine_id(plan) == fid or step["mark"] == "~":
+            state["rg_active_fid"] = fid
+            state[f"rg_{fid}_gturn"] = turn
+            # Remember the est the FAILED grasp asked for: the retry should get at least that.
+            if isinstance(est, int) and est > 0:
+                state[f"rg_{fid}_gest"] = est
+    else:
+        fid = state.get("rg_active_fid")
+        if not fid:
+            return {}
+    key = f"rg_{fid}"
+    gturn = state.get(f"{key}_gturn")
+    offset = (turn - gturn) if gturn is not None else None
+    far = offset is not None and offset >= 2
+
+    def _missed() -> bool:
+        # PHASE-2 gate: grip_width is the previous segment's aperture, so during the grasp turn itself
+        # it is still the open value from the reach and an up-front check could never fire.
+        w = state.get("grip_width")
+        if w is None or w >= REGRASP_MISS_WIDTH:
+            return False
+        return gturn is not None and 1 <= (turn - gturn) <= REGRASP_WINDOW
+
+    def _extra(t: str) -> str:
+        """offset 1 -> "<step> again"; offset 2 -> "reach and grasp X again" (must travel back)."""
+        if not far or _REGRASP_REACH_RE.match(t):
+            return f"{t} again"
+        return f"{_REGRASP_BARE_RE.sub('reach and grasp', t, count=1)} again"
+
+    r = _inject_after_step(
+        key, plan, subgoal, state, None, _REGRASP_RE,
+        extra_fn=_extra, rule="regrasp_recovery",
+        tx_label="tx_sg_failed", phase2_gate=_missed, max_injections=1,
+        missing_means_done=True,
+        why=lambda: f"gripper width {state.get('grip_width'):.4f} < {REGRASP_MISS_WIDTH} -- the fingers "
+                    f"are closed on nothing {turn - state[f'{key}_gturn']} turn(s) after {fid}, so the "
+                    "object was never held or was dropped"
+                    + (" (the arm has moved on: reach back first)" if far else ""))
+    if any(iv.get("kind") == "tx_sg_failed" for iv in r.get("interventions", [])):
+        floor = max(REGRASP_FAR_EST if far else REGRASP_NEAR_EST, state.get(f"{key}_gest") or 0)
+        r["est_proposal"] = floor
+        r["interventions"].append(
+            {"rule": "regrasp_recovery", "kind": "est_proposed",
+             "detail": f"{'reach-back' if far else 'in-place'} recovery at offset {offset}: est floor "
+                       f"{floor} = max({REGRASP_FAR_EST if far else REGRASP_NEAR_EST}, "
+                       f"grasp est {state.get(f'{key}_gest')})",
+             "before": est, "after": floor})
+    return r
+
+
+# GENERAL rules -- not gated on a single task name. They run FIRST, in this order.
+#   regrasp_recovery   every task, gated on the gripper width it observes
+#   repeat_cap         every task
+#   microwave_again    any microwave subgoal (TEXT-gated)
+#   sink_faucet_est    any faucet-handle subgoal (TEXT-gated) -- fires on 5 tasks; pooled +10/100 over
+#                      the tasks it touches, so it stays broad
+#   est_bump           a TUPLE of 3 precision tasks, so not single-task but not universal either
+#   flag_retract_emitted  record-only
+# "General" therefore means "not gated on one task name", which is the honest line to draw: two of
+# these are text-gated and one is tuple-gated. The GUI derives its general/task tag from this split
+# rather than from a hardcoded list.
+_GENERAL_RULES = (_rule_regrasp_recovery, _rule_repeat_cap, _rule_microwave_again,
+                  _rule_sink_faucet_est, _rule_est_bump, _rule_flag_retract_emitted)
+
+# TASK-SPECIFIC rules -- each gated on exactly one task name, checked as its first statement.
+# NOTE the two per-task re-grasp copies are RETIRED: _rule_regrasp_recovery above subsumes
+# drawer_regrasp_recovery and pil_regrasp_recovery, with the same width bar, the same borrowed-turn
+# machinery and the same one-injection-per-grasp-step budget.
+_TASK_RULES = (_rule_drawer_base_align, _rule_strip_retract_plan,
+               _rule_mixer_est_floor, _rule_coffee_m2_est,
+               _rule_coffee_split_release, _rule_coffee_split_reach_grasp, _rule_coffee_grasp_est,
+               _rule_ppc2c_skip_failed, _rule_ppc2c_extra_carry, _rule_ppc2c_grasp_est,
+               _rule_wfc_skip_carry_continue,
+               _rule_gtb_wait_force_steps, _rule_gtb_slot_est,
+               _rule_wi_extra_carry_turn, _rule_wi_reach_locate,
+               _rule_pil_reach_continue)
+
+_RULES = _GENERAL_RULES + _TASK_RULES
 
 # ---- PLAN-MODE rules -------------------------------------------------------------------------
 # apply_rules above runs on EXECUTION turns only. A rule that must replace the checklist System2
