@@ -949,6 +949,12 @@ const isDebugMethod=m=>/^debug-/i.test(String(m||''));
 // result, but it is a different PIPELINE (not a different checkpoint) and is usually run on a single
 // split, so its overall is not comparable with a cold run's -- hence the ability to drop it.
 const isMemoryMethod=m=>/-memory$/i.test(String(m||''));
+// The -v2 RULE ARM. Its own toggle in #0, default ON: these are real 1500-episode results, but they
+// ran the SUPERSEDED rule layer (est_bump global + sink_faucet_est, before the three-tier split), so
+// when comparing a -base control against a -inst arm head to head they are noise in the middle of the
+// ranking. One click removes them. Deliberately matches on the SUFFIX only, so a future "-v2-foo"
+// variant is not silently swept up with them.
+const isV2Method=m=>/-v2$/i.test(String(m||''));
 const pct=v=>v==null?'–':(100*v).toFixed(1)+'%';
 const f4=v=>v==null?'–':(+v).toFixed(4);
 async function load(){
@@ -1085,9 +1091,15 @@ async function load(){
       for(const t in pt){const n=pt[t].n||0; if(n>x)x=n;} return x;};
     const isEval30=m=>maxTaskN(m)>20;
     const OLD=ALL.filter(m=>!isEval30(m)&&!isDebugMethod(m));
+    const V2=ALL.filter(isV2Method);
     if(window._showDebug===undefined)window._showDebug=false;    // default OFF
     if(window._showMemory===undefined)window._showMemory=true;   // default ON
     if(window._show1000===undefined)window._show1000=false;      // default OFF -- 1500 runs only
+    // Default ON (a real result), but REMEMBERED like `refined` rather than reset on every reload:
+    // hiding the superseded arm is a comparison mode you stay in for a whole session, unlike the
+    // debug/memory boxes which you flick on to check one thing.
+    if(window._showV2===undefined)
+      window._showV2=(localStorage.getItem('cmbShowV2')!=='0');
     // REFINED: render the SAME episodes re-scored under RoboCasa's official per-task step horizon --
     // a success counts only if the env's success check fired within `horizon` cumulative env steps
     // (examples/robocasa/horizon_gate.py; precomputed per method by extract_combine_results.py).
@@ -1099,6 +1111,7 @@ async function load(){
       window._refined=(localStorage.getItem('cmbRefined')==='1');
     const ms=ALL.filter(m=>(window._showDebug||!isDebugMethod(m))
                         && (window._showMemory||!isMemoryMethod(m))
+                        && (window._showV2||!isV2Method(m))
                         && (window._show1000||isEval30(m)||isDebugMethod(m)));
     const dbgBar=document.getElementById('cmbdebug');
     if(dbgBar){
@@ -1114,6 +1127,13 @@ async function load(){
         +`<input type="checkbox" id="cmb1000cb" ${window._show1000?'checked':''} `
         +`style="margin-right:4px">show ${OLD.length} 1000-episode run${OLD.length>1?'s':''} `
         +`<span style="color:#aaa">(20/task; the 1500 set is 30/task)</span></label>`);
+      if(V2.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px" `
+        +`title="The -v2 arm ran the superseded rule layer (global est_bump + sink_faucet_est, before `
+        +`the mandatory/general/task split). Untick to compare -base against -inst without it in `
+        +`between.">`
+        +`<input type="checkbox" id="cmbv2cb" ${window._showV2?'checked':''} `
+        +`style="margin-right:4px">show ${V2.length} *-v2 run${V2.length>1?'s':''} `
+        +`<span style="color:#aaa">(superseded rule layer)</span></label>`);
       boxes.push(`<label style="cursor:pointer;color:${window._refined?'#b45309':'#888'}" `
         +`title="A success counts only if the env's success check fired within RoboCasa's official `
         +`per-task step horizon (450-4350 env steps, robocasa dataset_registry). Our loop budgets per `
@@ -1130,15 +1150,18 @@ async function load(){
     if(mcb)mcb.onchange=()=>{window._showMemory=mcb.checked; load();};
     const ocb=document.getElementById('cmb1000cb');
     if(ocb)ocb.onchange=()=>{window._show1000=ocb.checked; load();};
+    const vcb=document.getElementById('cmbv2cb');
+    if(vcb)vcb.onchange=()=>{window._showV2=vcb.checked;
+      localStorage.setItem('cmbShowV2', window._showV2?'1':'0'); load();};
     const rcb=document.getElementById('cmbrefcb');
     if(rcb)rcb.onchange=()=>{window._refined=rcb.checked;
       localStorage.setItem('cmbRefined', window._refined?'1':'0'); load();};
     // Guard on EITHER kind being hidden: with only *-memory runs present and its box unticked,
     // DBG.length alone would be 0 and the page would claim there are no runs at all.
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
-      '<span style="color:#888">'+((DBG.length||MEM.length||OLD.length)
-        ? 'Only hidden runs present (debug-* / *-memory / 1000-episode) — tick a box above to see '
-          +'them.'
+      '<span style="color:#888">'+((DBG.length||MEM.length||OLD.length||V2.length)
+        ? 'Only hidden runs present (debug-* / *-memory / *-v2 / 1000-episode) — tick a box above to '
+          +'see them.'
         : 'No combined runs yet — see /combine.')+'</span>';return;}
     // ONE table: overall + per-split, RANKED best -> worst by overall rate.
     //
@@ -2213,14 +2236,24 @@ def api_combine_methods():
     out = []
     for m in _combine_methods():
         idx = COMBINE_ROOT / m / "index.json"
+        cfg_file = COMBINE_ROOT / m / "rule_config.json"
         doc = {}
+        rule_config = None
         if idx.exists():
             try:
                 doc = json.loads(idx.read_text())
             except Exception:  # noqa: BLE001
                 doc = {}
+        if cfg_file.exists():
+            try:
+                rule_config = json.loads(cfg_file.read_text())
+            except Exception:  # noqa: BLE001 - surface the method even if metadata is torn
+                rule_config = None
+        if rule_config is None:
+            rule_config = doc.get("rule_config")
         out.append({"method": m, "n_episodes": doc.get("n_episodes"),
-                    "n_success": doc.get("n_success"), "success_rate": doc.get("success_rate")})
+                    "n_success": doc.get("n_success"), "success_rate": doc.get("success_rate"),
+                    "rule_config": rule_config})
     return jsonify(out)
 
 
@@ -2466,7 +2499,7 @@ COMBINE_HTML = """<!doctype html><meta charset=utf-8>
 </div>
 <script>
 const $=s=>document.querySelector(s);
-const S={method:null,ep:null,doc:null,ti:0,turns:[]};   // ti = index into S.turns (0 = plan)
+const S={method:null,ep:null,doc:null,ti:0,turns:[],ruleConfig:null}; // ti=0 is plan
 const esc=s=>(s==null?'':String(s)).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const jtag=j=>j?`<span class="tag j-${esc(j)}">${esc(j)}</span>`:'';
 const nn=v=>(v==null?'&ndash;':v);
@@ -2485,6 +2518,7 @@ function segClass(t){
 
 async function loadMethods(){
   const ms=await (await fetch('/api/combine/methods')).json();
+  window._combineRuleConfigs=Object.fromEntries(ms.map(m=>[m.method,m.rule_config||null]));
   // On THIS page debug-* runs stay selectable -- inspecting a debug rollout turn by turn is the
   // whole point of /combine -- they just must not be the DEFAULT selection, which would silently
   // open a 2-episode throwaway instead of a real sweep. So: keep every option, sort debug last,
@@ -2496,6 +2530,7 @@ async function loadMethods(){
   $('#method').innerHTML=ordered.map(m=>`<option value="${m.method}">${/-memory$/i.test(m.method)?'[memory] ':isDbg(m.method)?'[debug] ':''}${m.method} (${m.n_success??'?'}/${m.n_episodes??'?'})</option>`).join('');
   if(!ms.length){$('#left').innerHTML='<div class=card><span class=muted>No combined runs under eval_results/combine yet.</span></div>';return;}
   S.method=(ordered.find(m=>!isDbg(m.method))||ordered[0]).method;
+  S.ruleConfig=window._combineRuleConfigs[S.method]||null;
   $('#method').value=S.method;   // explicit: option 0 may now be a different method than S.method
   await loadEpisodes();
 }
@@ -2550,6 +2585,9 @@ function fillEpisodes(){
 async function selectEpisode(i){
   const e=window._eps[i]; S.ep=e.dir;
   S.doc=await (await fetch(`/api/combine/episode/${S.method}/${S.ep}`)).json();
+  // The method-level file is authoritative. Per-episode metadata is a fallback for copied legacy
+  // episodes whose rule_config.json was not copied with them.
+  S.ruleConfig=(window._combineRuleConfigs||{})[S.method]||S.doc.rule_config||null;
   const d=S.doc;
   // Turn list = a synthetic MEMORY step (only for the -memory variant, where System2 narrated a
   // video before planning) + a synthetic PLAN turn (System2 only) + every execution turn.
@@ -2560,7 +2598,8 @@ async function selectEpisode(i){
   // easy to read a rollout and forget WHICH run it belongs to (the dropdown scrolls out of view once
   // the turn track and video are open). Taken from S.method, i.e. the run actually loaded.
   $('#epmethod').textContent=S.method?`${S.method} ·`:'';
-  $('#epsum').textContent=`${d.task_name} · ${d.episode_success?'SUCCESS':'FAIL'} · ${d.n_turns} turns · ${d.termination} · ${d.seconds}s`;
+  const rt=S.ruleConfig&&S.ruleConfig.tier?` · rules=${S.ruleConfig.tier}`:'';
+  $('#epsum').textContent=`${d.task_name} · ${d.episode_success?'SUCCESS':'FAIL'} · ${d.n_turns} turns · ${d.termination}${rt} · ${d.seconds}s`;
   drawTrack();
   selectTurn(0);
 }
@@ -2781,7 +2820,7 @@ async function renderExec(t){
       <div class=kv style="margin-top:6px"><span class=k>plan handed in</span>
         ${t.turn===0&&(S.doc.plan||{}).plan_after_rules
           ?'<span class=pill title="a plan-mode rule replaced the System2 checklist">rule-forced</span>':''}</div>
-      <pre>${esc(planBefore(t))}</pre>
+      <pre>${esc(planBefore(t, s2))}</pre>
       ${t.turn===0&&(S.doc.plan||{}).s2_plan_before_rules
         ?`<details><summary>what System2 actually proposed (overridden)</summary>
            <pre>${esc((S.doc.plan||{}).s2_plan_before_rules)}</pre></details>`:''}
@@ -3157,8 +3196,23 @@ function toggleRuleWhy(){
   selectTurn(S.ti);          // re-render the current turn in place
 }
 function _ruleIvs(T){
-  const R=T.rules||{}; if(!R.enabled) return [];
+  const R=T.rules||{}, C=S.ruleConfig;
+  // New runs are governed by method/rule_config.json, not the historical task_rules bit. This is
+  // what makes mandatory-only and general-only interventions visible. Old runs fall back to the
+  // per-turn enabled field because they have no method-level configuration.
+  if(C){
+    if(!(C.mandatory_rules||C.general_rules||C.task_rules))return [];
+  }else if(!R.enabled)return [];
   return (R.interventions||[]).filter(i=>i&&i.rule);
+}
+function configuredRuleTier(rule){
+  const A=(S.ruleConfig||{}).active_rules||{};
+  if((A.mandatory||[]).includes(rule))return 'mandatory';
+  if((A.general||[]).includes(rule))return 'general';
+  if((A.task||[]).includes(rule)||(A.task_plan||[]).includes(rule)
+      ||(A.task_action||[]).includes(rule))return 'task';
+  if(rule==='est_resolve')return 'resolver';
+  return 'task';
 }
 function ruleBadge(T){
   const ivs=_ruleIvs(T); const R=T.rules||{};
@@ -3181,10 +3235,6 @@ function ruleWhy(T){
   const changed = eff!=null && s2!=null && eff!==s2;
   if(!ivs.length && !changed) return '';
   const col=k=>/declin|exempt/.test(k||'')?'#6b7280':(/^tx_/.test(k||'')?'#b0431c':'#0a7d33');
-  // UNIVERSAL rules run on every task; the rest are gated on this task alone. Worth distinguishing
-  // at a glance, because "repeat_cap fired" and "a task rule fired" mean very different things.
-  const UNIV=['repeat_cap','est_bump','est_resolve','sink_faucet_est','microwave_again',
-              'flag_retract_emitted','retract_emitted_despite_plan'];
   // Keep it to ONE short line per rule: the reason strings carry a long justification after ": " or
   // " -- ", which belongs on hover, not on screen.
   const brief=d=>{const t=String(d||'').split(' -- ')[0].split(': ')[0];
@@ -3192,7 +3242,7 @@ function ruleWhy(T){
   const rows=ivs.map(i=>`<div style="margin-top:2px;line-height:1.35">
       <span class=pill style="border-color:${col(i.kind)};color:${col(i.kind)}">${esc(i.kind)}</span>
       <span class=k>${esc(i.rule)}</span>
-      <span class=muted style="font-size:11px">${UNIV.includes(i.rule)?'general':'task'}</span>
+      <span class=muted style="font-size:11px">${configuredRuleTier(i.rule)}</span>
       <span title="${esc(String(i.detail||''))}">&mdash; ${esc(brief(i.detail))}</span></div>`).join('');
   return `<div class=kv style="display:block;background:#faf7f2;border:1px solid #e6ddd0;
       border-radius:6px;padding:5px 8px;margin-bottom:6px;font-size:12px">
@@ -3201,10 +3251,25 @@ function ruleWhy(T){
     ${rows}</div>`;
 }
 
-function planBefore(t){
+function planBefore(t, s2){
   // A PLAN-MODE rule can replace System2's checklist before the exec loop starts, so on turn 0 the
   // plan HANDED IN is the forced one -- doc.plan.plan stays the faithful record of what System2
   // itself proposed, and showing that here misreported what System1/System2 actually received.
+  // Deriving this from the PREVIOUS turn's plan_after is wrong whenever a rule revised the checklist
+  // and re-queried System2 WITHIN this turn -- repeat_cap's milestone close and coffee_skip_failed both
+  // do. The call that produced this turn's response saw the REVISED plan. Observed on
+  // ArrangeBreadBasket ep0 t4: the panel showed "M1 [~] / M1.2 [~]" while the prompt actually sent
+  // said "M1 [x] / M1.2 [x]".
+  //
+  // Three sources, best first:
+  //   1. s2.plan_in -- recorded explicitly by combined_eval (new runs).
+  //   2. the checklist parsed out of s2.user_prompt -- the prompt IS the ground truth of what System2
+  //      received, and it is present in every run ever recorded, so this repairs old results too.
+  //   3. the turn-1 derivation, for a turn whose prompt was not captured.
+  if(s2&&s2.plan_in)return s2.plan_in;
+  const up=(s2&&s2.user_prompt)||'';
+  const m=up.match(/Here's where the plan stands:\s*\n([\s\S]*?)(?:\n\s*\n|$)/);
+  if(m&&m[1].trim())return m[1].replace(/\s+$/,'');
   if(t.turn===0){const p=S.doc.plan||{};return p.plan_after_rules||p.plan||'';}
   const prev=(S.doc.turns||[]).find(x=>x.turn===t.turn-1);
   return prev?(prev.plan_after||''):'';
@@ -3222,7 +3287,8 @@ async function selectTurn(i){
   $('#left').scrollTop=0; $('#right').scrollTop=0;
 }
 
-$('#method').onchange=async e=>{S.method=e.target.value; await loadEpisodes();};
+$('#method').onchange=async e=>{S.method=e.target.value;
+  S.ruleConfig=(window._combineRuleConfigs||{})[S.method]||null; await loadEpisodes();};
 $('#episode').onchange=e=>selectEpisode(+e.target.value);
 $('#tasktype').onchange=()=>fillTasks();
 $('#task').onchange=()=>fillEpisodes();

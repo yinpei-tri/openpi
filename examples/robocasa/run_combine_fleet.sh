@@ -63,8 +63,8 @@ cd "$OPENPI_REPO"
 METHOD=${METHOD:-progreg}                  # progreg | progact  (which System1 head)
 EPISODES=${EPISODES:-0}                    # per-task episode spec, e.g. "0", "0-9", "0,5,10"
 TASKS=${TASKS:-}                           # explicit comma list; overrides TASK_SET
-USE_EVAL_SET=${USE_EVAL_SET:-0}            # 1 = use the 1000-episode manifest inlined in
-                                           # combined_eval.TARGET_EVAL_EPISODES
+USE_EVAL_SET=${USE_EVAL_SET:-0}            # 1 = use the 1500-episode manifest inlined in
+                                           # combined_eval.TARGET_EVAL_EPISODES; TASKS filters it
 TASK_SET=${TASK_SET:-all}                  # all (the 50-task benchmark) | atomic_seen |
                                            # composite_seen | composite_unseen
 NGPU=${NGPU:-8}
@@ -96,8 +96,17 @@ RUN_LABEL=${RUN_LABEL:-}
 # UNITS_FILE supplies an explicit "<lerobot-dir> <episode>" manifest, one line per episode, and
 # bypasses worklist generation entirely -- for re-running a hand-picked set of episodes.
 UNITS_FILE=${UNITS_FILE:-}
-# TASK_RULES=1 applies the hardcoded per-task System2 revisions in sys2_rules.py. Off by default:
-# the baseline path must stay identical. Every override is recorded in the results.
+# THE THREE RULE ARMS. repeat_cap is MANDATORY and runs in all three -- it is the loop's termination
+# policy, not a revision of System2, so without it a stuck subgoal is re-issued until max_turns with
+# nothing advancing. So there is no "zero rules" arm here; the floor is repeat_cap, which is exactly
+# what the historical "-base" methods measured.
+#
+#   (neither)                     mandatory only            == the -base arm
+#   GENERAL_RULES=1               + task-agnostic rules
+#   TASK_RULES=1                  + task-agnostic AND per-task rules (implies GENERAL_RULES)
+#
+# Every override is recorded in the results, and episode.json:rule_tier names the arm.
+GENERAL_RULES=${GENERAL_RULES:-0}
 TASK_RULES=${TASK_RULES:-0}
 # Which rollout client each stack runs. The default is the cold-plan loop; combine_memory_eval.py is
 # the same loop with the narrate->recipe->warm-plan memory pass in front of it (it derives its own
@@ -182,10 +191,14 @@ def lerobot_dir(task):
     return hits[0] if hits else None
 
 if use_eval_set == "1":
-    # The 1000-episode manifest, inlined in combined_eval (no sidecar JSON). ONE line per
-    # (task, episode) so nothing is inferred from a range.
+    # The 1500-episode manifest, inlined in combined_eval (no sidecar JSON). ONE line per
+    # (task, episode) so nothing is inferred from a range. An explicit TASKS list filters the
+    # manifest, which is needed for targeted 30-episode task-rule sweeps with sparse source ids.
     from combined_eval import TARGET_EVAL_EPISODES
+    selected = {t.strip() for t in tasks_csv.split(",") if t.strip()}
     for task, episodes in TARGET_EVAL_EPISODES.items():
+        if selected and task not in selected:
+            continue
         ld = lerobot_dir(task)
         if not ld:
             missing.append(task)
@@ -319,6 +332,7 @@ for i in "${!GPULIST[@]}"; do
           --out-root "$SYS1_RESULTS_DIR/combine" --max-turns "$MAX_TURNS" \
           --max-steps-cap "$MAX_STEPS_CAP" \
           ${RUN_LABEL:+--method "$RUN_LABEL"} \
+          $([[ "$GENERAL_RULES" == 1 ]] && echo --general-rules) \
           $([[ "$TASK_RULES" == 1 ]] && echo --task-rules) \
           $([[ "$RESUME" == 1 ]] && echo --resume) \
           ${EVAL_ARGS:-} \

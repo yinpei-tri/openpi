@@ -941,6 +941,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         "episode_id": episode_id, "task_name": task_name, "instruction": instruction,
         "method": method, "eval_kind": "combine",
         "lerobot_dir": str(ld), "episode_index": ep_index,
+        "rule_config": _rule_config(args),
         "config": {
             "reset_mode": "reset_to(states[0]) from the raw LeRobot episode (no annotations)",
             "s1_port": args.s1_port, "s2_port": args.s2_port, "s2_model": args.s2_model,
@@ -1002,6 +1003,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         # during the exec loop the plan is then maintained as usual (System2's plan_update marks
         # progress), so no rule has to reconstruct the marks. episode.json["plan"]["s2_plan_before_
         # rules"] keeps what System2 actually emitted, so the override is always auditable.
+        # Every plan rule is gated on one task, so this is the TASK tier -- a general-only arm does
+        # not get it.
         if args.task_rules:
             pr = SR.apply_plan_rules(task_name, plan=plan)
             # Apply the revision whenever the plan actually changed -- NOT only when the rule also
@@ -1051,8 +1054,37 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             grip_status = _gripper_status(seg_grip_cmds) or ("close" if last_cmd_grip > 0 else "open")
 
             # -- System2: what next? --
+            # HELD TURN. A rule borrowed the PREVIOUS turn (a re-grasp, an extra carry), so the
+            # subgoal System2 proposed then has not been executed yet. There is nothing for it to
+            # judge and nothing new to decide, so it is NOT queried: the held subgoal runs against the
+            # unchanged plan, and the next real query sees the clip of THAT segment.
+            #
+            # Querying anyway was a defect, not merely a waste. The answer had to be discarded by
+            # tx_resume, but its <plan_update> was still applied -- so the checklist advanced past a
+            # step System1 had not finished, and the fine step System2 proposed was SWALLOWED:
+            # PackIdenticalLunches ep0 proposed "search for the counter" (M14.1) on the resume turn,
+            # it was thrown away, and the next turn marked M14.1 [x] though it never ran.
+            # UNCONDITIONAL: pending_resume returns None unless a rule actually borrowed the
+            # previous turn, so the gate was redundant when the whole layer was one switch -- and it
+            # became a BUG once a borrow-a-turn rule moved to the general tier. regrasp_recovery holds
+            # System2's subgoal and resumes it next turn; with this gated on --task-rules, a general-
+            # only arm would borrow the turn and then never resume, silently dropping the held subgoal
+            # and advancing the checklist past a step System1 never ran (the PackIdenticalLunches ep0
+            # failure described above, which is exactly what the hold exists to prevent).
+            held = SR.pending_resume(rule_state)
             _t = time.perf_counter()
-            if turn == 0:
+            if held:
+                s2 = {"held_by_rule": held["rule"], "subgoal": held["subgoal"],
+                      "subgoal_detail": held.get("subgoal_detail") or held["subgoal"],
+                      "estimated_step": held.get("est"), "judge": None,
+                      "thought": (f"System2 NOT queried: {held['rule']} borrowed turn {turn - 1}, so "
+                                  "the subgoal it proposed there runs now against the same plan."),
+                      "plan_update": None}
+                s2_media = {"held_by_rule": held["rule"]}
+                s2_user = None
+                plan_in = plan          # unchanged: no plan_update is applied on a held turn
+                clip_stats = None
+            elif turn == 0:
                 cur = env._get_observations(force_update=True)
                 tile0 = SE._stacked_from_obs(cur)
                 S2C.write_image(tile0, tdir / "s2_input_scene_full.png")     # what the model reads
@@ -1060,6 +1092,11 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 s2 = s2_client.exec_first(instruction, plan, tdir / "s2_input_scene_full.png")
                 s2_media = {"image": sc}
                 s2_user = S2C.user_exec_first(instruction, plan)
+                # The plan actually HANDED TO System2 for this call. Recorded because it cannot be
+                # reconstructed from the previous turn's plan_after once a rule revises the plan and
+                # re-queries within the same turn (repeat_cap's milestone close, coffee_skip_failed):
+                # the GUI used to derive "plan handed in" from turn-1 and so showed the pre-rule plan.
+                plan_in = plan
                 clip_stats = None
             else:
                 if prev_clip_path is None or not prev_clip_path.exists():
@@ -1072,10 +1109,14 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                             "clip_path": str(prev_clip_path), "clip_from_turn": turn - 1,
                             "model_res": list(S2C.TILE_HW), "display_res": list(S2C.DISPLAY_HW)}
                 s2_user = S2C.user_exec_turn(instruction, plan, task_status, grip_status)
+                plan_in = plan
             t_s2 = time.perf_counter() - _t
             ep_timings["s2_exec"].append(t_s2)
 
-            plan = S2C.apply_plan_update(plan, s2.get("plan_update"))
+            # No plan_update on a held turn -- there was no System2 call to produce one, and the plan
+            # must stay exactly as it was so the held subgoal is still the current step.
+            if not held:
+                plan = S2C.apply_plan_update(plan, s2.get("plan_update"))
             # PLAN-EXHAUSTED cutoff, re-evaluated against the LATEST plan every turn: while System2
             # keeps sitting on the last fine step the run grows; the moment it appends a new step the
             # run RESETS, because there is fresh work planned.
@@ -1084,12 +1125,18 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             sg_detail = (s2.get("subgoal_detail") or "").strip()
             est = s2.get("estimated_step")
 
-            # ---- HARDCODED PER-TASK RULES (opt-in via --task-rules) -------------------------
-            # Revise System2's output before System1 sees it. OFF by default, so the baseline
-            # path is byte-identical to a run without this module. The revised PLAN is assigned
-            # back to `plan`, which is what gets fed to every later exec_turn -- so a rule's plan
-            # edit becomes System2's context for the rest of the episode, exactly like a
-            # model-authored <plan_update>.
+            # ---- THE RULE LAYER, IN TWO TIERS -----------------------------------------------
+            # MANDATORY (repeat_cap) runs on EVERY run, with or without --task-rules: it is the
+            # loop's termination policy, not a revision of System2's output. Without it a stuck
+            # subgoal is re-issued until max_turns with nothing advancing, so a "no rules" arm
+            # would measure the harness's inability to escape a repeat rather than the model. The
+            # no-rules baseline is therefore "repeat_cap only".
+            # OPTIONAL (general + per-task + the sys2_rules_exp*.py patch layer) is what
+            # --task-rules adds, and it is off by default. Tier selection lives in apply_rules, so
+            # this call is UNCONDITIONAL and passes the flag through.
+            # The revised PLAN is assigned back to `plan`, which is what gets fed to every later
+            # exec_turn -- so a rule's plan edit becomes System2's context for the rest of the
+            # episode, exactly like a model-authored <plan_update>.
             # System2's OWN output, kept verbatim for the record. The rules below rebind
             # `subgoal`/`est`/`plan` to the EFFECTIVE values handed to System1; these three keep
             # what the model actually said, so turn.json's "s2" block never misreports the planner
@@ -1101,10 +1148,25 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             tx_label = None
             force_steps = 0
             rr_stop = False
+            # Reset per turn: a HELD turn skips the rule call below, and without this rr would still
+            # be the PREVIOUS turn's result -- a stale requery_s2 would fire a spurious second
+            # System2 call. (Latent before the mandatory tier existed, because the requery guard also
+            # tested args.task_rules; now that the guard is unconditional it would be reachable.)
+            rr: dict = {}
             s2_requery = None          # the SECOND System2 response, when a rule asked for one
-            if args.task_rules:
+            # A held turn is ALREADY a rule decision: the subgoal is the one System2 proposed last
+            # turn and a rule deferred. Re-running the rule layer over it would let the same rule that
+            # borrowed the turn look at the same plan and borrow again (its own counter guards that,
+            # but the est rules would also re-fire on a subgoal whose est was resolved a turn ago).
+            # So the rules are skipped and the held values are used verbatim.
+            if not held:
+                # Rules that act on System2's judgement (rather than merely its wording) read the
+                # current value from the shared per-episode state. Assign even when None so a stale
+                # subgoal_failed can never leak from the previous turn.
+                rule_state["judge"] = judge
                 rr = SR.apply_rules(task_name, plan=plan, subgoal=subgoal,
-                                    subgoal_detail=sg_detail, est=est, state=rule_state)
+                                    subgoal_detail=sg_detail, est=est, state=rule_state,
+                                    general=bool(args.general_rules), task_tier=bool(args.task_rules))
                 plan, subgoal, sg_detail, est = rr["plan"], rr["subgoal"], rr["subgoal_detail"], rr["est"]
                 skip_s1 = rr["skip_s1"]
                 tx_label = rr.get("tx_label")
@@ -1128,7 +1190,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             # revised checklist and ITS new subgoal is what System1 executes. One extra S2 call (~2-4s)
             # and at most ONE per turn: the rule resets its repeat counter when it closes a milestone,
             # so the re-applied rules cannot ask again and walk the whole plan.
-            if args.task_rules and rr.get("requery_s2"):
+            if rr.get("requery_s2"):
                 _t2 = time.perf_counter()
                 if turn == 0:
                     s2_requery = s2_client.exec_first(instruction, plan,
@@ -1139,6 +1201,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                                                      prev_clip_frames, task_status, grip_status)
                     s2_user = S2C.user_exec_turn(instruction, plan, task_status, grip_status)
                 ep_timings["s2_exec"].append(time.perf_counter() - _t2)
+                plan_in = plan          # the REVISED checklist is what this call was given
                 s2_prev, s2 = s2, s2_requery
                 judge = s2.get("judge")
                 subgoal = (s2.get("subgoal") or "").strip()
@@ -1146,8 +1209,10 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 est = s2.get("estimated_step")
                 plan = S2C.apply_plan_update(plan, s2.get("plan_update"))
                 s2_subgoal, s2_sg_detail, s2_est, s2_plan = subgoal, sg_detail, est, plan
+                rule_state["judge"] = judge
                 rr = SR.apply_rules(task_name, plan=plan, subgoal=subgoal,
-                                    subgoal_detail=sg_detail, est=est, state=rule_state)
+                                    subgoal_detail=sg_detail, est=est, state=rule_state,
+                                    general=bool(args.general_rules), task_tier=bool(args.task_rules))
                 plan, subgoal, sg_detail, est = (rr["plan"], rr["subgoal"],
                                                  rr["subgoal_detail"], rr["est"])
                 skip_s1, tx_label = rr["skip_s1"], rr.get("tx_label")
@@ -1164,6 +1229,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 "s2": {
                     "system_prompt": (S2C.SYS_EXEC),
                     "user_prompt": s2_user,
+                    # The checklist this System2 call actually received (post-rule on a re-query).
+                    "plan_in": plan_in,
                     "response_raw": s2.get("raw"),
                     "thought": s2.get("thought"), "judge": judge, "judge_raw": s2.get("judge_raw"),
                     # PRE-rule: what System2 itself emitted (see s2_* capture above).
@@ -1174,6 +1241,10 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                                                "response_raw": s2_prev.get("raw")}
                                               if s2_requery is not None else None),
                     "subgoal": s2_subgoal, "subgoal_detail": s2_sg_detail,
+                    # Names the rule that borrowed the PREVIOUS turn when System2 was not queried at
+                    # all this turn -- so "no user_prompt / no judge" reads as deliberate rather than
+                    # as a missing record.
+                    "held_by_rule": s2.get("held_by_rule"),
                     "latency_s": s2.get("latency_s"), "usage": s2.get("usage"),
                     "nframes_requested": s2.get("nframes"),
                     "media": s2_media,
@@ -1183,7 +1254,11 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 "plan_after": plan,
                 # Full audit trail: what System2 actually said, and every override applied to it.
                 # Empty list == no rule fired, so an unrevised turn is unambiguous.
-                "rules": {"enabled": bool(args.task_rules), "interventions": rule_ivs,
+                # New runs use the run-level rule_config.json as the source of truth. Keep this
+                # per-turn bit for old readers, but make it mean what it says: at least one tier ran.
+                "rules": {"enabled": _rules_present(args),
+                          "tier": _rule_tier(args),
+                          "interventions": rule_ivs,
                           # set when a rule INJECTED this turn rather than System2 asking for it
                           "tx_label": tx_label,
                           # What System1 was ACTUALLY given, after any override. Equal to the "s2"
@@ -1253,7 +1328,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             anchor_info = S2C.write_image(S2C.downscale([anchor_tile])[0], tdir / "s1_anchor.png")
 
             # Per-step action override for this segment (gripper pinning); {} when none applies.
-            act_override = SR.action_overrides(task_name, plan, subgoal) if args.task_rules else {}
+            act_override = SR.action_overrides(task_name, plan, subgoal,
+                                       task_tier=bool(args.task_rules))
             if act_override:
                 rule_ivs.append({"rule": "action_override", "kind": "action_override",
                                  "detail": act_override.get("why", ""),
@@ -1408,6 +1484,10 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         # roll-up the report script and the GUI read. `rule_interventions: []` with
         # `task_rules: true` means the rules were ON but nothing matched this episode.
         doc["task_rules"] = bool(args.task_rules)
+        doc["general_rules"] = bool(args.general_rules)
+        # The mandatory tier (repeat_cap) runs regardless; task_rules above is the
+        # OPTIONAL tier only. Recorded explicitly so an arm is self-describing.
+        doc["rule_tier"] = _rule_tier(args)
         doc["rule_interventions"] = ep_rule_log
         doc["n_rule_interventions"] = sum(len(t["interventions"]) for t in ep_rule_log)
         doc["episode_success"] = bool(env._check_success())
@@ -1432,6 +1512,10 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
 
     except Exception as e:
         doc["task_rules"] = bool(args.task_rules)
+        doc["general_rules"] = bool(args.general_rules)
+        # The mandatory tier (repeat_cap) runs regardless; task_rules above is the
+        # OPTIONAL tier only. Recorded explicitly so an arm is self-describing.
+        doc["rule_tier"] = _rule_tier(args)
         doc["rule_interventions"] = ep_rule_log
         doc["error"] = f"{type(e).__name__}: {e}"
         doc["traceback"] = traceback.format_exc()
@@ -1444,6 +1528,50 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             env.close()
         except Exception:
             pass
+
+
+def _rule_tier(args) -> str:
+    """Which rule tiers this run applied -- recorded so an arm is self-describing.
+
+    Three arms, matching the CLI: "mandatory" (repeat_cap only -- this is the historical '-base'
+    arm), "mandatory+general", "mandatory+general+task". A leading "none" appears only when the
+    mandatory tier was explicitly disabled with SYS2_RULES_NO_MANDATORY=1.
+    """
+    tiers = ["mandatory"] if SR.mandatory_on() else ["none"]
+    if getattr(args, "general_rules", False):
+        tiers.append("general")
+    if getattr(args, "task_rules", False):
+        tiers.append("task")
+    return "+".join(tiers)
+
+
+def _rule_config(args) -> dict:
+    """Stable, serializable configuration shared by result files and the GUI."""
+    cfg = SR.rule_config(general=bool(getattr(args, "general_rules", False)),
+                         task_tier=bool(getattr(args, "task_rules", False)))
+    return {**cfg, "tier": _rule_tier(args)}
+
+
+def _rules_present(args) -> bool:
+    cfg = _rule_config(args)
+    return bool(cfg["mandatory_rules"] or cfg["general_rules"] or cfg["task_rules"])
+
+
+def _write_run_rule_config(out_root: Path, method: str, args) -> dict:
+    """Persist the method's rule tiers and refuse to mix incompatible arms in one directory."""
+    cfg = _rule_config(args)
+    path = out_root / method / "rule_config.json"
+    if path.exists():
+        try:
+            old = json.loads(path.read_text())
+        except Exception as e:
+            raise RuntimeError(f"invalid existing rule config {path}: {e}") from e
+        if old != cfg:
+            raise RuntimeError(
+                f"rule configuration mismatch for method {method!r}: existing {old}, requested "
+                f"{cfg}. Use a distinct --method/RUN_LABEL for each evaluation arm.")
+    _write_json(path, cfg)
+    return cfg
 
 
 def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
@@ -1501,15 +1629,24 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                          "it, half of them the GetToastedBread waits that now bypass the cap. Runs at "
                          "400 ARE step-for-step comparable with the 1000-episode no-rules baseline and "
                          "are NOT comparable with the -estbump sweep, which used 800.")
+    ap.add_argument("--general-rules", action="store_true",
+                    help="add the GENERAL (task-agnostic) rule tier on top of the mandatory one. "
+                         "Implied by --task-rules, so the three arms are: no flag = mandatory only "
+                         "(repeat_cap, the '-base' arm); --general-rules = mandatory + general; "
+                         "--task-rules = mandatory + general + per-task. The general tier is "
+                         f"currently {SR.TASKS_WITH_RULES[1]}.")
     ap.add_argument("--task-rules", action="store_true",
-                    help="MASTER SWITCH for the whole sys2_rules.py layer -- despite the name it "
-                         "gates apply_rules() itself, so WITHOUT it not even the general rules that "
-                         "apply to every task run (a run launched with TASK_RULES=0 is a pure "
-                         "no-rules baseline, whatever sys2_rules._RULES contains). Which rules are "
-                         "active is decided ONLY by _RULES in that module; currently "
-                         f"{', '.join(SR.TASKS_WITH_RULES)}. Off by default so the baseline path is "
-                         "unchanged; every intervention is recorded under turn.json:rules and "
-                         "episode.json:rule_interventions.")
+                    help="add the OPTIONAL rule tiers (general + per-task + any sys2_rules_exp*.py "
+                         "patch file) on top of the MANDATORY tier. The mandatory tier -- repeat_cap "
+                         "-- runs on EVERY run whether or not this flag is given, because it is the "
+                         "loop's termination policy rather than a revision of System2's output: "
+                         "without it a stuck subgoal is re-issued until max_turns with nothing "
+                         "advancing. So the no-rules baseline is 'repeat_cap only', and this flag "
+                         "chooses between the two arms. Scope, derived from the live registry: "
+                         f"{'; '.join(SR.TASKS_WITH_RULES)}. Every intervention is recorded under "
+                         "turn.json:rules (with the tier) and episode.json:rule_interventions. To "
+                         "reproduce the historical zero-rules baseline that predates the mandatory "
+                         "tier, set SYS2_RULES_NO_MANDATORY=1 as well.")
     ap.add_argument("--default-est-length", type=int, default=50,
                     help="fallback when System2 omits/garbles <estimated_step>")
     ap.add_argument("--replan-steps", type=int, default=16)
@@ -1530,6 +1667,10 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
 
 
 def run_sweep(args, *, method_suffix: str = "") -> None:
+    # The task tier sits on top of the general tier, so --task-rules implies --general-rules.
+    # Resolved ONCE here rather than at each use, so the rule call, the recorded tier and the log
+    # line can never disagree about which arm ran.
+    args.general_rules = bool(getattr(args, "general_rules", False) or args.task_rules)
     """Connect to both servers, roll every requested episode, write the index part.
 
     Shared by ``main()`` and by plan-variant scripts: a variant only has to set ``args.plan_fn``
@@ -1541,6 +1682,10 @@ def run_sweep(args, *, method_suffix: str = "") -> None:
     if not args.method:
         args.method = _short_method_name(args.s1_dir, args.s2_dir, method_suffix)
         print(f"derived --method: {args.method}", flush=True)
+    out_root = Path(args.out_root)
+    run_rule_config = _write_run_rule_config(out_root, args.method, args)
+    print(f"rule config: {run_rule_config['tier']}  ({out_root / args.method / 'rule_config.json'})",
+          flush=True)
     norm_stats = None
     if args.norm_stats and args.norm_stats.exists():
         raw = json.loads(args.norm_stats.read_text())
@@ -1551,7 +1696,6 @@ def run_sweep(args, *, method_suffix: str = "") -> None:
                         max_tokens=args.s2_max_tokens, inline_media=not args.s2_file_uri)
     print(f"System2 server health: {s2.health()}  (model={args.s2_model})", flush=True)
 
-    out_root = Path(args.out_root)
     results = []
     for i, ep_idx in enumerate(ep_indices):
         if args.resume and _episode_done(out_root / args.method, Path(args.lerobot_dir), ep_idx):
@@ -1566,6 +1710,7 @@ def run_sweep(args, *, method_suffix: str = "") -> None:
     ok = sum(1 for r in results if r.get("episode_success"))
     idx = {
         "eval_kind": "combine", "method": args.method, "n_episodes": len(results),
+        "rule_config": run_rule_config,
         "n_success": ok,
         "success_rate": (ok / len(results)) if results else None,
         "episodes": [{k: r.get(k) for k in

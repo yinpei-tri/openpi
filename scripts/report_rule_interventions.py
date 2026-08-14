@@ -4,8 +4,8 @@ These rules override a learned planner, so a result from a rules-on run is only 
 next to an audit of the overrides: which fired, how often, and -- when a baseline is given --
 whether the episodes they touched actually got better.
 
-Reads ``episode.json`` (``rule_interventions`` / ``task_rules``), written by combined_eval when
-``--task-rules`` is on. Never infers an intervention from a name or a diff.
+Reads ``episode.json`` (``rule_interventions`` / ``rule_tier``), written by combined_eval for every
+rule configuration. Never infers an intervention from a name or a diff.
 
     python scripts/report_rule_interventions.py --method debug-...-improve
     python scripts/report_rule_interventions.py --method debug-...-improve \
@@ -39,7 +39,7 @@ def _episodes(method_dir: Path) -> dict[str, dict]:
             continue
         try:
             doc = json.loads(f.read_text())
-        except Exception:  # noqa: BLE001 - torn write
+        except Exception:  # torn write
             continue
         if doc.get("termination") and not doc.get("error"):
             out[doc.get("episode_id") or d.name] = doc
@@ -58,11 +58,16 @@ def main() -> None:
     if not eps:
         raise SystemExit(f"no complete episodes under {a.combine_root / a.method}")
 
-    on = sum(1 for d in eps.values() if d.get("task_rules"))
+    on = sum(1 for d in eps.values()
+             if d.get("rule_tier") not in (None, "none") or d.get("task_rules"))
+    tiers = collections.Counter(d.get("rule_tier") or
+                                ("legacy-task" if d.get("task_rules") else "legacy-none")
+                                for d in eps.values())
     print(f"method   : {a.method}")
-    print(f"episodes : {len(eps)} complete   ({on} ran with --task-rules)")
+    print(f"episodes : {len(eps)} complete   ({on} ran with at least one rule tier)")
+    print("tiers    : " + ", ".join(f"{k}={v}" for k, v in sorted(tiers.items())))
     if on == 0:
-        print("\nWARNING: no episode recorded task_rules=true -- the rules were NOT active.")
+        print("\nWARNING: no episode recorded an active rule tier.")
 
     # ---- what fired ----
     by_rule = collections.Counter()
@@ -89,7 +94,7 @@ def main() -> None:
     print("  by kind: " + ", ".join(f"{k}={v}" for k, v in by_kind.most_common()))
     print("\n  by task:")
     for task in sorted(by_task):
-        inner = ", ".join(f"{r}×{n}" for r, n in by_task[task].most_common())
+        inner = ", ".join(f"{r}x{n}" for r, n in by_task[task].most_common())
         print(f"    {task:28s} {inner}")
 
     # Tasks that have rules but where nothing fired are worth surfacing: usually the rule's
