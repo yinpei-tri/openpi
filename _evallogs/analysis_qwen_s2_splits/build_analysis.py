@@ -15,7 +15,7 @@ from scipy.stats import binomtest, spearmanr
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "examples" / "robocasa"))
 from combined_eval import TARGET_TASK_SPLIT  # noqa: E402
-from horizon_gate import gate_episode, total_steps  # noqa: E402
+from horizon_gate import TASK_HORIZON, gate_episode, total_steps  # noqa: E402
 
 OUT = Path(__file__).resolve().parent
 ROOT = Path("/home/ec2-user/data/sys1_eval_results/combine")
@@ -262,6 +262,34 @@ def compute_tables(episodes, turns, rules):
                         adjacent_same += norm_subgoal(a["raw_subgoal"]) == norm_subgoal(b["raw_subgoal"])
                 judges = collections.Counter(r["judge"] for r in ts)
                 terms = collections.Counter(r["termination"] for r in es)
+                midplan_cap_episode_ids = {
+                    r["episode_id"]
+                    for r in rules
+                    if r["split"] == split
+                    and r["model"] == model
+                    and r["arm"] == arm
+                    and r["rule"] == "repeat_cap"
+                    and r["kind"] in ("plan_revised", "milestone_closed")
+                }
+                failed_after_midplan_cap = sum(
+                    not r["success"] and r["episode_id"] in midplan_cap_episode_ids
+                    for r in es
+                )
+                official_step_cutoff = sum(
+                    not r["refined"]
+                    and TASK_HORIZON.get(r["task"]) is not None
+                    and r["steps"] >= TASK_HORIZON[r["task"]]
+                    for r in es
+                )
+                step_or_turn_cutoff = sum(
+                    (
+                        not r["refined"]
+                        and TASK_HORIZON.get(r["task"]) is not None
+                        and r["steps"] >= TASK_HORIZON[r["task"]]
+                    )
+                    or r["termination"] == "max_turns"
+                    for r in es
+                )
                 behavior.append(
                     {
                         "split": split,
@@ -276,6 +304,9 @@ def compute_tables(episodes, turns, rules):
                         "max_cap_rate": terms["max_cap"] / n,
                         "max_turns_rate": terms["max_turns"] / n,
                         "task_finish_rate": terms["task_finish"] / n,
+                        "failed_after_midplan_cap_rate": failed_after_midplan_cap / n,
+                        "official_step_cutoff_rate": official_step_cutoff / n,
+                        "step_or_turn_cutoff_rate": step_or_turn_cutoff / n,
                     }
                 )
         tasks = sorted({r["task"] for r in episodes if r["split"] == split})
@@ -492,13 +523,13 @@ def plot_success(split_summary):
 
 
 def grouped_distribution_plot(turns, arm, raw_field, filename, title, subtitle):
-    im, d = base_canvas(title, subtitle, width=1900, height=720)
+    im, d = base_canvas(title, subtitle, width=2200, height=800)
     legend(d, [("Qwen3-VL higher", COLORS["Qwen3-VL"], 255), ("Qwen3.5 higher", COLORS["Qwen3.5"], 255)], 1250, 32)
-    boxes = panel_boxes(im.width, 135, 625, left=85, gap=65)
+    boxes = panel_boxes(im.width, 150, 690, left=90, gap=70)
     for split, box in zip(SPLITS, boxes):
         x0, y0, x1, y1 = box
         y_for = signed_axes(d, box, 0.08, yticks=4)
-        d.text(((x0 + x1) / 2, y0 - 28), SPLIT_LABEL[split], fill="#111827", font=font(20, True), anchor="mm")
+        d.text(((x0 + x1) / 2, y0 - 30), SPLIT_LABEL[split], fill="#111827", font=font(24, True), anchor="mm")
         slot = (x1 - x0) / len(EST_BUCKETS)
         for bi, bucket in enumerate(EST_BUCKETS):
             rates = {}
@@ -513,25 +544,25 @@ def grouped_distribution_plot(turns, arm, raw_field, filename, title, subtitle):
             color = COLORS["Qwen3-VL"] if diff >= 0 else COLORS["Qwen3.5"]
             d.rectangle((cx - bw / 2, min(zero_y, value_y), cx + bw / 2, max(zero_y, value_y)), fill=rgba(color), outline=rgba(color))
             if abs(diff) >= 0.002:
-                d.text((cx, value_y + (-5 if diff >= 0 else 5)), f"{100 * diff:+.1f}", fill=rgba(color), font=font(10, True), anchor="mb" if diff >= 0 else "ma")
-            d.text((x0 + (bi + 0.5) * slot, y1 + 8), bucket, fill="#4b5563", font=font(11), anchor="ma")
-        d.text(((x0 + x1) / 2, y1 + 42), "S2 estimated length bucket · difference in percentage points", fill="#4b5563", font=font(13), anchor="mm")
+                d.text((cx, value_y + (-6 if diff >= 0 else 6)), f"{100 * diff:+.1f}", fill=rgba(color), font=font(12, True), anchor="mb" if diff >= 0 else "ma")
+            d.text((x0 + (bi + 0.5) * slot, y1 + 8), bucket, fill="#4b5563", font=font(17), anchor="ma")
+        d.text(((x0 + x1) / 2, y1 + 52), "S2 estimated length bucket · difference in percentage points", fill="#4b5563", font=font(17), anchor="mm")
     im.convert("RGB").save(OUT / filename, quality=95)
 
 
 def grouped_distribution_paired_plot(turns, arm, raw_field, filename):
     im, d = base_canvas(
-        "Base arm: raw S2 estimated-length distribution · paired values",
+        "Qwen3-VL vs. Qwen3.5 estimated_length prediction",
         "Percent of turns in each estimate bucket; distributions are normalized separately inside each split.",
-        width=1900,
-        height=720,
+        width=2200,
+        height=800,
     )
     legend(d, [(m, COLORS[m], 255) for m in COLORS], 1320, 32)
-    boxes = panel_boxes(im.width, 135, 625, left=85, gap=65)
+    boxes = panel_boxes(im.width, 150, 690, left=90, gap=70)
     for split, box in zip(SPLITS, boxes):
         x0, y0, x1, y1 = box
         axes(d, box, 0, 0.7, percent=True, yticks=7)
-        d.text(((x0 + x1) / 2, y0 - 28), SPLIT_LABEL[split], fill="#111827", font=font(20, True), anchor="mm")
+        d.text(((x0 + x1) / 2, y0 - 30), SPLIT_LABEL[split], fill="#111827", font=font(24, True), anchor="mm")
         slot = (x1 - x0) / len(EST_BUCKETS)
         for bi, bucket in enumerate(EST_BUCKETS):
             for mi, model in enumerate(COLORS):
@@ -543,9 +574,9 @@ def grouped_distribution_paired_plot(turns, arm, raw_field, filename):
                 top = y1 - rate / 0.7 * (y1 - y0)
                 d.rectangle((cx - bw / 2, top, cx + bw / 2, y1), fill=rgba(COLORS[model]))
                 if rate >= 0.008:
-                    d.text((cx, top - 4), f"{100 * rate:.1f}", fill=rgba(COLORS[model]), font=font(9, True), anchor="mb")
-            d.text((x0 + (bi + 0.5) * slot, y1 + 8), bucket, fill="#4b5563", font=font(11), anchor="ma")
-        d.text(((x0 + x1) / 2, y1 + 42), "S2 estimated length bucket", fill="#4b5563", font=font(14), anchor="mm")
+                    d.text((cx, top - 5), f"{100 * rate:.1f}", fill=rgba(COLORS[model]), font=font(11, True), anchor="mb")
+            d.text((x0 + (bi + 0.5) * slot, y1 + 8), bucket, fill="#4b5563", font=font(17), anchor="ma")
+        d.text(((x0 + x1) / 2, y1 + 52), "S2 estimated length bucket", fill="#4b5563", font=font(18), anchor="mm")
     im.convert("RGB").save(OUT / filename, quality=95)
 
 
@@ -652,21 +683,22 @@ def plot_behavior(behavior):
         ("adjacent_repeat_rate", "adjacent repeat"),
         ("incomplete_rate", "judge incomplete"),
         ("failed_rate", "judge failed"),
-        ("max_cap_rate", "max-cap deaths"),
-        ("max_turns_rate", "max-turn deaths"),
+        ("failed_after_midplan_cap_rate", "mid-task loop"),
+        ("max_cap_rate", "end-task loop"),
+        ("step_or_turn_cutoff_rate", "max_step limit"),
     )
     im, d = base_canvas(
-        "Base arm: Qwen3-VL minus Qwen3.5 repeat/judge/termination rates",
-        "Signed percentage-point difference. Positive (blue) = Qwen3-VL higher; negative (orange) = Qwen3.5 higher.",
-        width=1850,
-        height=740,
+        "Qwen3-VL vs. Qwen3.5 subgoal prediction",
+        "Signed percentage-point difference; max_step limit is the share of all episodes reaching either limit.",
+        width=2400,
+        height=820,
     )
     legend(d, [("Qwen3-VL higher", COLORS["Qwen3-VL"], 255), ("Qwen3.5 higher", COLORS["Qwen3.5"], 255)], 1260, 32)
-    boxes = panel_boxes(im.width, 140, 630, left=90, gap=65)
+    boxes = panel_boxes(im.width, 150, 700, left=95, gap=75)
     for split, box in zip(SPLITS, boxes):
         x0, y0, x1, y1 = box
-        y_for = signed_axes(d, box, 0.2, yticks=4)
-        d.text(((x0 + x1) / 2, y0 - 28), SPLIT_LABEL[split], fill="#111827", font=font(20, True), anchor="mm")
+        y_for = signed_axes(d, box, 0.4, yticks=4)
+        d.text(((x0 + x1) / 2, y0 - 30), SPLIT_LABEL[split], fill="#111827", font=font(24, True), anchor="mm")
         slot = (x1 - x0) / len(metrics)
         for qi, (key, label) in enumerate(metrics):
             q3 = next(x for x in behavior if x["split"] == split and x["model"] == "Qwen3-VL" and x["arm"] == "base")
@@ -677,8 +709,8 @@ def plot_behavior(behavior):
             zero_y, value_y = y_for(0), y_for(diff)
             color = COLORS["Qwen3-VL"] if diff >= 0 else COLORS["Qwen3.5"]
             d.rectangle((cx - bw / 2, min(zero_y, value_y), cx + bw / 2, max(zero_y, value_y)), fill=rgba(color))
-            d.text((cx, value_y + (-6 if diff >= 0 else 6)), f"{100 * diff:+.1f}", fill=rgba(color), font=font(12, True), anchor="mb" if diff >= 0 else "ma")
-            d.text((x0 + (qi + 0.5) * slot, y1 + 8), label.replace(" ", "\n"), fill="#4b5563", font=font(10), anchor="ma", align="center")
+            d.text((cx, value_y + (-7 if diff >= 0 else 7)), f"{100 * diff:+.1f}", fill=rgba(color), font=font(15, True), anchor="mb" if diff >= 0 else "ma")
+            d.text((x0 + (qi + 0.5) * slot, y1 + 9), label.replace(" ", "\n"), fill="#4b5563", font=font(17), anchor="ma", align="center")
     im.convert("RGB").save(OUT / "06_loop_behavior_by_split.png", quality=95)
 
 
@@ -687,21 +719,22 @@ def plot_behavior_paired(behavior):
         ("adjacent_repeat_rate", "adjacent repeat"),
         ("incomplete_rate", "judge incomplete"),
         ("failed_rate", "judge failed"),
-        ("max_cap_rate", "max-cap deaths"),
-        ("max_turns_rate", "max-turn deaths"),
+        ("failed_after_midplan_cap_rate", "mid-task loop"),
+        ("max_cap_rate", "end-task loop"),
+        ("step_or_turn_cutoff_rate", "max_step limit"),
     )
     im, d = base_canvas(
-        "Base arm: repeat/judge/termination rates · paired values",
-        "Adjacent-repeat and judge rates are turn-level; max-cap and max-turn rates are episode-level.",
-        width=1850,
-        height=740,
+        "Qwen3-VL vs. Qwen3.5 subgoal prediction",
+        "max_step limit: percentage of all episodes reaching the official-step cutoff OR max-turn termination; counted once.",
+        width=2400,
+        height=820,
     )
     legend(d, [(m, COLORS[m], 255) for m in COLORS], 1330, 32)
-    boxes = panel_boxes(im.width, 140, 630, left=90, gap=65)
+    boxes = panel_boxes(im.width, 150, 700, left=95, gap=75)
     for split, box in zip(SPLITS, boxes):
         x0, y0, x1, y1 = box
         axes(d, box, 0, 0.5, percent=True, yticks=5)
-        d.text(((x0 + x1) / 2, y0 - 28), SPLIT_LABEL[split], fill="#111827", font=font(20, True), anchor="mm")
+        d.text(((x0 + x1) / 2, y0 - 30), SPLIT_LABEL[split], fill="#111827", font=font(24, True), anchor="mm")
         slot = (x1 - x0) / len(metrics)
         for qi, (key, label) in enumerate(metrics):
             for mi, model in enumerate(COLORS):
@@ -711,8 +744,8 @@ def plot_behavior_paired(behavior):
                 bw = slot * 0.26
                 top = y1 - rate / 0.5 * (y1 - y0)
                 d.rectangle((cx - bw / 2, top, cx + bw / 2, y1), fill=rgba(COLORS[model]))
-                d.text((cx, top - 4), f"{100 * rate:.1f}", fill=rgba(COLORS[model]), font=font(9, True), anchor="mb")
-            d.text((x0 + (qi + 0.5) * slot, y1 + 8), label.replace(" ", "\n"), fill="#4b5563", font=font(10), anchor="ma", align="center")
+                d.text((cx, top - 5), f"{100 * rate:.1f}", fill=rgba(COLORS[model]), font=font(13, True), anchor="mb")
+            d.text((x0 + (qi + 0.5) * slot, y1 + 9), label.replace(" ", "\n"), fill="#4b5563", font=font(17), anchor="ma", align="center")
     im.convert("RGB").save(OUT / "06b_loop_behavior_by_split_paired.png", quality=95)
 
 
@@ -861,7 +894,7 @@ def main():
         "base",
         "raw_est_bucket",
         "02_base_s2_estimate_distribution.png",
-        "Base arm: Qwen3-VL minus Qwen3.5 estimated-length distribution",
+        "Qwen3-VL vs. Qwen3.5 estimated_length prediction",
         "Signed percentage-point difference per bucket. Positive (blue) = Qwen3-VL higher; negative (orange) = Qwen3.5 higher.",
     )
     grouped_distribution_paired_plot(
