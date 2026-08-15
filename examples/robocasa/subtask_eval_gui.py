@@ -673,7 +673,7 @@ def api_stats():
 
 @app.route("/stats")
 def stats_page():
-    return STATS_HTML
+    return STATS_HTML.replace("<script>", _ERR_JS + "<script>", 1)
 
 
 VAL_MSE_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
@@ -809,8 +809,12 @@ function drawTable(metric){
   });
 }
 document.getElementById('metric').onchange=draw;
-load();
-setInterval(load, 60000);   // refresh while the sweep is still writing results
+// Swallow a failed poll: a dropped /api/stats request is expected (tunnel, or this server being
+// restarted mid-sweep) and the next tick recovers. Unguarded, each failure became an unhandled
+// rejection and a scary banner once a minute.
+const safeLoad=()=>Promise.resolve().then(load).catch(e=>console.warn('stats refresh failed:', e));
+safeLoad();
+setInterval(safeLoad, 60000);   // refresh while the sweep is still writing results
 </script></body></html>"""
 
 
@@ -853,6 +857,7 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   <div id="cmbtab" style="overflow-x:auto"></div>
   <div id="cmbsplit" style="overflow-x:auto"></div>
   <h2>#0b Per-task COMBINED success <span style="font-size:11px;color:#888;font-weight:400">— task × method · #successful / #episodes (hover for % and s/ep) · OVERALL row = the three splits combined, then per-split totals and their tasks</span></h2>
+  <div id="cmbcmp" style="font-size:11px;margin:0 0 5px"></div>
   <div id="cmbtask" style="overflow-x:auto"></div>
   <h2>#2 Episode success rate <span style="font-size:11px;color:#888;font-weight:400">— % (n episodes)</span></h2>
   <div id="epfilter" style="margin:2px 0 8px;font-size:12px;display:flex;gap:6px;align-items:center;flex-wrap:wrap"></div>
@@ -863,6 +868,10 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 </div>
 <script>
 const COLORS=["#b0431c","#1c6bb0","#2e8b3d","#8b2eb0","#b0902e","#2eb0a3","#b02e5a","#555"];
+// #0b compare mode: highlight a per-task gap of at least this many EPISODES. 4 because at n=30 per
+// task the binomial SD is ~2.7 episodes, so anything under ~4 is inside ordinary sampling noise --
+// a highlighted cell is a gap worth looking at, not proof of one.
+const CMP_HL=4;
 // Method DISPLAY name: fix up truncated/short output-dir labels to the complete ablation name.
 // (v12's rollout dir is 'v12_progact_noanchorstate' but the ckpt is '..._noanchorstate_noanchor';
 //  shown complete here until the dir is renamed post-run.)
@@ -884,11 +893,63 @@ function s1Short(t){
     .replace(/-noanchorstate-noanchor|-noanchor-noanchorstate/g,'-noanchor')
     .replace(/-noanchorstate/g,'-noanchor');
 }
-function mName2(m){
+// COLOUR BY FAMILY, so a table of near-identical names can be read at a glance. Two independent
+// axes, because a run is a PAIR of checkpoints and either half can be the thing that differs:
+//   System1 progress head -- progact (teal) vs progreg (violet)
+//   System2 planner       -- qwen35 (blue) vs qwen3vl (rose)
+// Anything unrecognised stays neutral grey rather than being given a colour it might share with a
+// family it is not in.
+const s1Color=t=>{const x=(t||'').toLowerCase();
+  return x.includes('progact')?'#0f766e':x.includes('progreg')?'#6d28d9':'#333';};
+const s2Color=t=>{const x=(t||'').toLowerCase();
+  return x.includes('qwen3vl')?'#be123c':x.includes('qwen35')?'#1d4ed8':'#666';};
+// FULL method name, COLOURED by family. The name is not shortened -- the checkpoint tail is what
+// makes a run identifiable, and collapsing it once already cost a round of confusion -- so only the
+// colour carries the family, on two independent axes (see s1Color / s2Color above):
+//   progact270k-qwen3vl-4b-full-ep3-17124-base
+//   ^^^^^^^^^^^ teal        ^^^^^^^^^^^^^^^^^^ rose        ^^^^^ grey (the rule ARM, not a checkpoint)
+// The arm suffix is split off by matching a known checkpoint prefix; anything unrecognised is left
+// whole and coloured as one piece, so a new checkpoint is never silently mis-split.
+const _S2_CKPTS=['qwen35-4b-full-ep3-11416','qwen3vl-4b-full-ep3-17124'];
+const _s2Parts=t=>{const s=t||'';
+  for(const k of _S2_CKPTS){
+    if(s===k)return [k,''];
+    if(s.startsWith(k+'-'))return [k, s.slice(k.length)];
+  }
+  return [s,''];};
+// ``br`` puts the System2 half on its own line, which is what the narrow table headers want; inline
+// otherwise (pickers, legends). Full name also in the tooltip.
+function mLabel(m, br){
   const x=/^s1-(.+?)_s2-(.+)$/.exec(m||'');
   if(!x)return `<span title="${m}">${mName(m)}</span>`;
-  return `<span title="${m}"><b>${s1Short(x[1])}</b><br><span style="font-weight:400;color:#666">${x[2]}</span></span>`;
+  const [ck,arm]=_s2Parts(x[2]);
+  return `<span title="${m}"><b style="color:${s1Color(x[1])}">${s1Short(x[1])}</b>`
+    +(br?'<br>':`<span style="color:#bbb">-</span>`)
+    +`<span style="font-weight:400;color:${s2Color(ck)}">${ck}</span>`
+    +(arm?`<span style="font-weight:400;color:#888">${arm}</span>`:'')
+    +`</span>`;
 }
+// SHORT form, used by #0b and its compare controls only: the per-task matrix has 50 rows and one
+// column per method, so the full checkpoint tail costs width that the task names need. #0 keeps the
+// full name -- that table is the record, this one is the working view.
+//   progact270k / qwen3vl (inst)
+// The family map is EXPLICIT: any checkpoint outside it keeps its full name, so a new step is never
+// rendered as if it were the established one.
+const _S2_FAMILY={'qwen35-4b-full-ep3-11416':'qwen35','qwen3vl-4b-full-ep3-17124':'qwen3vl'};
+function mLabelShort(m, br){
+  const x=/^s1-(.+?)_s2-(.+)$/.exec(m||'');
+  if(!x)return `<span title="${m}">${mName(m)}</span>`;
+  const [ck,arm]=_s2Parts(x[2]);
+  const fam=_S2_FAMILY[ck]||ck;
+  const armTxt=arm?`(${arm.replace(/^-/,'')})`:'';
+  return `<span title="${m}"><b style="color:${s1Color(x[1])}">${s1Short(x[1])}</b>`
+    +(br?'<br>':`<span style="color:#bbb"> / </span>`)
+    +`<span style="font-weight:400;color:${s2Color(ck)}">${fam}</span>`
+    +(armTxt?` <span style="font-weight:400;color:#888">${armTxt}</span>`:'')
+    +`</span>`;
+}
+const mShort=m=>mLabelShort(m,false);      // #0b compare picker / legend
+const mName2=m=>mLabel(m,true);            // #0: full name
 function renderTagDoc(){
   const box=document.getElementById('tagdoc-body'); if(!box)return;
   const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
@@ -955,6 +1016,20 @@ const isMemoryMethod=m=>/-memory$/i.test(String(m||''));
 // ranking. One click removes them. Deliberately matches on the SUFFIX only, so a future "-v2-foo"
 // variant is not silently swept up with them.
 const isV2Method=m=>/-v2$/i.test(String(m||''));
+// FLAT-POLICY BASELINE (Xiaomi-Robotics-1 RoboCasa365): one policy, no System2, no turns. Summarised
+// into combine_results/ by scripts/extract_baseline_results.py, which is also what stamps the
+// `baseline-` prefix this keys on. Its own toggle in #0, default ON: it is the external reference the
+// hierarchical runs are measured against, but it is a DIFFERENT SYSTEM, not another arm of ours, so
+// one click removes it when comparing our arms to each other.
+//
+// COMPARE IT AGAINST THE REFINED COLUMN, not the raw one. These rollouts were GENERATED with
+// RoboCasa's official per-task horizon as the cap, so they cannot overshoot it and their raw rate is
+// already horizon-compliant (measured: refined == raw on every episode delivered). Our hierarchical
+// runs budget per subgoal and per turn, so only their refined rate is scored the same way.
+// Keyed on the RECORD's `kind`, with the historic `baseline-` name prefix kept as a fallback for
+// files written before that field existed. Pass C[m] at every call site.
+const isBaselineMethod=(m,rec)=>((rec&&rec.kind==='baseline_flat_policy')
+                                 ||/^baseline-/i.test(String(m||'')));
 const pct=v=>v==null?'–':(100*v).toFixed(1)+'%';
 const f4=v=>v==null?'–':(+v).toFixed(4);
 async function load(){
@@ -1092,6 +1167,7 @@ async function load(){
     const isEval30=m=>maxTaskN(m)>20;
     const OLD=ALL.filter(m=>!isEval30(m)&&!isDebugMethod(m));
     const V2=ALL.filter(isV2Method);
+    const BL=ALL.filter(m=>isBaselineMethod(m,C[m]));
     if(window._showDebug===undefined)window._showDebug=false;    // default OFF
     if(window._showMemory===undefined)window._showMemory=true;   // default ON
     if(window._show1000===undefined)window._show1000=false;      // default OFF -- 1500 runs only
@@ -1100,18 +1176,23 @@ async function load(){
     // debug/memory boxes which you flick on to check one thing.
     if(window._showV2===undefined)
       window._showV2=(localStorage.getItem('cmbShowV2')!=='0');
+    // Default ON and REMEMBERED, like _showV2: whether the external baseline belongs in the table is
+    // a comparison mode you stay in, not something you flick on to check one number.
+    if(window._showBaseline===undefined)
+      window._showBaseline=(localStorage.getItem('cmbBaseline')!=='0');
     // REFINED: render the SAME episodes re-scored under RoboCasa's official per-task step horizon --
     // a success counts only if the env's success check fired within `horizon` cumulative env steps
     // (examples/robocasa/horizon_gate.py; precomputed per method by extract_combine_results.py).
     // PRESENTATION ONLY: it gates which episodes count as successes and touches no eval data. Both #0
     // and #0b switch together, including the ranking, so a screenshot is never half refined. Default
-    // OFF -- the raw rate is what every earlier note quotes -- but the choice is remembered, because
-    // it is the mode you want for anything comparable with a published RoboCasa number.
+    // ON by default, because it is the only scoring comparable with a published RoboCasa number; the
+    // choice is remembered, so unticking it sticks ('0' is stored explicitly).
     if(window._refined===undefined)
-      window._refined=(localStorage.getItem('cmbRefined')==='1');
+      window._refined=(localStorage.getItem('cmbRefined')!=='0');
     const ms=ALL.filter(m=>(window._showDebug||!isDebugMethod(m))
                         && (window._showMemory||!isMemoryMethod(m))
                         && (window._showV2||!isV2Method(m))
+                        && (window._showBaseline||!isBaselineMethod(m,C[m]))
                         && (window._show1000||isEval30(m)||isDebugMethod(m)));
     const dbgBar=document.getElementById('cmbdebug');
     if(dbgBar){
@@ -1134,6 +1215,14 @@ async function load(){
         +`<input type="checkbox" id="cmbv2cb" ${window._showV2?'checked':''} `
         +`style="margin-right:4px">show ${V2.length} *-v2 run${V2.length>1?'s':''} `
         +`<span style="color:#aaa">(superseded rule layer)</span></label>`);
+      if(BL.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px" `
+        +`title="Flat-policy reference (Xiaomi-Robotics-1 RoboCasa365): one policy, no System2, no `
+        +`turns, so the turns column is blank. Generated WITH RoboCasa's official per-task step `
+        +`horizon as the cap, so its raw rate is already horizon-compliant -- compare it against our `
+        +`REFINED column, not our raw one.">`
+        +`<input type="checkbox" id="cmbblcb" ${window._showBaseline?'checked':''} `
+        +`style="margin-right:4px">show ${BL.length} baseline run${BL.length>1?'s':''} `
+        +`<span style="color:#aaa">(flat policy, no System2)</span></label>`);
       boxes.push(`<label style="cursor:pointer;color:${window._refined?'#b45309':'#888'}" `
         +`title="A success counts only if the env's success check fired within RoboCasa's official `
         +`per-task step horizon (450-4350 env steps, robocasa dataset_registry). Our loop budgets per `
@@ -1153,15 +1242,18 @@ async function load(){
     const vcb=document.getElementById('cmbv2cb');
     if(vcb)vcb.onchange=()=>{window._showV2=vcb.checked;
       localStorage.setItem('cmbShowV2', window._showV2?'1':'0'); load();};
+    const blcb=document.getElementById('cmbblcb');
+    if(blcb)blcb.onchange=()=>{window._showBaseline=blcb.checked;
+      localStorage.setItem('cmbBaseline', window._showBaseline?'1':'0'); load();};
     const rcb=document.getElementById('cmbrefcb');
     if(rcb)rcb.onchange=()=>{window._refined=rcb.checked;
       localStorage.setItem('cmbRefined', window._refined?'1':'0'); load();};
     // Guard on EITHER kind being hidden: with only *-memory runs present and its box unticked,
     // DBG.length alone would be 0 and the page would claim there are no runs at all.
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
-      '<span style="color:#888">'+((DBG.length||MEM.length||OLD.length||V2.length)
-        ? 'Only hidden runs present (debug-* / *-memory / *-v2 / 1000-episode) — tick a box above to '
-          +'see them.'
+      '<span style="color:#888">'+((DBG.length||MEM.length||OLD.length||V2.length||BL.length)
+        ? 'Only hidden runs present (debug-* / *-memory / *-v2 / baseline-* / 1000-episode) — tick a '
+          +'box above to see them.'
         : 'No combined runs yet — see /combine.')+'</span>';return;}
     // ONE table: overall + per-split, RANKED best -> worst by overall rate.
     //
@@ -1230,7 +1322,9 @@ async function load(){
       const ov=(t0&&v.n)?(t0.na?{n:v.n,na:true}:{n:v.n,n_success:t0.s,rate:t0.r}):overallOf(m);
       // Under the toggle the name says "(refined)" too, so a screenshot of this table cannot be
       // mistaken for the raw one.
-      const nm=mName2(m)+(window._refined?' <span style="color:#b45309">(refined)</span>':'');
+      // No "(refined)" suffix on the name: it doubled the width of every row label, and the toggle
+      // above the table already says which scoring is on.
+      const nm=mName2(m);
       const dropTip=(window._refined&&t0&&!t0.na&&t0.drop)
         ? ` · horizon gate removed ${t0.drop} win${t0.drop>1?'s':''}`
         : (window._refined&&t0&&t0.na?' · not scorable under the horizon gate':'');
@@ -1243,30 +1337,10 @@ async function load(){
         +`</td>`
         +spShown.map(x=>cellSp(P[x],false)).join('')
         +`<td>${v.avg_seconds??'–'}</td><td>${v.avg_turns??'–'}</td></tr>`;});
-    h+="</table><div style='color:#888;font-size:11px;margin-top:3px'>Ranked best → worst by overall "
-      +"success rate. Every cell shows the rate above and the #success/#episodes it was computed "
-      +"from — denominators differ between methods (a finished 1500-episode sweep vs a partial run) "
-      +"and between splits, so the counts are what make the rates comparable. overall = the three "
-      +"splits combined. Hover the overall cell for the error count and the termination breakdown "
-      +"(env_success / task_finish / max_turns / no_subgoal), and a split cell for its s/ep. "
-      +"Per-task counts are in #0b below. "
-      +"By default only runs on the 1500-episode manifest (30 episodes per task) are listed; the "
-      +"older 1000-episode runs (20 per task, the same episodes as the first 20 of each task) are one "
-      +"click away above — their rates are computed on a subset, so ranking them beside a 1500-run is "
-      +"a comparison of two different denominators. "
-      +(window._refined
-        ? "<b style='color:#b45309'>REFINED is ON</b> — a success counts only if the env's success "
-          +"check fired within RoboCasa's official per-task step horizon (450–4350 env steps, from "
-          +"its dataset_registry). Our loop budgets per subgoal and per turn and never over total env "
-          +"steps, so an episode can run past it; the gate only ever removes wins, so the denominator "
-          +"is unchanged and refined ≤ raw. #0b follows the same toggle. This is the mode to use for "
-          +"anything compared with a published RoboCasa number. It re-scores the recorded rollouts "
-          +"and changes no data — and note the rollouts were GENERATED without the horizon, so a "
-          +"policy tuned for it could behave differently. "
-        : "")
-      +"Source: eval_results/combine_results/*.json via scripts/extract_combine_results.py"
-      +" (refined: examples/robocasa/horizon_gate.py; audit trail per episode in "
-      +"eval_results/combine_refined/*.json).</div>";
+    // No explanatory paragraph under the table, by request. Everything it said is either visible in
+    // the table itself (rate + #success/#episodes per cell), in a hover title (errors, terminations,
+    // s/ep, the refined drop), or on the toggle labels above.
+    h+="</table>";
     document.getElementById('cmbtab').innerHTML=h;
     document.getElementById('cmbsplit').innerHTML='';
     // #0b per-task matrix: rows = tasks grouped by split, cols = methods.
@@ -1286,30 +1360,99 @@ async function load(){
       return `<td title="${(100*u.r).toFixed(1)}% · ${b.avg_seconds??'?'}s/ep${drop}" `
         +`style="background:rgba(46,139,61,${(0.10+0.5*u.r).toFixed(2)})">`
         +`${u.s}<span style="color:#888">/${u.n}</span></td>`;};
+    // ---- COMPARE MODE ------------------------------------------------------------------------
+    // Pick exactly two methods and the table collapses to those two columns plus a per-task Δ, so the
+    // question "which tasks does A win or lose on" is answered by reading one column instead of
+    // subtracting 50 pairs by eye. Δ is in EPISODES (A - B), not percentage points, because that is
+    // the unit the cells are in and the unit the noise band is quoted in.
+    if(window._cmpMode===undefined)window._cmpMode=false;
+    if(!window._cmpSel)window._cmpSel=[];
+    const cmpOn=!!(window._cmpRun && window._cmpRun.length===2
+                   && window._cmpRun.every(m=>C[m]));
+    const cols=cmpOn?window._cmpRun:ranked;
+    const cbar=document.getElementById('cmbcmp');
+    if(cbar){
+      let cb='';
+      if(!window._cmpMode && !cmpOn){
+        cb=`<button id="cmpbtn" style="font-size:11px">compare…</button>`
+          +`<span style="color:#888;margin-left:6px">pick two methods and diff them task by task</span>`;
+      }else if(!cmpOn){
+        cb=`<span style="color:#888">pick <b>two</b> methods:</span> `
+          +ranked.map(m=>`<label style="margin-right:8px;cursor:pointer;white-space:nowrap">`
+            +`<input type="checkbox" class="cmpck" data-m="${m}" `
+            +`${window._cmpSel.includes(m)?'checked':''}> ${mShort(m)}</label>`).join('')
+          +`<button id="cmpgo" style="font-size:11px;margin-left:4px" `
+          +`${window._cmpSel.length===2?'':'disabled'}>start</button>`
+          +`<button id="cmpoff" style="font-size:11px;margin-left:4px">cancel</button>`;
+      }else{
+        cb=`<b>comparing</b> A=${mShort(window._cmpRun[0])} &nbsp; B=${mShort(window._cmpRun[1])}`
+          +`<span style="color:#888"> &nbsp;Δ = A − B in episodes; ▲ A better, ▼ B better; </span>`
+          +`<b style="background:#fde68a">|Δ| ≥ ${CMP_HL}</b><span style="color:#888"> highlighted</span>`
+          +`<button id="cmpoff" style="font-size:11px;margin-left:8px">exit compare</button>`;
+      }
+      cbar.innerHTML=cb;
+      const gb=document.getElementById('cmpbtn');
+      if(gb)gb.onclick=()=>{window._cmpMode=true; load();};
+      document.querySelectorAll('.cmpck').forEach(el=>{el.onchange=()=>{
+        const m=el.dataset.m;
+        let s=window._cmpSel.filter(x=>x!==m);
+        if(el.checked)s.push(m);
+        window._cmpSel=s.slice(-2);        // keep the two most recent picks
+        load();};});
+      const go=document.getElementById('cmpgo');
+      if(go)go.onclick=()=>{window._cmpRun=window._cmpSel.slice(0,2); window._cmpMode=false; load();};
+      const off=document.getElementById('cmpoff');
+      if(off)off.onclick=()=>{window._cmpRun=null; window._cmpMode=false; window._cmpSel=[]; load();};
+    }
+    // One Δ cell: counts from SUC, so it follows the refined toggle like every other cell here.
+    const dcell=(ba,bb)=>{
+      const A=SUC(ba), B=SUC(bb);
+      if(!A||!B||A.na||B.na)return '<td style="color:#ccc">–</td>';
+      const d=A.s-B.s;
+      const arrow=d>0?'▲':(d<0?'▼':'=');
+      const col=d>0?'#166534':(d<0?'#b91c1c':'#999');
+      const hl=Math.abs(d)>=CMP_HL?';background:#fde68a':'';
+      const warn=A.n!==B.n?` (different denominators: ${A.n} vs ${B.n})`:'';
+      return `<td title="A ${A.s}/${A.n} vs B ${B.s}/${B.n}${warn}" `
+        +`style="text-align:center;font-weight:700;color:${col}${hl}">`
+        +`${arrow}${d===0?'':(d>0?'+'+d:d)}${warn?'<span style="color:#b45309">*</span>':''}</td>`;};
     // Method COLUMNS follow #0's ranking (left = best overall), not alphabetical order, so a task's
     // row reads in the same left-to-right order as the summary table above it. `ranked` is the exact
-    // array #0 rendered, so the two tables can never disagree.
+    // array #0 rendered, so the two tables can never disagree. In compare mode the columns are the
+    // two chosen methods instead, in the order they were picked (A then B).
     let h3="<table class=cmbtask><tr><th class='exp'>task</th>"
-      +ranked.map(m=>`<th>${mName2(m)}</th>`).join('')+"</tr>";
+      +cols.map(m=>`<th>${mLabelShort(m,true)}</th>`).join('')
+      +(cmpOn?"<th>Δ<br><span style='font-weight:400;color:#888'>A−B</span></th>":"")+"</tr>";
     // OVERALL row first: the three splits combined, summed from per_split so it always agrees with
     // the split-total rows below it (and with a partial sweep's uneven splits).
+    // The OVERALL row is summed from per_split, so it needs its own block builder rather than a
+    // lookup -- shared by the cells and by the Δ column so both read the same numbers.
+    const ovBlk=m=>{const P=C[m].per_split||{};
+      let n=0,s=0,sr=0,unk=0,sec=0,sn=0,anyRef=false;
+      for(const x of ['atomic_seen','composite_seen','composite_unseen','other']){
+        const b=P[x]; if(!b||!b.n)continue;
+        n+=b.n; s+=(b.n_success??b.s??0);
+        if(b.n_success_refined!=null){anyRef=true; sr+=b.n_success_refined; unk+=(b.n_refined_unknown||0);}
+        if(typeof b.avg_seconds==='number'){sec+=b.avg_seconds*b.n; sn+=b.n;}}
+      if(!n)return null;
+      const o={n:n,n_success:s,rate:s/n,avg_seconds:sn?+(sec/sn).toFixed(2):null};
+      if(anyRef){o.n_success_refined=sr; o.rate_refined=sr/n; o.n_refined_unknown=unk;}
+      return o;};
     h3+=`<tr><td class='exp' style="background:#cdd8ee;font-weight:700">OVERALL</td>`
-      +ranked.map(m=>{const P=C[m].per_split||{};
-        let n=0,s=0,sec=0,sn=0;
-        for(const x of ['atomic_seen','composite_seen','composite_unseen','other']){
-          const b=P[x]; if(!b||!b.n)continue;
-          n+=b.n; s+=(b.n_success??b.s??0);
-          if(typeof b.avg_seconds==='number'){sec+=b.avg_seconds*b.n; sn+=b.n;}}
-        return cell(n?{n:n,n_success:s,rate:s/n,avg_seconds:sn?+(sec/sn).toFixed(2):null}:null);
-      }).join('')+`</tr>`;
+      +cols.map(m=>cell(ovBlk(m))).join('')
+      +(cmpOn?dcell(ovBlk(cols[0]),ovBlk(cols[1])):'')+`</tr>`;
     // split-total rows so a whole split reads at a glance
     ['atomic_seen','composite_seen','composite_unseen','other'].forEach(sp=>{
       const rows=tasks.filter(t=>info[t]===sp);
       if(!rows.length)return;
+      const sb=m=>(C[m].per_split||{})[sp];
       h3+=`<tr><td class='exp' style="background:#dfe6f5;font-weight:700">${sp.replace('_','-')}</td>`
-        +ranked.map(m=>cell((C[m].per_split||{})[sp])).join('')+`</tr>`;
-      rows.forEach(t=>{h3+=`<tr><td class='exp' style="padding-left:14px">${t}</td>`
-        +ranked.map(m=>cell((C[m].per_task||{})[t])).join('')+`</tr>`;});
+        +cols.map(m=>cell(sb(m))).join('')
+        +(cmpOn?dcell(sb(cols[0]),sb(cols[1])):'')+`</tr>`;
+      rows.forEach(t=>{const tb=m=>(C[m].per_task||{})[t];
+        h3+=`<tr><td class='exp' style="padding-left:14px">${t}</td>`
+        +cols.map(m=>cell(tb(m))).join('')
+        +(cmpOn?dcell(tb(cols[0]),tb(cols[1])):'')+`</tr>`;});
     });
     document.getElementById('cmbtask').innerHTML=h3+"</table>";
   })();
@@ -1336,7 +1479,10 @@ async function load(){
   new Chart(document.getElementById('chart'),{type:'bar',data:{labels:methods,datasets:ds},
     options:{responsive:true,scales:{y:{min:0,max:100,title:{display:true,text:'%'}}}}});
 }
-load();
+// A failed /api/stats (tunnel hiccup, or this server restarting mid-sweep) must not surface as an
+// 'unhandled promise rejection' banner -- it is a dropped request, not a script bug. The toggles
+// call load() again on every click, so the page recovers on its own.
+Promise.resolve().then(load).catch(e=>console.warn('stats load failed:', e));
 </script></body></html>"""
 
 
@@ -2175,6 +2321,11 @@ def _combine_stats() -> dict:
                 "per_split": rec.get("per_split") or {},
                 "per_task": rec.get("per_task") or {},
                 "bench": rec.get("bench") or {},
+                # What KIND of eval this is. Set to "baseline_flat_policy" by
+                # scripts/extract_baseline_results.py; absent for our own combine runs. #0 keys its
+                # baseline toggle on this rather than on the method name, so a baseline run can be
+                # named anything.
+                "kind": rec.get("kind"),
                 "src": "extracted",
             }
     # 2) live fallback for methods not extracted yet (a sweep still running)
@@ -3162,9 +3313,12 @@ function wireVideo(){
     S._rvfc=requestAnimationFrame(raf);};
   v.addEventListener('play',()=>{if(S._rvfc)return;
     S._rvfc=hasRVFC?v.requestVideoFrameCallback(follow):requestAnimationFrame(raf);});
-  v.addEventListener('play', ()=>{$('#play').innerHTML='&#10074;&#10074; pause';});
-  v.addEventListener('pause',()=>{$('#play').innerHTML='&#9654; play';});
-  v.addEventListener('ended',()=>{$('#play').innerHTML='&#9654; play';});
+  // The card is rebuilt on every turn/episode change while the <video> can still emit one last
+  // pause/ended, so #play may already be gone -- guard instead of throwing TypeError on null.
+  const setPlayLabel=h=>{const b=$('#play'); if(b)b.innerHTML=h;};
+  v.addEventListener('play', ()=>setPlayLabel('&#10074;&#10074; pause'));
+  v.addEventListener('pause',()=>setPlayLabel('&#9654; play'));
+  v.addEventListener('ended',()=>setPlayLabel('&#9654; play'));
   $('#play').onclick=()=>{if(v.paused)v.play().catch(()=>{});else v.pause();};
   rng.oninput=e=>{v.pause();gotoStep(+e.target.value);};
   $('#ff').onclick=()=>{v.pause();gotoStep((+rng.value)+1);};
@@ -3268,7 +3422,12 @@ function planBefore(t, s2){
   //   3. the turn-1 derivation, for a turn whose prompt was not captured.
   if(s2&&s2.plan_in)return s2.plan_in;
   const up=(s2&&s2.user_prompt)||'';
-  const m=up.match(/Here's where the plan stands:\s*\n([\s\S]*?)(?:\n\s*\n|$)/);
+  // COMBINE_HTML is a NON-RAW triple-quoted string, so every backslash escape here must be DOUBLED.
+  // A single backslash-n is consumed by Python and reaches the browser as a real newline, which
+  // splits this regex literal across lines and kills the whole script with "Invalid regular
+  // expression: missing /" -- i.e. a blank page. Backslash-s survives only because Python leaves
+  // unknown escapes alone. This applies to comments too: a broken comment line becomes bare code.
+  const m=up.match(/Here's where the plan stands:\\s*\\n([\\s\\S]*?)(?:\\n\\s*\\n|$)/);
   if(m&&m[1].trim())return m[1].replace(/\s+$/,'');
   if(t.turn===0){const p=S.doc.plan||{};return p.plan_after_rules||p.plan||'';}
   const prev=(S.doc.turns||[]).find(x=>x.turn===t.turn-1);
@@ -3307,9 +3466,67 @@ loadMethods();
 """
 
 
+# A blank page is the failure mode of a JS-heavy page: an exception during init leaves nothing
+# rendered, which looks exactly like "no data". There is no JS engine on this box to reproduce it
+# offline, so the page reports its own errors -- visibly in a banner AND back to this server, where
+# they land in the GUI log next to the request that served the page.
+_ERR_JS = """<script>
+(function(){
+  function post(o){try{fetch('/api/client_error',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(o)});}catch(e){}}
+  function note(msg){
+    var d=document.getElementById('__note');
+    if(!d){d=document.createElement('div'); d.id='__note';
+      d.style.cssText='position:fixed;right:8px;bottom:8px;z-index:9999;background:#f1f5f9;'
+        +'color:#475569;border:1px solid #cbd5e1;border-radius:4px;padding:4px 8px;'
+        +'font:11px/1.3 ui-monospace,monospace';
+      document.body.appendChild(d);}
+    d.textContent=msg;
+    clearTimeout(window.__noteT);
+    window.__noteT=setTimeout(function(){if(d&&d.parentNode)d.parentNode.removeChild(d);},4000);
+  }
+  function banner(msg){
+    var d=document.getElementById('__err')||document.createElement('div');
+    d.id='__err';
+    d.style.cssText='background:#fee2e2;color:#7f1d1d;border:1px solid #fca5a5;padding:6px 9px;'
+      +'font:12px/1.4 ui-monospace,monospace;white-space:pre-wrap;margin:0 0 6px';
+    d.textContent='page script error — '+msg;
+    if(document.body&&!document.getElementById('__err'))document.body.insertBefore(d,document.body.firstChild);
+  }
+  window.addEventListener('error',function(e){
+    var m=(e.message||'error')+' @ '+(e.filename||'')+':'+(e.lineno||'?')+':'+(e.colno||'?');
+    banner(m); post({page:location.pathname,msg:e.message,file:e.filename,line:e.lineno,
+                     col:e.colno,stack:(e.error&&e.error.stack)||null});});
+  // A DROPPED REQUEST IS NOT A SCRIPT BUG. /stats polls every 60s and the viewer fetches on every
+  // click; over a tunnel (or while this server restarts) any of those can fail, and the page's
+  // awaits are not individually guarded, so each one surfaces here. Shouting "page script error" at
+  // that trained the reader to ignore the banner -- which is the one thing it must not do. Network
+  // failures get a quiet, self-dismissing note and are NOT posted; everything else stays loud.
+  var NETRE=/failed to fetch|networkerror|load failed|network request failed|aborted/i;
+  window.addEventListener('unhandledrejection',function(e){
+    var r=e.reason||{}; var msg=r.message||String(e.reason);
+    if(NETRE.test(msg)){note('lost contact with the eval server — retrying'); return;}
+    var m='unhandled promise rejection: '+msg;
+    banner(m); post({page:location.pathname,msg:m,stack:r.stack||null});});
+})();
+</script>"""
+
+
+@app.route("/api/client_error", methods=["POST"])
+def api_client_error():
+    from flask import request
+    try:
+        d = request.get_json(force=True, silent=True) or {}
+    except Exception:  # noqa: BLE001
+        d = {}
+    print(f"CLIENT JS ERROR on {d.get('page')}: {d.get('msg')} "
+          f"({d.get('file')}:{d.get('line')}:{d.get('col')})\n{d.get('stack') or ''}", flush=True)
+    return jsonify({"ok": True})
+
+
 @app.route("/combine")
 def combine_page():
-    return COMBINE_HTML
+    return COMBINE_HTML.replace("<script>", _ERR_JS + "<script>", 1)
 
 
 def main():
