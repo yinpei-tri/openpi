@@ -16,6 +16,13 @@
 # Usage:
 #   METHOD=progreg TASKS=CloseFridge EPISODES=0-9  bash examples/robocasa/run_combine_fleet.sh
 #   METHOD=progact TASK_SET=atomic_seen EPISODES=0-4 bash examples/robocasa/run_combine_fleet.sh
+#   # SHORT-GOAL arm: the 16 composite-unseen tasks x 30 episodes, terse goals replacing
+#   # ep_meta['lang']. The label MUST differ from the full-goal run -- the run guard now enforces
+#   # that (rule_config.json records the goal file's content hash), but naming it is clearer.
+#   USE_EVAL_SET=1 TASK_SET=composite_unseen \
+#     GOAL_JSON=/home/ec2-user/composite_unseen_short_goal.json \
+#     RUN_LABEL=s1-progact270k_s2-qwen35-4b-full-ep3-11416-unseenshort \
+#     METHOD=progact STEP=269999 TASK_RULES=1 bash examples/robocasa/run_combine_fleet.sh
 #   # one stack, S1+sim on GPU0 and S2 on GPU1:
 #   METHOD=progreg-noanchor STEP=240000 S1_GPUS=0 S2_GPUS=1 XLA_FRAC=0.9 GPU_FRAC=0.9 \
 #     TASKS=CloseFridge EPISODES=0 bash examples/robocasa/run_combine_fleet.sh
@@ -199,8 +206,17 @@ if use_eval_set == "1":
     # manifest, which is needed for targeted 30-episode task-rule sweeps with sparse source ids.
     from combined_eval import TARGET_EVAL_EPISODES
     selected = {t.strip() for t in tasks_csv.split(",") if t.strip()}
+    # TASK_SET also filters the manifest. It used to be IGNORED here, so
+    # `USE_EVAL_SET=1 TASK_SET=composite_unseen` silently ran all 50 tasks -- and with a strict
+    # --goal-json covering only the 16 unseen ones, the other 34 would abort one episode at a time.
+    split = {}
+    if task_set not in ("", "all"):
+        from combined_eval import TARGET_TASK_SPLIT
+        split = TARGET_TASK_SPLIT
     for task, episodes in TARGET_EVAL_EPISODES.items():
         if selected and task not in selected:
+            continue
+        if split and split.get(task) != task_set:
             continue
         ld = lerobot_dir(task)
         if not ld:

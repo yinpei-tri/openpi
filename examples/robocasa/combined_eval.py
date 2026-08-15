@@ -35,7 +35,12 @@ NO ANNOTATIONS ARE READ. The annotation files were the TRAINING data for System1
 at rollout time System2 supplies the subgoals and System1 the actions. Everything this script
 needs comes from the raw LeRobot dataset and the env itself:
   * ``reset_to(states[0])``           -- the episode's own first frame (recorded scene + start),
-  * ``ep_meta['lang']``               -- the task goal handed to System2's planner,
+  * ``ep_meta['lang']``               -- the task goal handed to System2's planner AND used as
+                                         System1's "Task:" prefix. ``--goal-json {task: goal}``
+                                         REPLACES it (both systems see only the replacement; the
+                                         original is kept in episode.json:instruction_original),
+                                         which is how a terse-goal arm is measured against a
+                                         full-goal one,
   * ``env._check_success()``          -- the episode-success metric AND the privileged
                                          "Current task status" line System2 reads.
 The recorded ACTIONS are never used; System1 generates every action.
@@ -47,11 +52,20 @@ Run (robocasa micromamba env; needs a System2 vLLM server AND a System1 policy s
         --s1-port 8060 --s2-port 8100 \
         --norm-stats <ckpt>/assets/robocasa_system1/norm_stats.json \
         --out-root eval_results/combine
+
+Short-goal arm (terse goals instead of the dataset's, 16 composite-unseen tasks x 30 episodes):
+    USE_EVAL_SET=1 TASK_SET=composite_unseen \
+      GOAL_JSON=/home/ec2-user/composite_unseen_short_goal.json \
+      RUN_LABEL=s1-progact270k_s2-qwen35-4b-full-ep3-11416-unseenshort \
+      METHOD=progact STEP=269999 TASK_RULES=1 bash examples/robocasa/run_combine_fleet.sh
+The goal map lives OUTSIDE the repo (it is data, not code); its content hash goes into the run's
+rule_config.json, so editing it between sweeps cannot silently mix two goal styles in one method.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -938,10 +952,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
     instruction_original = instruction
     goal_override = None
     if args.goal_json:
-        try:
-            _gmap = json.loads(Path(args.goal_json).expanduser().read_text())
-        except Exception as e:  # a typo here would silently evaluate the wrong thing -- fail loudly
-            raise SystemExit(f"--goal-json unreadable: {args.goal_json}: {e}") from e
+        _gmap = _load_goal_map(args.goal_json)
         if task_name in _gmap:
             goal_override = str(_gmap[task_name]).strip()
             instruction = goal_override
@@ -1580,19 +1591,66 @@ def _rules_present(args) -> bool:
     return bool(cfg["mandatory_rules"] or cfg["general_rules"] or cfg["task_rules"])
 
 
+def _load_goal_map(path: str | os.PathLike) -> dict[str, str]:
+    """Read and VALIDATE a --goal-json map. Fails loudly: a bad map silently evaluates the wrong task.
+
+    Requires a JSON object of task -> NON-EMPTY string. Without the type check a null becomes the
+    string "None" and a number becomes "42", either of which would be handed to both models as the
+    task goal and produce a run that looks valid and measures nothing.
+    """
+    p = Path(path).expanduser()
+    try:
+        raw = json.loads(p.read_text())
+    except Exception as e:
+        raise SystemExit(f"--goal-json unreadable: {p}: {e}") from e
+    if not isinstance(raw, dict) or not raw:
+        raise SystemExit(f"--goal-json must be a non-empty JSON object of task -> goal: {p}")
+    bad = {k: v for k, v in raw.items()
+           if not isinstance(k, str) or not isinstance(v, str) or not v.strip()}
+    if bad:
+        raise SystemExit(f"--goal-json has non-string or empty goals for {sorted(bad)} in {p}; "
+                         "every value must be a non-empty string")
+    return {k: v.strip() for k, v in raw.items()}
+
+
+def _goal_fingerprint(args) -> dict:
+    """What the run guard stores about the GOAL SOURCE, so two goal styles cannot share a directory.
+
+    The hash is of the file's CONTENTS, not just its path: editing the map in place between sweeps
+    would otherwise pass the guard and mix two goal phrasings under one method name.
+    """
+    if not getattr(args, "goal_json", None):
+        return {"json": None, "sha256": None, "n_tasks": 0, "strict": None}
+    gmap = _load_goal_map(args.goal_json)
+    blob = json.dumps(gmap, sort_keys=True).encode()
+    return {"json": str(Path(args.goal_json).expanduser()),
+            "sha256": hashlib.sha256(blob).hexdigest()[:16],
+            "n_tasks": len(gmap),
+            "strict": bool(getattr(args, "goal_json_strict", True))}
+
+
 def _write_run_rule_config(out_root: Path, method: str, args) -> dict:
     """Persist the method's rule tiers and refuse to mix incompatible arms in one directory."""
-    cfg = _rule_config(args)
+    # The guard covers the GOAL SOURCE as well as the rule tiers: a --goal-json run and a normal run
+    # are different arms, and with a derived method name or --resume they would otherwise merge into
+    # one directory and one success rate. (Found in review; the short-goal sweep was safe only because
+    # it was launched with an explicit RUN_LABEL.)
+    cfg = {**_rule_config(args), "goal": _goal_fingerprint(args)}
     path = out_root / method / "rule_config.json"
     if path.exists():
         try:
             old = json.loads(path.read_text())
         except Exception as e:
             raise RuntimeError(f"invalid existing rule config {path}: {e}") from e
-        if old != cfg:
+        # Compare only the keys BOTH sides carry, then merge forward. A guard written by an older
+        # revision simply lacks the newer keys, and refusing on that would abort every remaining
+        # episode of a sweep that is already running correctly -- schema growth is not an arm change.
+        clash = {k: (old[k], cfg[k]) for k in cfg if k in old and old[k] != cfg[k]}
+        if clash:
             raise RuntimeError(
-                f"rule configuration mismatch for method {method!r}: existing {old}, requested "
-                f"{cfg}. Use a distinct --method/RUN_LABEL for each evaluation arm.")
+                f"run configuration mismatch for method {method!r}: {clash}. Use a distinct "
+                "--method/RUN_LABEL for each evaluation arm (rule tier AND goal source).")
+        cfg = {**old, **cfg}
     _write_json(path, cfg)
     return cfg
 

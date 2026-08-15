@@ -116,9 +116,17 @@ def extract_method(method_dir: Path) -> dict | None:
     n_error = sum(1 for e in eps if e.get("error"))
     terms = collections.Counter(e.get("termination") or "error" for e in eps)
 
+    # GOAL SOURCE, from the run guard. Without this the aggregated tables cannot tell a terse-goal
+    # arm from a full-goal one -- only the individual episode.json files carried it.
+    goal = None
+    try:
+        goal = (json.loads((method_dir / "rule_config.json").read_text()) or {}).get("goal")
+    except Exception:
+        goal = None
     out = {
         "method": method_dir.name,
         "eval_kind": "combine",
+        "goal": goal,
         "overall": _stat_block(eps),
         "n_error": n_error,
         "terminations": dict(sorted(terms.items(), key=lambda kv: -kv[1])),
@@ -160,6 +168,7 @@ def main() -> None:
             "method": md.name, **o, "n_error": rec["n_error"],
             "terminations": rec["terminations"],
             "per_split_rate": {k: v["rate"] for k, v in rec["per_split"].items()},
+            "goal": rec.get("goal"),
             "bench": rec["bench"],
         })
         print(f"  {md.name}: {o['n_success']}/{o['n']} = "
