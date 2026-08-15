@@ -108,6 +108,9 @@ UNITS_FILE=${UNITS_FILE:-}
 # Every override is recorded in the results, and episode.json:rule_tier names the arm.
 GENERAL_RULES=${GENERAL_RULES:-0}
 TASK_RULES=${TASK_RULES:-0}
+# GOAL_JSON replaces the dataset task goal per task (JSON: {task_name: goal}). Used to test a
+# different goal phrasing -- e.g. terse composite-unseen goals -- without touching the dataset.
+GOAL_JSON=${GOAL_JSON:-}
 # Which rollout client each stack runs. The default is the cold-plan loop; combine_memory_eval.py is
 # the same loop with the narrate->recipe->warm-plan memory pass in front of it (it derives its own
 # "<...>-memory" results dir, so a memory sweep never mixes into the cold run's numbers).
@@ -334,6 +337,7 @@ for i in "${!GPULIST[@]}"; do
           ${RUN_LABEL:+--method "$RUN_LABEL"} \
           $([[ "$GENERAL_RULES" == 1 ]] && echo --general-rules) \
           $([[ "$TASK_RULES" == 1 ]] && echo --task-rules) \
+          ${GOAL_JSON:+--goal-json "$GOAL_JSON"} \
           $([[ "$RESUME" == 1 ]] && echo --resume) \
           ${EVAL_ARGS:-} \
         || echo "[fleet] stack$i FAILED $ld ep$ep" >&2

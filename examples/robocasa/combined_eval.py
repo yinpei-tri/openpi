@@ -930,6 +930,24 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
     ep_meta = LU.get_episode_meta(ld, ep_index)
     task_name = _task_name_from_lerobot_dir(ld)
     instruction = (ep_meta.get("lang") or "").strip()
+    # GOAL OVERRIDE. --goal-json maps task_name -> the goal string to use INSTEAD of the dataset's
+    # ep_meta['lang']. Applied here, at the single point the goal enters the loop, so every consumer
+    # sees only the replacement: System2's plan-mode prompt, every exec-turn prompt, and System1's
+    # "Task: <goal>" prefix. Nothing else is touched -- same episodes, same scene, same rules.
+    # The original is kept in the record so a run can always be told apart from a full-goal one.
+    instruction_original = instruction
+    goal_override = None
+    if args.goal_json:
+        try:
+            _gmap = json.loads(Path(args.goal_json).expanduser().read_text())
+        except Exception as e:  # a typo here would silently evaluate the wrong thing -- fail loudly
+            raise SystemExit(f"--goal-json unreadable: {args.goal_json}: {e}") from e
+        if task_name in _gmap:
+            goal_override = str(_gmap[task_name]).strip()
+            instruction = goal_override
+        elif args.goal_json_strict:
+            raise SystemExit(f"--goal-json has no entry for {task_name} (use --no-goal-json-strict "
+                             "to fall back to the dataset goal)")
     episode_id = f"{task_name}/{_split_from_lerobot_dir(ld)}/episode_{ep_index:06d}"
     flat = episode_id.replace("/", "__")
     ep_out = out_root / method / flat
@@ -939,6 +957,11 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                           window=args.stop_window)
     doc: dict = {
         "episode_id": episode_id, "task_name": task_name, "instruction": instruction,
+        # What the goal WAS, and whether a --goal-json replaced it. `instruction` above is always the
+        # string the models actually received.
+        "instruction_original": instruction_original,
+        "goal_override": goal_override,
+        "goal_json": args.goal_json or None,
         "method": method, "eval_kind": "combine",
         "lerobot_dir": str(ld), "episode_index": ep_index,
         "rule_config": _rule_config(args),
@@ -1651,6 +1674,15 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                     help="fallback when System2 omits/garbles <estimated_step>")
     ap.add_argument("--replan-steps", type=int, default=16)
     ap.add_argument("--resize-size", type=int, default=224)
+    ap.add_argument("--goal-json", default=None,
+                    help="JSON map {task_name: goal} that REPLACES the dataset's ep_meta['lang'] task "
+                         "goal for those tasks. Use to test a different goal phrasing (e.g. terse "
+                         "goals: /home/ec2-user/composite_unseen_short_goal.json) without touching the "
+                         "dataset. Both systems see only the replacement; episode.json keeps the "
+                         "original under instruction_original.")
+    ap.add_argument("--goal-json-strict", action=argparse.BooleanOptionalAction, default=True,
+                    help="with --goal-json, fail if a task has no entry rather than silently falling "
+                         "back to the dataset goal (which would mix two goal styles in one run)")
     ap.add_argument("--prompt-source", choices=["subgoal", "subgoal_detail"], default="subgoal",
                     help="which System2 text becomes the System1 instruction")
     ap.add_argument("--stop-progress", type=float, default=0.95)
