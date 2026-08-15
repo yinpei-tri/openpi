@@ -431,35 +431,61 @@ def _rule_flag_retract_emitted(task: str, plan: str, subgoal: str, est, state) -
                                "before": subgoal, "after": subgoal}]}
 
 
-def _rule_microwave_again(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """ANY microwave subgoal: rewrite "continue to press X" -> "press X again" for System1.
+# Devices whose PRESS the planner re-issues as "continue to press ...". Matched on the SUBGOAL text.
+# Measured on the no-rules arm plus the four 30/task arms (6000 episodes), counting System2's own
+# "press X again" as the evidence that the rewritten form is in-distribution for System1:
+#     the microwave start button   503 continue-to    9 spontaneous "again"  <- the original case
+#     the kettle lever down         53               2
+#     the kettle switch down        45               0
+#     the kettle switch             10               2
+#     the coffee machine start button 6              0
+# So the kettle has weak but non-zero support and the coffee machine has NONE; both are included at
+# the session owner's request, on the argument that the wrapper is the thing System1 handles badly and
+# the devices are the same kind of momentary contact. Recorded here so the asymmetry is not forgotten:
+# if this rule is ever measured and only helps on the microwave, the kettle/coffee extension is why.
+PRESS_AGAIN_DEVICES = ("microwave", "kettle", "coffee machine")
+# ...and TASK names that identify the device when the subgoal drops it ("press the start button", 17
+# turns, split between PrepareCoffee and TurnOnMicrowave). Safe to widen: the verb gate below still
+# requires "continue to press", and the only other press subgoal in the corpus is "press the cucumber
+# against the cutting board" (CuttingToolSelection), which matches neither list.
+# Exact task fallbacks for subgoals that omit the device name (for example, "press the start
+# button"). Do not use task-name substrings here: CoffeeSetupMug contains "coffee" but does not
+# operate the coffee machine, so a future incidental press in that task must not be rewritten.
+PRESS_AGAIN_TASKS = frozenset({
+    "TurnOnMicrowave", "SteamInMicrowave", "WaffleReheat",
+    "TurnOnElectricKettle", "KettleBoiling", "PrepareCoffee",
+})
 
-    Both phrasings occur in this task's recorded rollouts, but they are not equally represented:
-    "press the microwave start button again" (9x) / "press the start button again" (2x) appear as
-    their own subgoals, so the "... again" form is in-distribution for System1, while "continue
-    to ..." is the wrapper System2 adds when it judges a step only partway done.
+
+def _rule_press_again(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """ANY press subgoal on a PRESS_AGAIN device: "continue to press X" -> "press X again".
+
+    Was ``microwave_again`` and is recorded under that name in every run before 2026-08-14; the
+    mechanism is unchanged, only the device list widened.
+
+    Both phrasings occur in the recorded rollouts but are not equally represented: "press the
+    microwave start button again" (9x on the no-rules arm) appears as System2's OWN subgoal, so the
+    "... again" form is in-distribution for System1, while "continue to ..." is the wrapper System2
+    adds when it judges a step only partway done.
 
     This changes ONLY the instruction string handed to System1. System2's own subgoal is recorded
     verbatim (turn.json "s2"), the checklist is untouched, and the est/budget is unchanged -- so the
-    planner's behaviour on later turns is unaffected except through what System1 actually does.
+    planner's behaviour on later turns is unaffected except through what System1 actually does. It
+    also cannot help a subgoal escape repeat_cap: _norm() collapses "continue to X" and "X again" to
+    the same key, so a rephrased re-issue still counts against the cap.
 
     Guards: an existing trailing "again" is not doubled, and a subgoal without the "continue to"
     wrapper is left exactly as-is.
     """
-    # ANY task whose subgoal is about the MICROWAVE (not just the atomic task): SteamInMicrowave
-    # 145 microwave-button turns, WaffleReheat 36, PrepareCoffee 11. Deliberately NOT global -- the
-    # "start button" phrasing also belongs to the coffee machine (129 turns), and this rephrase is
-    # only motivated where the "... again" form was observed in-distribution.
-    # Gate: the SUBGOAL names the microwave, OR the TASK does. Both are needed -- the atomic task
-    # drops the word ("press the start button" 6x, "press the start button again" 2x) so a
-    # subgoal-only gate would miss its own re-issues, while a task-only gate would miss the
-    # composite tasks (SteamInMicrowave 145 microwave-button turns, WaffleReheat 36).
-    if "microwave" not in _norm(subgoal) and "microwave" not in (task or "").lower():
+    # Gate: the SUBGOAL names the device, OR the TASK does. Both halves are needed -- the atomic tasks
+    # drop the device ("press the start button") so a subgoal-only gate would miss their own
+    # re-issues, while a task-only gate would miss the composites (SteamInMicrowave, WaffleReheat).
+    sg = _norm(subgoal)
+    if not (any(d in sg for d in PRESS_AGAIN_DEVICES) or task in PRESS_AGAIN_TASKS):
         return {}
-    # PRESS only, by request: "continue to press X" -> "press X again". The "... again" form was
-    # observed in-distribution specifically for the button press ("press the microwave start button
-    # again" 9x, "press the start button again" 2x); there is no such evidence for other verbs, so
-    # "continue to push the microwave door closed" is left exactly as System2 wrote it.
+    # PRESS only. The "... again" form was observed in-distribution for a button/switch press and for
+    # nothing else, so "continue to push the microwave door closed" (90 turns, zero "again") is left
+    # exactly as System2 wrote it.
     m = re.match(r"^\s*continue\s+to\s+(press\b.+)$", subgoal or "", re.I)
     if not m:
         return {}
@@ -467,10 +493,14 @@ def _rule_microwave_again(task: str, plan: str, subgoal: str, est, state) -> dic
     new = body if re.search(r"\bagain$", body, re.I) else f"{body} again"
     if new == subgoal:
         return {}
-    return {"subgoal": new,
-            "interventions": [{"rule": "microwave_again", "kind": "subgoal_override",
-                               "detail": "'continue to X' -> 'X again' (the in-distribution "
-                                         "phrasing for System1 on this task)",
+    # BOTH fields. combined_eval hands System1 `subgoal_detail` when --prompt-source=subgoal_detail
+    # (combined_eval.py: s1_text = sg_detail if ...), so rewriting only `subgoal` makes this rule a
+    # no-op under that flag -- silently, since the intervention is still logged. Every other rewriting
+    # rule here sets both.
+    return {"subgoal": new, "subgoal_detail": new,
+            "interventions": [{"rule": "press_again", "kind": "subgoal_override",
+                               "detail": "'continue to press X' -> 'press X again' (the "
+                                         "in-distribution phrasing for System1 on this device)",
                                "before": subgoal, "after": new}]}
 
 
@@ -984,7 +1014,7 @@ PPC2C = "PickPlaceCounterToCabinet"
 #    finished action. Skip it by ADVANCING the plan (see _advance_current_step for why not skip_s1).
 # NAMED DISTINCTLY on purpose: a later _REGRASP_RE (the general re-grasp recovery, "^(reach and )?
 # grasp\b") used to SHADOW this one, because module-level names are resolved at call time and the
-# later assignment wins. That made ppc2c_skip_failed match a FIRST grasp and advance past it, i.e.
+# later assignment wins. That made skip_failed_regrasp match a FIRST grasp and advance past it, i.e.
 # the task stopped grasping at all before lifting. Verified and fixed; do not reintroduce the
 # shared name.
 _REGRASP_AGAIN_RE = re.compile(r"^\s*(continue\s+to\s+)?grasp\b.*\bagain\b\s*$", re.I)
@@ -1002,9 +1032,35 @@ GRASP_EST_FLOOR = 75
 _CONTINUE_PREFIX = "continue to "
 
 
-def _rule_ppc2c_skip_failed(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """PickPlaceCounterToCabinet: a re-grasp after subgoal_failed advances the plan instead."""
-    if task != PPC2C:
+# Tasks where a subgoal_failed re-grasp is skipped. A SET, not one task, because the planner makes the
+# same mistake on both pick-and-place variants and the mechanism is identical -- so it is one rule with
+# a task list, like _STRIP_RETRACT_TASKS / _DRAWER_ALIGN_TASKS, rather than a copy per task.
+#
+# EVIDENCE PER TASK -- turns where judge == subgoal_failed AND the subgoal is "grasp X again", scored
+# against the gripper width the graded segment left (>= its tier bar = the object really was held, so
+# the planner's verdict is a false positive):
+#
+#   PickPlaceCounterToCabinet   21 skips over 3 arms   19 held / 2 EMPTY   (debug ep11, qwen35-inst ep15)
+#   PickPlaceSinkToCounter      67 candidates, 4 arms  67 held / 0 EMPTY
+#
+# PPS2C is where the volume is: 12-25 candidate turns per 30 episodes (40-83% of episodes) against
+# PPC2C's 8 episodes in 1499. First measured run with it included, everything else on, same 30 ids:
+#   skipfail arm 29/30, 6.03 mean turns   vs inst 28/30 6.30, base 26/30 6.53, v2 26/30 6.77
+#   15 skips, 0 declines. The success delta is inside the n=30 noise band (p=0.375 vs base); the turn
+#   reduction is the arithmetic consequence of the skips and is monotone with the mechanism.
+SKIP_FAILED_TASKS = tuple(
+    t.strip() for t in os.environ.get(
+        "SYS2_RULES_SKIP_FAILED_TASKS",
+        "PickPlaceCounterToCabinet,PickPlaceSinkToCounter").split(",") if t.strip())
+
+
+def _rule_skip_failed_regrasp(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """SKIP_FAILED_TASKS: a re-grasp after subgoal_failed advances the plan instead of repeating.
+
+    Was ``ppc2c_skip_failed`` and is recorded under that name in every run before 2026-08-15; the
+    mechanism is unchanged, only the gate widened from one task to a set.
+    """
+    if task not in SKIP_FAILED_TASKS:
         return {}
     # This rule handles System2's FALSE-POSITIVE failure judgement. If the physical width-gated
     # recovery actually fired, its re-grasp must win; otherwise this rule would immediately rewrite
@@ -1013,10 +1069,61 @@ def _rule_ppc2c_skip_failed(task: str, plan: str, subgoal: str, est, state) -> d
         return {}
     if not _REGRASP_AGAIN_RE.match(subgoal or ""):
         return {}
-    return _advance_current_step(
-        plan, subgoal, "ppc2c_skip_failed",
+    # DO NOT OVERRIDE A RE-GRASP THE GRIPPER AGREES WITH. This rule's whole premise is that the
+    # subgoal_failed verdict is a FALSE POSITIVE -- a held object reading inside the closing band. The
+    # width that settles it is already in state (the last step of the previous segment, i.e. the grasp
+    # being judged), and regrasp_recovery cannot supply the verdict here because it is still in its
+    # remember phase while the step is [~], where the width is deliberately not consulted.
+    #
+    # Measured over three arms' PickPlaceCounterToCabinet episodes, every skip this rule made:
+    #     19 of 21 had the object clearly HELD   0.0195 - 0.0709   <- genuine false positives
+    #      2 of 21 had the fingers EMPTY         0.0031            <- the planner was RIGHT
+    # (debug ep11 and qwen35-inst ep15). The bar sits in a wide gap between those groups, unlike the
+    # PreSoakPan port where a successful grasp read 0.017-0.025 against the same 0.015. In ep11 the
+    # discarded re-grasp cost a turn, the recovery landed one turn later via the refund below, missed
+    # again, and the episode carried an empty gripper to the cabinet and died at max_cap.
+    # FAIL CLOSED on an unknown width. `w is None` means nobody measured the grasp (turn 0, a skipped
+    # segment, an older run) -- that is the absence of evidence, not evidence the mug is held, and the
+    # cost of guessing wrong is a dropped object carried to the cabinet. Declining costs one turn.
+    w = state.get("grip_width")
+    bar = regrasp_bar(subgoal or "")
+    if w is None or w < bar:
+        return {"interventions": [{"rule": "skip_failed_regrasp", "kind": "skip_declined",
+                                   "detail": (f"gripper width {w:.4f} < {bar} -- the fingers really "
+                                              "are empty, so System2's subgoal_failed is CORRECT; let "
+                                              "its re-grasp run instead of advancing past it"
+                                              if w is not None else
+                                              "no gripper width recorded for the graded segment -- "
+                                              "cannot verify the object is held, so do not override "
+                                              "System2's re-grasp (fail closed)"),
+                                   "before": subgoal, "after": subgoal}]}
+    fid = current_fine_id(plan)
+    r = _advance_current_step(
+        plan, subgoal, "skip_failed_regrasp",
         f"subgoal_failed re-grasp is a false positive (judge={state.get('judge')!r}); "
         "advance rather than repeat a finished grasp")
+    if any(i.get("kind") == "advance_declined" for i in r.get("interventions", [])):
+        return r
+    # REFUND regrasp_recovery's one-shot budget for this step. regrasp runs FIRST and, seeing System2
+    # re-issue the grasp, books it as tx_counted -- "the planner asked for the extra attempt itself, so
+    # do not stack a borrowed turn on top". That accounting is right only if the attempt RUNS, and the
+    # advance above is precisely the decision that it will not: System1 is handed the next step
+    # instead. Left un-refunded, the physical recovery is disabled exactly when it is needed --
+    # measured: gripper at 0.0010, grasp marked [x], window still open, and regrasp returns {} because
+    # done >= max_injections, so a genuinely dropped object is never recovered.
+    #
+    # Note tx_counted is NOT width-gated (phase 1 counts on text alone), so this refund is not
+    # "trusting" the planner: regrasp's phase-2 gate still requires the fingers to read empty, so on
+    # the false positive this rule is built for -- object held, width inside the holding band -- the
+    # refund changes nothing at all.
+    if fid and state.pop(f"rg_{fid}_injected", None):
+        r.setdefault("interventions", []).append(
+            {"rule": "skip_failed_regrasp", "kind": "regrasp_credit_refund",
+             "detail": f"regrasp_recovery had counted System2's re-issue of {fid} as its one attempt; "
+                       "that attempt is being skipped, so the credit is returned and the width-gated "
+                       "recovery can still fire if the object really was dropped",
+             "before": f"rg_{fid} attempts used 1/1", "after": f"rg_{fid} attempts used 0/1"})
+    return r
 
 
 def _rule_ppc2c_grasp_est(task: str, plan: str, subgoal: str, est, state) -> dict:
@@ -1168,23 +1275,57 @@ def _rule_coffee_grasp_est(task: str, plan: str, subgoal: str, est, state) -> di
 # whose budget is 12 turns and whose mean is 7.5-7.9, with 4 of 30 episodes dying on max_turns in the
 # -v2 arm. So the wasted turn is not free.
 #
-# Advance the plan rather than repeat the grasp -- the same mechanism as the graduated
-# _rule_ppc2c_skip_failed, and deliberately NOT skip_s1 (a skipped turn does not step the env, so
-# _check_success can never fire; measured 4/8 -> 0/8 on TurnOnMicrowave).
+# Move the plan on rather than repeat the grasp. NOT the same mechanism as the graduated
+# _rule_skip_failed_regrasp, which advances one fine step via _advance_current_step: this rule closes
+# the whole grasp milestone and writes the NEXT milestone's steps out (see the rule body for why a
+# re-query was tried and rejected). Deliberately NOT skip_s1 either -- a skipped turn does not step
+# the env, so _check_success can never fire; measured 4/8 -> 0/8 on TurnOnMicrowave.
 COFFEE_SKIP_FAILED = os.environ.get("SYS2_COFFEE_SKIP_FAILED", "1") not in ("", "0")
 
 
 def _rule_coffee_skip_failed(task: str, plan: str, subgoal: str, est, state) -> dict:
-    """CoffeeSetupMug: a "grasp the mug again" re-grasp advances the plan instead of repeating.
+    """CoffeeSetupMug: a "grasp the mug again" re-grasp CLOSES the grasp milestone, writes the next
+    milestone's four steps, and hands System1 the first of them.
 
-    Matched on the "... again" form only (``_REGRASP_AGAIN_RE``), so a genuine FIRST grasp is never
-    skipped. Declines when the grasp is the last fine step, since advancing off the end would strand
-    System2 with nothing to propose.
+    NOT an advance-one-fine-step (that is ``_rule_skip_failed_regrasp``, via ``_advance_current_step``)
+    and NOT a re-query (``requery_s2``) -- System2 was asked again and confidently re-opened the
+    milestone, so the rewrite is deterministic. The comment in the body records that experiment.
+
+    Gates:
+      * the "... again" form only (``_REGRASP_AGAIN_RE``), so a genuine FIRST grasp is never skipped;
+      * declines when there is no LATER unfinished milestone to move into (nothing to write);
+      * at most ONE rewrite per episode (``state["coffee_skip_closes"]``), so re-applying the rules to
+        the revised plan cannot walk the whole checklist.
+
+    Like ``skip_failed_regrasp``, this requires ``judge == "subgoal_failed"``, a measured gripper width
+    showing that the mug is held, and no physical recovery injection on this turn. A missing or empty
+    width fails closed and lets System2's re-grasp execute.
     """
     if task != COFFEE or not COFFEE_SKIP_FAILED:
         return {}
     if not _REGRASP_AGAIN_RE.match(subgoal or ""):
         return {}
+    # THE SAME THREE GATES skip_failed_regrasp uses. This rule shipped with none of them, on the
+    # argument that the "... again" phrasing alone identified the false positive. Measured over the
+    # four 30-episode CoffeeSetupMug arms, that is nearly true but not true:
+    #     71 "grasp X again" turns, ALL of them judge == subgoal_failed  -> the judge gate is free
+    #     68 with the mug HELD (0.0204-0.06, above the 0.003 mug bar)    -> unchanged behaviour
+    #      3 with the fingers EMPTY (0.0014 / 0.0021 / 0.0017)           -> the skip was WRONG
+    # (base ep9 t2, base ep27 t2, v2 ep28 t2.) On those three the rule closed M1, wrote M2's steps and
+    # sent System1 to carry a mug it was not holding -- and consumed regrasp_recovery's one attempt on
+    # the way, so nothing could recover it. Zero coverage lost, three wrong skips prevented.
+    if state.get("judge") != "subgoal_failed" or state.get("regrasp_recovery_hit"):
+        return {}
+    w = state.get("grip_width")
+    bar = regrasp_bar(subgoal or "")
+    if w is None or w < bar:
+        return {"interventions": [{"rule": "coffee_skip_failed", "kind": "skip_declined",
+                                   "detail": (f"gripper width {w:.4f} < {bar} -- the mug is NOT held, "
+                                              "so System2's subgoal_failed is correct; let its "
+                                              "re-grasp run" if w is not None else
+                                              "no gripper width recorded -- cannot verify the mug is "
+                                              "held, so do not override System2 (fail closed)"),
+                                   "before": subgoal, "after": subgoal}]}
     # DETERMINISTIC REWRITE, no re-query. Re-asking System2 was tried and it simply refused: handed
     # the closed checklist it answered with a plan_update RE-OPENING the milestone --
     #     <thought>the gripper closed too early and only achieved a shallow, insecure hold...</thought>
@@ -1210,6 +1351,7 @@ def _rule_coffee_skip_failed(task: str, plan: str, subgoal: str, est, state) -> 
         or next((b for b in blocks if b["mark"] == "~"), None)
     if cur_b is None:
         return {}
+    cur_f = next((f for f in cur_b["fine"] if f["fid"] == cur_id), None)
     if obj is None:      # fall back to the milestone's own wording ("grasp the mug", "pick up the mug")
         m2 = re.match(r"^(?:grasp|pick\s+up)\s+(.*)$", cur_b["text"].strip(), re.IGNORECASE)
         obj = m2.group(1).strip() if m2 else "the mug"
@@ -1220,6 +1362,32 @@ def _rule_coffee_skip_failed(task: str, plan: str, subgoal: str, est, state) -> 
     nxt = next((b for b in blocks if _num(b["mid"]) > _num(cur_b["mid"]) and b["mark"] != "x"), None)
     if nxt is None:
         return {}                                  # no milestone to move into
+    # THE REWRITE IS SHAPE-SPECIFIC, so check the shape instead of assuming it. The four steps written
+    # below are the mug-placement decomposition; they are only correct if the milestone being closed is
+    # the mug GRASP and the one being filled in is still unstarted. Without these checks the rule
+    # rewrote whatever happened to be current: with M3 "press the coffee machine start button" active
+    # it produced "lift and carry the start button to the coffee machine dispenser" and overwrote M4
+    # "retract the arm" with four placement steps; and with M2 already part-executed it reset a step
+    # marked [x] back to [~], destroying execution history. All 36 matching turns in the recorded logs
+    # were at M1, so this was dormant -- but a planner that numbers differently on one episode is
+    # exactly the case a hardcoded rewrite must refuse.
+    if (not re.match(r"^(grasp|pick\s+up)\b", cur_b["text"].strip(), re.IGNORECASE)
+            or not re.search(r"\bmug\b", cur_b["text"], re.IGNORECASE)
+            or cur_f is None or not _REGRASP_RE.match(cur_f["text"])
+            or not re.search(r"\bmug\b", cur_f["text"], re.IGNORECASE)):
+        return {"interventions": [{"rule": "coffee_skip_failed", "kind": "shape_declined",
+                                   "detail": f"{cur_b['mid']} is {cur_b['text'].strip()!r}, not the mug "
+                                             "grasp -- refusing to write the placement decomposition "
+                                             "over an unrelated milestone",
+                                   "before": subgoal, "after": subgoal}]}
+    if (nxt["mark"] != " " or nxt["fine"]
+            or "mug" not in nxt["text"].lower()
+            or not any(x in nxt["text"].lower() for x in ("coffee machine", "dispenser"))):
+        return {"interventions": [{"rule": "coffee_skip_failed", "kind": "shape_declined",
+                                   "detail": f"{nxt['mid']} is not a bare, pending mug-placement "
+                                             "milestone -- refusing to overwrite its authored steps "
+                                             "or execution history",
+                                   "before": subgoal, "after": subgoal}]}
     if state.get("coffee_skip_closes", 0) >= 1:
         return {}                                  # ONE rewrite per episode; do not re-plan repeatedly
     steps = [f"lift and carry {obj} to the coffee machine dispenser",
@@ -1233,6 +1401,11 @@ def _rule_coffee_skip_failed(task: str, plan: str, subgoal: str, est, state) -> 
     nxt["fine"] = [{"mark": ("~" if i == 0 else " "), "fid": f"{nxt['mid']}.{i + 1}", "text": t}
                    for i, t in enumerate(steps)]   # ...with the known decomposition written out
     state["coffee_skip_closes"] = state.get("coffee_skip_closes", 0) + 1
+    # Return regrasp_recovery's one-shot credit if it booked System2's re-issue as tx_counted: that
+    # attempt is exactly what is being skipped here, so leaving it spent disables the physical recovery
+    # for this grasp (same reasoning as skip_failed_regrasp).
+    _fid = current_fine_id(plan)
+    _refunded = bool(_fid) and bool(state.pop(f"rg_{_fid}_injected", None))
     new_sg = steps[0]
     # est is ASSIGNED, not left to resolution. On this turn the est proposals were computed from the
     # subgoal System2 asked for ("grasp the mug again"), so coffee_grasp_est's grasp bump was winning
@@ -1253,7 +1426,12 @@ def _rule_coffee_skip_failed(task: str, plan: str, subgoal: str, est, state) -> 
                           f"{nxt['mid']}.1..{nxt['mid']}.{len(steps)}"},
                 {"rule": "coffee_skip_failed", "kind": "subgoal_override",
                  "detail": "run the first step of the next milestone instead of the re-grasp",
-                 "before": subgoal, "after": new_sg}]}
+                 "before": subgoal, "after": new_sg},
+                *([{"rule": "coffee_skip_failed", "kind": "regrasp_credit_refund",
+                    "detail": f"regrasp_recovery had counted System2's re-issue of {_fid} as its one "
+                              "attempt; that attempt is being skipped, so the credit is returned",
+                    "before": f"rg_{_fid} attempts used 1/1",
+                    "after": f"rg_{_fid} attempts used 0/1"}] if _refunded else [])]}
 
 
 DRAWER = "PickPlaceDrawerToCounter"
@@ -2312,7 +2490,8 @@ def mandatory_on() -> bool:
 #                      NOT established as a general rule: the all-tasks form has no A/B of its own,
 #                      the PreSoakPan port was 13/20 -> 11/20 (p=0.688, no effect either way), and no
 #                      replicate of the PIL arm was ever run.
-#   microwave_again    subgoal- or task-gated on "microwave" (TurnOnMicrowave, SteamInMicrowave 145
+#   press_again        subgoal- or task-gated on microwave / kettle / coffee machine (was
+#                      microwave_again; TurnOnMicrowave, SteamInMicrowave 145
 #                      button turns, WaffleReheat 36, PrepareCoffee 11): "continue to press X" ->
 #                      "press X again" for System1 only. NO A/B at all -- the support is that the
 #                      "... again" form is in-distribution (9x / 2x as its own subgoal) while
@@ -2331,7 +2510,7 @@ def mandatory_on() -> bool:
 # ORDER: rewrite text first, then let the physical recovery replace the turn when needed. The faucet
 # estimate runs last and explicitly declines a recovery turn, so its estimate cannot leak from the
 # held faucet action onto the injected re-grasp. est proposals are still resolved once below.
-_GENERAL_RULES: tuple = (_rule_microwave_again, _rule_regrasp_recovery, _rule_sink_faucet_est)
+_GENERAL_RULES: tuple = (_rule_press_again, _rule_regrasp_recovery, _rule_sink_faucet_est)
 
 # =============================================================================================
 # GRADUATED: CloseToasterOvenDoor -- pin est to 100, and name the door HANDLE on a bare-door reach.
@@ -2488,7 +2667,7 @@ _TASK_RULES = (_rule_drawer_base_align, _rule_drawer_base_align_est,
                _rule_mixer_est_floor, _rule_coffee_m2_est,
                _rule_coffee_split_release, _rule_coffee_split_reach_grasp, _rule_coffee_grasp_est,
                _rule_coffee_skip_failed,
-               _rule_ppc2c_skip_failed, _rule_ppc2c_extra_carry, _rule_ppc2c_grasp_est,
+               _rule_skip_failed_regrasp, _rule_ppc2c_extra_carry, _rule_ppc2c_grasp_est,
                _rule_gtb_reach_grasp, _rule_gtb_add_wait, _rule_gtb_skip_wait_cont,
                _rule_gtb_wait_force_steps, _rule_gtb_slot_est,
                _rule_pil_reach_continue,
@@ -2619,6 +2798,7 @@ def apply_plan_rules(task: str, *, plan: str) -> dict:
 # patch file must never break a real run, so each import failure is swallowed with a warning.
 _EXP_RULES: tuple = ()
 _EXP_PLAN_RULES: tuple = ()
+_EXP_RULE_TASKS: dict[str, tuple[str, ...]] = {}
 if not os.environ.get("SYS2_RULES_NO_EXP"):
     import glob as _glob
     import importlib as _importlib
@@ -2629,6 +2809,12 @@ if not os.environ.get("SYS2_RULES_NO_EXP"):
             _m = _importlib.import_module(_mod)
             _EXP_RULES = _EXP_RULES + tuple(getattr(_m, "EXP_RULES", ()))
             _EXP_PLAN_RULES = _EXP_PLAN_RULES + tuple(getattr(_m, "EXP_PLAN_RULES", ()))
+            # An exp file declares its rules' task scope by EXPORTING ``EXP_RULE_TASKS``; it cannot
+            # import _RULE_TASKS and poke it, because this loader runs BEFORE that dict is defined
+            # (attempting it raised "partially initialized module" and silently dropped the file's
+            # rules). Merged into _RULE_TASKS below so the scope self-check and the --task-rules help
+            # cover experimental rules too.
+            _EXP_RULE_TASKS.update(getattr(_m, "EXP_RULE_TASKS", {}) or {})
         except Exception as _e:  # a bad patch file must never break a real run
             print(f"WARNING: experimental rules in {_mod} not loaded: {_e}", flush=True)
     _RULES = _RULES + tuple(_EXP_RULES)
@@ -2671,7 +2857,7 @@ _RULE_TASKS: dict[str, tuple[str, ...]] = {
     "_rule_coffee_split_reach_grasp": (COFFEE,),
     "_rule_coffee_grasp_est": (COFFEE,),
     "_rule_coffee_skip_failed": (COFFEE,),
-    "_rule_ppc2c_skip_failed": (PPC2C,),
+    "_rule_skip_failed_regrasp": SKIP_FAILED_TASKS,
     "_rule_ppc2c_extra_carry": (PPC2C,),
     "_rule_ppc2c_grasp_est": (PPC2C,),
     "_rule_gtb_reach_grasp": (GTB,),
@@ -2686,6 +2872,11 @@ _RULE_TASKS: dict[str, tuple[str, ...]] = {
     # Experimental patch layer (sys2_rules_exp*.py).
     "_rule_tosf_force_plan": ("TurnOnSinkFaucet",),
 }
+
+# Scopes declared by experimental patch files (EXP_RULE_TASKS). setdefault, so an exp file can never
+# silently redefine the scope of a graduated rule.
+for _rn, _rt in _EXP_RULE_TASKS.items():
+    _RULE_TASKS.setdefault(_rn, tuple(_rt))
 
 # SELF-CHECK: every registered non-general rule must be accounted for above, so the --task-rules help
 # and any per-task audit cannot silently drift from the registry.

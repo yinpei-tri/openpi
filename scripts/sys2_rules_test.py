@@ -90,6 +90,33 @@ def test_microwave_est_bump_is_task_specific():
     assert rules._rule_microwave_est_bump("TurnOnSinkFaucet", "", "turn on the sink faucet handle", 50, {}) == {}
 
 
+@pytest.mark.parametrize(
+    ("task", "subgoal"),
+    [
+        ("TurnOnMicrowave", "continue to press the start button"),
+        ("TurnOnElectricKettle", "continue to press the switch down"),
+        ("PrepareCoffee", "continue to press the start button"),
+        ("NavigateKitchen", "continue to press the kettle switch"),
+    ],
+)
+def test_press_again_rewrites_both_prompt_fields(task, subgoal):
+    result = rules._rule_press_again(task, "", subgoal, 50, {})
+
+    expected = subgoal.removeprefix("continue to ") + " again"
+    assert result["subgoal"] == expected
+    assert result["subgoal_detail"] == expected
+    assert rules._norm(result["subgoal"]) == rules._norm(subgoal)
+
+
+def test_press_again_does_not_use_broad_task_name_substrings():
+    assert rules._rule_press_again(
+        "CoffeeSetupMug", "", "continue to press the mug against the dispenser", 50, {},
+    ) == {}
+    assert rules._rule_press_again(
+        "CuttingToolSelection", "", "continue to press the cucumber against the board", 50, {},
+    ) == {}
+
+
 def test_regrasp_hit_suppresses_sink_est_for_injected_turn():
     grasp_plan = """- [~] M1: operate faucet
   * [~] M1.1: grasp the sink faucet handle
@@ -120,23 +147,46 @@ def test_regrasp_hit_suppresses_sink_est_for_injected_turn():
     assert held["est"] == 50
 
 
-def test_ppc2c_skip_failed_requires_judge_and_no_physical_recovery():
+def test_skip_failed_regrasp_requires_judge_and_no_physical_recovery():
     plan = """- [~] M1: pick up ketchup
   * [x] M1.1: reach to ketchup
   * [~] M1.2: grasp ketchup
   * [ ] M1.3: lift ketchup"""
 
-    assert rules._rule_ppc2c_skip_failed(
+    assert rules._rule_skip_failed_regrasp(
         rules.PPC2C, plan, "grasp ketchup again", 50, {"judge": None}) == {}
-    assert rules._rule_ppc2c_skip_failed(
+    assert rules._rule_skip_failed_regrasp(
         rules.PPC2C, plan, "grasp ketchup again", 50,
         {"judge": "subgoal_failed", "regrasp_recovery_hit": True},
     ) == {}
-    result = rules._rule_ppc2c_skip_failed(
+    # FAIL CLOSED: no recorded width is not evidence that the object is held.
+    assert rules._rule_skip_failed_regrasp(
         rules.PPC2C, plan, "grasp ketchup again", 50,
         {"judge": "subgoal_failed", "regrasp_recovery_hit": False},
+    )["interventions"][0]["kind"] == "skip_declined"
+    # ...and the gripper reading empty means System2 was RIGHT, so its re-grasp must run.
+    assert rules._rule_skip_failed_regrasp(
+        rules.PPC2C, plan, "grasp ketchup again", 50,
+        {"judge": "subgoal_failed", "regrasp_recovery_hit": False, "grip_width": 0.001},
+    )["interventions"][0]["kind"] == "skip_declined"
+    # Only a HELD object licenses the skip.
+    result = rules._rule_skip_failed_regrasp(
+        rules.PPC2C, plan, "grasp ketchup again", 50,
+        {"judge": "subgoal_failed", "regrasp_recovery_hit": False, "grip_width": 0.045},
     )
     assert result["subgoal"] == "lift ketchup"
+
+
+def test_skip_failed_regrasp_is_enabled_for_sink_to_counter():
+    plan = """- [~] M1: pick up the egg
+  * [x] M1.1: reach to the egg
+  * [~] M1.2: grasp the egg
+  * [ ] M1.3: lift the egg"""
+    result = rules._rule_skip_failed_regrasp(
+        "PickPlaceSinkToCounter", plan, "grasp the egg again", 50,
+        {"judge": "subgoal_failed", "grip_width": 0.04},
+    )
+    assert result["subgoal"] == "lift the egg"
 
 
 @pytest.mark.parametrize("subgoal", ["grasp the red mug", "grasp mug", "Grasp the blue mug"])
@@ -161,6 +211,101 @@ def test_coffee_normal_grasp_has_est_floor_75(subgoal):
 )
 def test_coffee_normal_grasp_uses_raw_anchored_subgoal(subgoal):
     assert rules._rule_coffee_grasp_est(rules.COFFEE, "", subgoal, 50, {}) == {}
+
+
+COFFEE_GRASP_PLAN = """- [~] M1: grasp the mug
+  * [x] M1.1: reach for the mug
+  * [~] M1.2: grasp the mug
+- [ ] M2: place the mug under the coffee machine dispenser"""
+
+
+@pytest.mark.parametrize("judge", [None, "subgoal_incomplete", "subgoal_complete"])
+def test_coffee_skip_failed_requires_failed_judge(judge):
+    assert rules._rule_coffee_skip_failed(
+        rules.COFFEE, COFFEE_GRASP_PLAN, "grasp the mug again", 75,
+        {"judge": judge, "grip_width": 0.02},
+    ) == {}
+
+
+@pytest.mark.parametrize("width", [None, 0.001])
+def test_coffee_skip_failed_preserves_real_or_unverified_regrasp(width):
+    result = rules._rule_coffee_skip_failed(
+        rules.COFFEE, COFFEE_GRASP_PLAN, "grasp the mug again", 75,
+        {"judge": "subgoal_failed", "grip_width": width},
+    )
+    assert result["interventions"][0]["kind"] == "skip_declined"
+    assert "subgoal" not in result
+
+
+def test_coffee_skip_failed_yields_to_an_injected_physical_recovery():
+    assert rules._rule_coffee_skip_failed(
+        rules.COFFEE, COFFEE_GRASP_PLAN, "grasp the mug again", 75,
+        {"judge": "subgoal_failed", "grip_width": 0.02, "regrasp_recovery_hit": True},
+    ) == {}
+
+
+@pytest.mark.parametrize(("width", "expected"), [(0.001, "grasp the mug again"),
+                                                   (0.02, "lift and carry the mug")])
+def test_coffee_regrasp_and_skip_rules_coordinate_in_registry_order(width, expected):
+    state = {"judge": "task_begin", "grip_width": 0.079}
+    rules.apply_rules(
+        rules.COFFEE, plan=COFFEE_GRASP_PLAN, subgoal="grasp the mug",
+        subgoal_detail="grasp the mug", est=50, state=state,
+        general=True, task_tier=True,
+    )
+    state["judge"] = "subgoal_failed"
+    state["grip_width"] = width
+
+    result = rules.apply_rules(
+        rules.COFFEE, plan=COFFEE_GRASP_PLAN, subgoal="grasp the mug again",
+        subgoal_detail="grasp the mug again", est=75, state=state,
+        general=True, task_tier=True,
+    )
+
+    assert result["subgoal"].startswith(expected)
+    if width < rules.regrasp_bar("grasp the mug"):
+        assert state["rg_M1.2_injected"] == 1  # the re-grasp will actually execute
+    else:
+        assert "rg_M1.2_injected" not in state  # skipped attempt was refunded
+
+
+def test_coffee_skip_failed_rewrites_only_safe_shape_and_refunds_regrasp():
+    state = {
+        "judge": "subgoal_failed", "grip_width": 0.02,
+        "rg_M1.2_injected": 1,
+    }
+    result = rules._rule_coffee_skip_failed(
+        rules.COFFEE, COFFEE_GRASP_PLAN, "grasp the mug again", 75, state,
+    )
+
+    assert result["subgoal"] == "lift and carry the mug to the coffee machine dispenser"
+    assert result["est_assign"] == rules.COFFEE_M2_EST
+    assert "- [x] M1: grasp the mug" in result["plan"]
+    assert "- [~] M2: place the mug under the coffee machine dispenser" in result["plan"]
+    assert "rg_M1.2_injected" not in state
+    assert any(i["kind"] == "regrasp_credit_refund" for i in result["interventions"])
+
+
+def test_coffee_skip_failed_refuses_to_overwrite_unrelated_or_unrolled_milestone():
+    unrelated = """- [x] M1: grasp the mug
+- [~] M2: press the coffee machine start button
+  * [~] M2.1: press the coffee machine start button
+- [ ] M3: retract the arm"""
+    result = rules._rule_coffee_skip_failed(
+        rules.COFFEE, unrelated, "grasp the mug again", 75,
+        {"judge": "subgoal_failed", "grip_width": 0.02},
+    )
+    assert result["interventions"][0]["kind"] == "shape_declined"
+
+    unrolled_next = """- [~] M1: grasp the mug
+  * [~] M1.1: grasp the mug
+- [ ] M2: place the mug under the coffee machine dispenser
+  * [ ] M2.1: carry the mug to the dispenser"""
+    result = rules._rule_coffee_skip_failed(
+        rules.COFFEE, unrolled_next, "grasp the mug again", 75,
+        {"judge": "subgoal_failed", "grip_width": 0.02},
+    )
+    assert result["interventions"][0]["kind"] == "shape_declined"
 
 
 def test_drawer_authored_m11_base_alignment_has_est_floor_75():
@@ -211,7 +356,7 @@ def test_drawer_alignment_est_requires_m11_alignment_step():
 def test_current_general_registry():
     assert tuple(fn.__name__ for fn in rules._MANDATORY_RULES) == ("_rule_repeat_cap",)
     assert tuple(fn.__name__ for fn in rules._GENERAL_RULES) == (
-        "_rule_microwave_again",
+        "_rule_press_again",
         "_rule_regrasp_recovery",
         "_rule_sink_faucet_est",
     )
@@ -230,5 +375,5 @@ def test_rule_config_describes_selected_tiers():
 
     full = rules.rule_config(general=True, task_tier=True)
     assert full["active_rules"]["general"] == [
-        "microwave_again", "regrasp_recovery", "sink_faucet_est"]
-    assert "ppc2c_skip_failed" in full["active_rules"]["task"]
+        "press_again", "regrasp_recovery", "sink_faucet_est"]
+    assert "skip_failed_regrasp" in full["active_rules"]["task"]
