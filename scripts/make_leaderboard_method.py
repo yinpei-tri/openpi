@@ -25,7 +25,7 @@ episode records. Here there are no records to verify, so it is an assumption; it
 default view entirely, which hides a comparable result for a worse reason.
 
 Usage:
-    python scripts/make_leaderboard_method.py                     # writes abot-m0.6
+    python scripts/make_leaderboard_method.py                     # writes abot06
     python scripts/make_leaderboard_method.py --method-name foo --dry-run
 """
 
@@ -148,7 +148,7 @@ def build(method: str) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--method-name", default="abot-m0.6")
+    ap.add_argument("--method-name", default="abot06")
     ap.add_argument("--out-dir", type=Path, default=OUT_DIR)
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()

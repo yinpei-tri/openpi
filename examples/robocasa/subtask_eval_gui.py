@@ -1033,15 +1033,24 @@ const isMemoryMethod=m=>/-memory$/i.test(String(m||''));
 // comes from. 480 episodes over the 16 composite_unseen tasks, so its overall is not comparable with
 // a 50-task overall -- hence the two boxes below (one to include it, one to see nothing else).
 const isUnseenShortMethod=m=>/unseenshort/i.test(String(m||''));
-// NEW-TASK runs: the 24-task held-out set, outside the 50-task manifest -- every task reports split
-// "other". Flagged server-side (`newtask`), with the name as a fallback. Their refined fields are
-// nulled by _combine_stats on purpose: the horizon gate is defined against the official manifest, so a
-// "refined" number here would be a copy of raw wearing a scored label.
+// NEW-TASK runs: the held-out set outside the 50-task manifest -- every task reports split "other".
+// Flagged server-side (`newtask`), with the name as a fallback. The set GROWS (24 tasks, then 34 as of
+// 2026-08-16), so no size is hardcoded anywhere below; every count is read off the data. Their refined
+// fields ARE shown: the gate knows these tasks' horizons and demotes nothing on them, so refined
+// equals raw, and printing n/a would hide a real result behind a technicality.
 const isNewTaskMethod=(m,rec)=>((rec&&rec.newtask)||/newtask/i.test(String(m||'')));
+// HUMAN-RECIPE runs: the composite_unseen split re-run with a HAND-WRITTEN recipe supplied to the
+// planner, so its 16-task result is not truth-free the way every other arm's is -- a human read the
+// task and wrote the plan. It borrows its other two splits from the matching -inst run (see donorOf)
+// to get a composed overall, which makes it look like a full 50-task row; hidden by default so that
+// composed number never sits in the default ranking unasked. Matched on the name suffix, which is the
+// only thing that distinguishes it from -inst (same checkpoint, same tasks, different goal source).
+const isHumanRecipeMethod=m=>/-human-recipe$/.test(String(m||''));
 // SPLIT DISPLAY NAMES. "other" is the split TARGET_TASK_SPLIT assigns to anything off the 50-task
-// manifest, and in this tree it is owned exclusively by the newtask runs -- verified: 24 distinct
-// tasks, reported by newtask methods and nothing else. So it is labelled "newtask", because "other"
-// tells a reader nothing about what the column holds.
+// manifest, and in this tree it is owned exclusively by the newtask runs -- verified: every task in it
+// is reported by a newtask method and by nothing else (34 distinct tasks as of 2026-08-16, up from 24;
+// the column header carries the live count). So it is labelled "newtask", because "other" tells a
+// reader nothing about what the column holds.
 const SPL_NAME={atomic_seen:'atomic-seen',composite_seen:'composite-seen',
                 composite_unseen:'composite-unseen',other:'newtask'};
 const splName=x=>SPL_NAME[x]||String(x||'').replace('_','-');
@@ -1212,6 +1221,9 @@ async function load(){
     const isOtherRun=m=>!isDebugMethod(m)&&!isNewTaskMethod(m,C[m])
                         &&(isV2Method(m)||!isEval30(m));
     const OTH=ALL.filter(isOtherRun);
+    // debug-* excluded so the count matches what ticking the box reveals: a debug human-recipe run
+    // stays behind the debug box, and counting it here would promise a row that never appears.
+    const HR=ALL.filter(m=>isHumanRecipeMethod(m)&&!isDebugMethod(m));
     const BL=ALL.filter(m=>isBaselineMethod(m,C[m]));
     if(window._showDebug===undefined)window._showDebug=false;    // default OFF
     // Merged -v2 + 20/task box, and the newtask box. Both default OFF: the default view is the arms
@@ -1238,6 +1250,10 @@ async function load(){
       window._refined=(localStorage.getItem('cmbRefined')!=='0');
     if(window._showUS===undefined)
       window._showUS=(localStorage.getItem('cmbShowUS')==='1');   // default OFF
+    // Default OFF, remembered: including a human-written-recipe arm is a deliberate comparison mode,
+    // not something you flick on to check one number.
+    if(window._showHR===undefined)
+      window._showHR=(localStorage.getItem('cmbShowHR')==='1');   // default OFF
     if(window._onlyUS===undefined)
       window._onlyUS=(localStorage.getItem('cmbOnlyUS')==='1');   // default OFF
     // ONLY-MODE short-circuits every other visibility box: the point is to see the terse-goal arms
@@ -1246,6 +1262,7 @@ async function load(){
       : ALL.filter(m=>(window._showDebug||!isDebugMethod(m))
                         && (window._showBaseline||!isBaselineMethod(m,C[m]))
                         && (window._showUS||!isUnseenShortMethod(m))
+                        && (window._showHR||!isHumanRecipeMethod(m))
                         && (window._showNT||!isNewTaskMethod(m,C[m]))
                         && (window._showOther||!isOtherRun(m)));
     const dbgBar=document.getElementById('cmbdebug');
@@ -1274,6 +1291,14 @@ async function load(){
           +`<input type="checkbox" id="cmbusonlycb" ${window._onlyUS?'checked':''} `
           +`style="margin-right:4px">unseen-short ONLY</label>`);
       }
+      if(HR.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px" `
+        +`title="The composite_unseen split re-run with a HAND-WRITTEN recipe given to the planner. `
+        +`Every other arm infers the plan itself, so this one is not truth-free and is not a like-for-`
+        +`like entry in the ranking. It also borrows its atomic-seen and composite-seen splits from the `
+        +`matching -inst run, so its overall is composed rather than measured end to end.">`
+        +`<input type="checkbox" id="cmbhrcb" ${window._showHR?'checked':''} `
+        +`style="margin-right:4px">include ${HR.length} human-recipe run${HR.length>1?'s':''} `
+        +`<span style="color:#aaa">(hand-written recipe)</span></label>`);
       if(OTH.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px" `
         +`title="The superseded -v2 rule arm and the older 20-episodes-per-task sweeps. Real results, `
         +`but on a rule set or a denominator that is no longer the comparison.">`
@@ -1312,6 +1337,9 @@ async function load(){
     const usonly=document.getElementById('cmbusonlycb');
     if(usonly)usonly.onchange=()=>{window._onlyUS=usonly.checked;
       localStorage.setItem('cmbOnlyUS', window._onlyUS?'1':'0'); load();};
+    const hrcb=document.getElementById('cmbhrcb');
+    if(hrcb)hrcb.onchange=()=>{window._showHR=hrcb.checked;
+      localStorage.setItem('cmbShowHR', window._showHR?'1':'0'); load();};
     const ocb=document.getElementById('cmbothcb');
     if(ocb)ocb.onchange=()=>{window._showOther=ocb.checked;
       localStorage.setItem('cmbShowOther', window._showOther?'1':'0'); load();};
@@ -1327,11 +1355,11 @@ async function load(){
     // Guard on EITHER kind being hidden: with only *-memory runs present and its box unticked,
     // DBG.length alone would be 0 and the page would claim there are no runs at all.
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
-      '<span style="color:#888">'+((DBG.length||US.length||OTH.length||NT.length||BL.length)
+      '<span style="color:#888">'+((DBG.length||US.length||HR.length||OTH.length||NT.length||BL.length)
         ? (window._onlyUS
             ? 'No unseen-short runs to show \u2014 untick \u201cunseen-short ONLY\u201d.'
-            : 'Only hidden runs present (debug-* / other / baseline / unseen-short / newtask) '
-              +'\u2014 tick a box above to see them.')
+            : 'Only hidden runs present (debug-* / other / baseline / unseen-short / newtask / '
+              +'human-recipe) \u2014 tick a box above to see them.')
         : 'No combined runs yet — see /combine.')+'</span>';return;}
     // ONE table: overall + per-split, RANKED best -> worst by overall rate.
     //
@@ -1352,7 +1380,7 @@ async function load(){
     // Only show a split column some method actually has episodes for ('other' is normally empty).
     const spShown=sp.filter(x=>ms.some(m=>((C[m].per_split||{})[x]||{}).n));
     // FULL-MANIFEST COVERAGE. A run evaluated on only one slice -- composite-unseen (16 tasks) or the
-    // newtask set (24 tasks) -- has no comparable "overall": averaging the hardest split alone against
+    // newtask set (34 tasks) -- has no comparable "overall": averaging the hardest split alone against
     // a 50-task average compares two different measurements. Such rows get an EMPTY overall cell and
     // are ranked BELOW every complete run, so the leaderboard reads top-down as "best full eval" and
     // the partial runs sit underneath rather than being interleaved by a number that is not the same
@@ -1360,6 +1388,37 @@ async function load(){
     const MANIFEST=['atomic_seen','composite_seen','composite_unseen'];
     const fullCov=m=>{const P=C[m].per_split||{};
       return MANIFEST.every(x=>P[x]&&P[x].n);};
+    // BORROWED SPLITS -- deliberately scoped to ONE method pattern, `<x>-inst-human-recipe`, whose
+    // donor is `<x>-inst`. That arm re-runs composite-unseen with a human-written recipe and is the
+    // -inst run untouched elsewhere, so filling its other two splits from -inst gives a comparable
+    // 1500-episode overall.
+    //
+    // NOT a general "longest full-coverage prefix" rule. That was tried and it silently paired
+    // `xiaomi-robo1-unseenshort` with `xiaomi-robo1` -- the prefix matched and the size guard passed,
+    // so a TERSE-GOAL arm would have been handed full-goal atomic and composite-seen cells and ranked
+    // on them. Borrowing is only sound when the modification is confined to the split being re-run,
+    // and that is a fact about the arm, not about its name. So it is enumerated, not inferred: adding
+    // another borrowing arm means adding it here on purpose.
+    const donorOf=m=>{
+      const x=/^(.*-inst)-human-recipe$/.exec(m||'');
+      if(!x)return null;
+      const dn=x[1];
+      if(!C[dn]||!fullCov(dn))return null;
+      // Still guarded on size: if this arm's own split is smaller than the donor's (a sweep still in
+      // flight), composing would put a mongrel denominator in the overall column.
+      const P=C[m].per_split||{}, Q=C[dn].per_split||{};
+      const own=MANIFEST.filter(y=>P[y]&&P[y].n);
+      if(!own.length||!own.every(y=>Q[y]&&P[y].n===Q[y].n))return null;
+      return dn;};
+    // Per split: the block to render and, when it is not this arm's own, where it came from.
+    const blocksOf=m=>{const P=C[m].per_split||{}, dn=donorOf(m), out={};
+      MANIFEST.forEach(x=>{
+        if(P[x]&&P[x].n){out[x]={b:P[x],from:null};}
+        else if(dn){const Q=C[dn].per_split||{}; if(Q[x]&&Q[x].n)out[x]={b:Q[x],from:dn};}});
+      return out;};
+    // Coverage AFTER borrowing -- what decides whether the row gets an overall and where it ranks.
+    const fullCovEff=m=>{const B=blocksOf(m); return MANIFEST.every(x=>B[x]);};
+    const borrowedIn=m=>MANIFEST.filter(x=>(blocksOf(m)[x]||{}).from);
     // SUC reads a stat block through the refined toggle, and is the ONLY place the two scorings are
     // chosen between -- #0, #0b and the ranking all go through it, so they cannot disagree.
     // Returns null for an empty block, and {na:true} when refined was asked for but the block has no
@@ -1382,24 +1441,50 @@ async function load(){
       return on?(na?{n:on,na:true}:{n:on,n_success:os,rate:os/on}):null;};
     // Rank on the top-level rate, falling back to the split-derived one. Under the toggle this ranks
     // by the refined rate, so the order matches the numbers on screen.
-    const rateOf=m=>{const t=SUC(C[m]); if(t&&!t.na&&t.r!=null)return t.r;
+    const rateIn=b=>{const u=SUC(b); return (u&&!u.na&&u.r!=null)?u.r:null;};
+    // Composed overall: sum the three blocks after borrowing. For a run with no borrowing this is the
+    // same number as before (its own three splits).
+    const ovEff=m=>{if(!fullCovEff(m))return null;
+      const B=blocksOf(m); let n=0,ns=0,na=false;
+      MANIFEST.forEach(x=>{const u=SUC(B[x].b); if(!u)return; n+=u.n; if(u.na)na=true; else ns+=u.s;});
+      return n?(na?{n:n,na:true}:{n:n,n_success:ns,rate:ns/n}):null;};
+    const ovRate=m=>{const o=ovEff(m); return (o&&!o.na&&o.rate!=null)?o.rate:null;};
+    const rateOf=m=>{const r=ovRate(m); if(r!=null)return r;
+      const t=SUC(C[m]); if(t&&!t.na&&t.r!=null)return t.r;
       const o=overallOf(m); return (o&&o.rate!=null)?o.rate:-1;};
     // Complete runs first, each group ranked by rate.
-    const ranked=ms.slice().sort((a,b)=>(fullCov(b)-fullCov(a))||(rateOf(b)-rateOf(a)));
+    // ROW GROUPS. Rows with a comparable 1500-episode overall come first; everything measured on a
+    // different question is separated below it under its own heading, because those numbers are not on
+    // the same axis and interleaving them by rate invites reading down the column as a ranking.
+    //   0 comparable  full manifest coverage, or composed from a donor
+    //   1 terse-goal  the unseen-short family: 16 tasks, one-line goals
+    //   2 newtask     the held-out set (size read from the data -- it grows)
+    //   3 partial     anything else without full coverage (a sweep still in flight)
+    const grpOf=m=>fullCovEff(m)?0:isUnseenShortMethod(m)?1:isNewTaskMethod(m,C[m])?2:3;
+    // Size of the newtask set as the DATA reports it, not as a literal: it went 24 -> 34 and the old
+    // hardcoded label then described a set that no longer existed.
+    const NT_TASKS=new Set();
+    ALL.forEach(m=>{if(isNewTaskMethod(m,C[m]))Object.keys(C[m].per_task||{}).forEach(t=>NT_TASKS.add(t));});
+    const GRP_LABEL={1:'terse-goal (unseen-short) — 16 composite-unseen tasks, one-line goals',
+                     2:'newtask — the '+(NT_TASKS.size?NT_TASKS.size+'-task ':'')
+                       +'held-out set, outside the 50-task manifest',
+                     3:'partial coverage — no comparable overall'};
+    const ranked=ms.slice().sort((a,b)=>(grpOf(a)-grpOf(b))||(rateOf(b)-rateOf(a)));
     // COLUMN BEST. One highlight per column, on the leading cell(s) only -- previously the overall
     // column was tinted on every row, which marked nothing. Computed over the rows CURRENTLY VISIBLE
     // (`ranked` is rebuilt by load() on every checkbox change) and under the CURRENT scoring, so
     // ticking a box or flipping `refined` moves the highlight to whatever now leads. Ties are all
     // highlighted rather than picking one arbitrarily.
-    const rateIn=b=>{const u=SUC(b); return (u&&!u.na&&u.r!=null)?u.r:null;};
-    const ovRate=m=>{if(!fullCov(m))return null;      // partial runs have no overall to win
-      const t0=SUC(C[m]); if(t0&&!t0.na&&t0.r!=null)return t0.r;
-      const o=overallOf(m); return (o&&o.rate!=null)?o.rate:null;};
+    // Best-in-column is computed over the COMPARABLE group only. A terse-goal or newtask row cannot win
+    // a column it is not competing in -- its composite-unseen number answers a different question than
+    // the full-goal one directly above it.
+    const cmpRows=ranked.filter(m=>grpOf(m)===0);
     const bestOf={overall:null};
-    ranked.forEach(m=>{const r=ovRate(m);
+    cmpRows.forEach(m=>{const r=ovRate(m);
       if(r!=null&&(bestOf.overall==null||r>bestOf.overall))bestOf.overall=r;});
     spShown.forEach(x=>{let mx=null;
-      ranked.forEach(m=>{const r=rateIn((C[m].per_split||{})[x]);
+      cmpRows.forEach(m=>{const e=blocksOf(m)[x];
+        const r=rateIn(e&&!e.from?e.b:((C[m].per_split||{})[x]));
         if(r!=null&&(mx==null||r>mx))mx=r;});
       bestOf[x]=mx;});
     // Rates are exact fractions here, but compare with a tolerance so 24/30 vs 0.8 cannot miss.
@@ -1408,32 +1493,46 @@ async function load(){
     // Named cellSp, NOT cell: #0b below declares its own `cell` in this same block scope, and a
     // duplicate `const` is a SyntaxError that kills the whole script -- the page then hangs forever
     // on "loading stats..." because load() never runs.
-    const cellSp=(b,key)=>{
+    const cellSp=(b,key,from)=>{
       const u=SUC(b);
       if(!u)return '<td style="color:#ccc">–</td>';
       if(u.na)return `<td style="color:#ccc" title="not scorable under the horizon gate — `
         +`re-run scripts/extract_combine_results.py, or the raw episodes were pruned">n/a</td>`;
       const drop=u.drop?` · refined: ${u.drop} win${u.drop>1?'s':''} outside the horizon`:'';
-      const top=isBest(u.r,key);
-      return `<td title="${b.avg_seconds!=null?b.avg_seconds+'s/ep':''}${drop}`
-        +`${top?' · best in this column':''}"${top?HL:''}>`
-        +`<b>${pct(u.r)}</b><br><span style="color:#888;font-size:11px">${u.s}/${u.n}</span></td>`;};
+      // A BORROWED cell is greyed and italic and never counts as the column best -- it is another
+      // arm's measurement shown here for completeness, so highlighting it would credit this row for a
+      // result it did not produce.
+      const top=!from&&isBest(u.r,key);
+      const st=from?' style="color:#999;font-style:italic;background:#fbfbfc"':(top?HL:'');
+      return `<td title="${from?'borrowed from '+from+' — NOT measured in this arm. ':''}`
+        +`${b.avg_seconds!=null?b.avg_seconds+'s/ep':''}${drop}`
+        +`${top?' · best in this column':''}"${st}>`
+        +`<b>${pct(u.r)}</b><br><span style="color:#888;font-size:11px">${u.s}/${u.n}</span>`
+        +`${from?'<br><span style="color:#aaa;font-size:10px">borrowed</span>':''}</td>`;};
     let h="<table class=cmbmain><tr><th>#</th><th class='exp'>method</th><th>overall</th>"
       +spShown.map(x=>`<th title="${x==='other'
           ?'the 24-task NEW-TASK held-out set, outside the 50-task manifest. The horizon gate demotes '
            +'nothing on these tasks, so refined equals raw and the two scorings show the same number.'
           :x}">${splName(x)}</th>`).join('')
       +"<th>avg s/ep</th><th>avg turns</th></tr>";
+    const NCOL=5+spShown.length;
+    let lastGrp=null;
     ranked.forEach((m,i)=>{const v=C[m], P=v.per_split||{};
+      const g=grpOf(m);
+      if(g!==lastGrp&&GRP_LABEL[g]){
+        h+=`<tr><td colspan="${NCOL}" style="background:#f2f2f5;border-top:2px solid #ccc;`
+          +`color:#555;font-size:11px;font-weight:700;letter-spacing:.03em;padding:5px 8px">`
+          +`${GRP_LABEL[g]}</td></tr>`;}
+      lastGrp=g;
       const tt=Object.entries(v.terminations||{}).sort((a,b2)=>b2[1]-a[1])
                  .map(([k,n])=>`${k}: ${n}`).join(' · ');
       // Prefer the top-level record for the overall cell (it is what the extractor computed over
       // every episode); fall back to the split sum when a method predates per_split.
       const t0=SUC(v);
-      // Partial-coverage runs get NO overall at all (see fullCov above), not a number computed over
-      // whichever slice they happen to cover.
-      const ov=!fullCov(m)?null
-        :(t0&&v.n)?(t0.na?{n:v.n,na:true}:{n:v.n,n_success:t0.s,rate:t0.r}):overallOf(m);
+      const B=blocksOf(m), bor=borrowedIn(m);
+      // Overall comes from the composed blocks, so an arm that re-ran one split still gets a
+      // comparable 1500-episode figure. Runs with no full-coverage donor still get nothing.
+      const ov=ovEff(m);
       // Under the toggle the name says "(refined)" too, so a screenshot of this table cannot be
       // mistaken for the raw one.
       // No "(refined)" suffix on the name: it doubled the width of every row label, and the toggle
@@ -1442,18 +1541,27 @@ async function load(){
       const dropTip=(window._refined&&t0&&!t0.na&&t0.drop)
         ? ` · horizon gate removed ${t0.drop} win${t0.drop>1?'s':''}`
         : (window._refined&&t0&&t0.na?' · not scorable under the horizon gate':'');
-      const ovTop=isBest(ovRate(m),'overall');
+      // A COMPOSED overall is not this arm's own measurement end to end, so it is marked and it is
+      // barred from winning the column -- otherwise a row could top the table on borrowed cells.
+      const ovTop=!bor.length&&isBest(ovRate(m),'overall');
+      const bTip=bor.length
+        ? ` · COMPOSED: ${bor.map(splName).join(' + ')} borrowed from ${donorOf(m)}; only `
+          +`${MANIFEST.filter(x=>B[x]&&!B[x].from).map(x=>(B[x].b.n||0)).reduce((a,c)=>a+c,0)} `
+          +`of ${ov?ov.n:'?'} episodes were run in this arm`
+        : '';
       h+=`<tr><td style="color:#888">${i+1}</td><td class='exp'>${nm}</td>`
-        +`<td title="errors: ${v.n_error??0} · terminations — ${tt||'n/a'}${dropTip}`
+        +`<td title="errors: ${v.n_error??0} · terminations — ${tt||'n/a'}${dropTip}${bTip}`
         +`${ovTop?' · best overall':''}"${ovTop?HL:''}>`
         +(!ov?`<span style="color:#ccc" title="evaluated on part of the manifest only `
               +`(${Object.keys(v.per_split||{}).map(splName).join(', ')}) — `
               +`no comparable overall">—</span>`
           :ov.na?'<span style="color:#ccc">n/a</span>'
-          :`<b>${pct(ov.rate)}</b><br><span style="color:#888;font-size:11px">`
-           +`${ov.n_success}/${ov.n}</span>`)
+          :`<b>${pct(ov.rate)}</b>`
+           +(bor.length?'<span style="color:#b0431c" title="composed overall">&#8853;</span>':'')
+           +`<br><span style="color:#888;font-size:11px">${ov.n_success}/${ov.n}</span>`)
         +`</td>`
-        +spShown.map(x=>cellSp(P[x],x)).join('')
+        +spShown.map(x=>{const e=(x==='other')?(P[x]?{b:P[x],from:null}:null):(B[x]||null);
+                         return e?cellSp(e.b,x,e.from):cellSp(P[x],x,null);}).join('')
         +`<td>${v.avg_seconds??'–'}</td><td>${v.avg_turns??'–'}</td></tr>`;});
     // No explanatory paragraph under the table, by request. Everything it said is either visible in
     // the table itself (rate + #success/#episodes per cell), in a hover title (errors, terminations,
@@ -2408,11 +2516,24 @@ COMBINE_BENCH_TASKS = 50
 COMBINE_BENCH_EPISODES = 25307
 
 
+def _is_snapshot_dir(name: str) -> bool:
+    """A snapshot or container dir sitting beside real methods, not a method. See _combine_stats step 2.
+
+    `<method>.premerge-backup-YYYYMMDD` is written by the merge tooling next to the tree it backs up,
+    and `_merge_backups/` / `_stale_results/` are containers -- all three would otherwise be scanned
+    for an index.json and listed as runs.
+    """
+    return (name.startswith("_") or ".premerge-backup" in name or ".backup" in name
+            or name.endswith((".bak", ".old")))
+
+
 def _is_newtask(rec: dict) -> bool:
-    """True for a run over the 24-task NEW-TASK set rather than the 50-task manifest.
+    """True for a run over the held-out NEW-TASK set rather than the 50-task manifest.
 
     Detected from the DATA (every per_task entry has split "other"), with the method name as a
-    fallback, so a future newtask run is classified without being renamed.
+    fallback, so a future newtask run is classified without being renamed. The set GROWS -- it was
+    24 tasks and is 34 as of 2026-08-16 -- so nothing here or in the UI hardcodes its size; the
+    count shown in #0 is taken from each run's own per_task.
     """
     pt = rec.get("per_task") or {}
     if pt and all((t.get("split") or "other") == "other" for t in pt.values()):
@@ -2475,7 +2596,10 @@ def _combine_stats() -> dict:
     if COMBINE_ROOT.is_dir():
         splits = _target_split_map()
         for md in sorted(p for p in COMBINE_ROOT.iterdir() if p.is_dir()):
-            if md.name in out:
+            # `<method>.premerge-backup-YYYYMMDD` snapshots carry a real index.json, so without this
+            # they surface here as an extra method (the extractors skip them, which is exactly why
+            # they reach this fallback). Matched by shape so future snapshots are skipped too.
+            if md.name in out or _is_snapshot_dir(md.name):
                 continue
             f = md / "index.json"
             if not f.exists():

@@ -150,6 +150,17 @@ def extract_method(method_dir: Path) -> dict | None:
     return out
 
 
+# Snapshot dirs the other machine drops beside a tree it is about to merge into
+# (``<method>.premerge-backup-YYYYMMDD``). They contain a real index.json, so without this they get
+# picked up as an extra METHOD -- e.g. a 4-episode "...-newtask-inst.premerge-backup-20260816" row
+# next to the 680-episode run it was backing up. Skipped by shape, not by date, so tomorrow's
+# snapshot is skipped too; the data itself is left on disk untouched. A LEADING UNDERSCORE is skipped
+# for the same reason: `_merge_backups/` and `_stale_results/` are containers, not methods.
+def is_snapshot_dir(name: str) -> bool:
+    return (name.startswith("_") or ".premerge-backup" in name or ".backup" in name
+            or name.endswith((".bak", ".old")))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -162,7 +173,8 @@ def main() -> None:
     a.out_dir.mkdir(parents=True, exist_ok=True)
 
     summary = []
-    for md in sorted(p for p in a.combine_root.iterdir() if p.is_dir()):
+    for md in sorted(p for p in a.combine_root.iterdir()
+                     if p.is_dir() and not is_snapshot_dir(p.name)):
         rec = extract_method(md)
         if rec is None:
             continue

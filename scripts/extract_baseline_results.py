@@ -146,10 +146,12 @@ def _block(eps: list[dict]) -> dict:
 
 def extract(run_dir: Path) -> dict | None:
     eps: list[dict] = []
-    # TWO LAYOUTS. xiaomi nests <Task>/episode_NNNNNN/; pi05 is flat, one dir per episode named
-    # <Task>__target__episode_NNNNNN/ (combined_eval's convention). Globbing both means a new baseline
-    # drops in without touching this script again.
-    files = (sorted(glob.glob(str(run_dir / "*" / "episode_*" / "episode.json")))
+    # TWO LAYOUTS, matched by SHAPE not by episode-dir NAME. xiaomi nests <Task>/<episode dir>/; pi05
+    # is flat, one dir per episode named <Task>__target__episode_NNNNNN/ (combined_eval's convention).
+    # The nested pattern used to be `episode_*`, which silently found ZERO episodes in the newtask
+    # baseline -- it names its episode dirs `seed_0001000009` after the reset seed, so the whole 680-
+    # episode run extracted as "no episodes, skipped". Any per-episode dir name works now.
+    files = (sorted(glob.glob(str(run_dir / "*" / "*" / "episode.json")))
              or sorted(glob.glob(str(run_dir / "*" / "episode.json"))))
     for f in files:
         try:
