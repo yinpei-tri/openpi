@@ -119,14 +119,18 @@ def extract_method(method_dir: Path) -> dict | None:
     # GOAL SOURCE, from the run guard. Without this the aggregated tables cannot tell a terse-goal
     # arm from a full-goal one -- only the individual episode.json files carried it.
     goal = None
+    plan = None
     try:
-        goal = (json.loads((method_dir / "rule_config.json").read_text()) or {}).get("goal")
+        run_cfg = json.loads((method_dir / "rule_config.json").read_text()) or {}
+        goal = run_cfg.get("goal")
+        plan = run_cfg.get("plan")
     except Exception:
-        goal = None
+        goal = plan = None
     out = {
         "method": method_dir.name,
         "eval_kind": "combine",
         "goal": goal,
+        "plan": plan,
         "overall": _stat_block(eps),
         "n_error": n_error,
         "terminations": dict(sorted(terms.items(), key=lambda kv: -kv[1])),
@@ -169,6 +173,7 @@ def main() -> None:
             "terminations": rec["terminations"],
             "per_split_rate": {k: v["rate"] for k, v in rec["per_split"].items()},
             "goal": rec.get("goal"),
+            "plan": rec.get("plan"),
             "bench": rec["bench"],
         })
         print(f"  {md.name}: {o['n_success']}/{o['n']} = "

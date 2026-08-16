@@ -7,6 +7,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "examples" / "robocasa"))
 import sys2_rules as rules
+from sys2_rules_exp_ArrangeTea import _rule_arrangetea_kettle_inner_tray
 
 
 def test_repeat_cap_advances_to_next_fine_step(monkeypatch):
@@ -112,6 +113,63 @@ def test_press_again_does_not_use_broad_task_name_substrings():
     assert rules._rule_press_again(
         "CoffeeSetupMug", "", "continue to press the mug against the dispenser", 50, {},
     ) == {}
+
+
+@pytest.mark.parametrize(
+    ("subgoal", "expected"),
+    [
+        ("lift and carry the kettle to the tray",
+         "lift and carry the kettle to the inner side of the tray"),
+        ("carry the kettle to the tray",
+         "lift and carry the kettle to the inner side of the tray"),
+        ("continue to lift and carry the kettle to the tray",
+         "continue to lift and carry the kettle to the inner side of the tray"),
+        ("continue to carry the kettle to the tray.",
+         "continue to lift and carry the kettle to the inner side of the tray"),
+    ],
+)
+def test_arrangetea_kettle_carry_targets_inner_side(subgoal, expected):
+    result = _rule_arrangetea_kettle_inner_tray(
+        "ArrangeTea", "unchanged plan", subgoal, 100, {},
+    )
+
+    assert result["subgoal"] == expected
+    assert result["subgoal_detail"] == expected
+    assert result["interventions"][0]["kind"] == "subgoal_override"
+    assert "plan" not in result
+    assert "est_proposal" not in result
+
+
+@pytest.mark.parametrize(
+    ("task", "subgoal"),
+    [
+        ("ArrangeTea", "lower the kettle onto the tray and release"),
+        ("ArrangeTea", "carry the mug to the tray"),
+        ("ArrangeTea", "carry the kettle to the counter"),
+        ("ArrangeBreadBasket", "lift and carry the kettle to the tray"),
+    ],
+)
+def test_arrangetea_kettle_inner_tray_rule_is_narrow(task, subgoal):
+    assert _rule_arrangetea_kettle_inner_tray(
+        task, "unchanged plan", subgoal, 100, {},
+    ) == {}
+
+
+def test_arrangetea_kettle_inner_tray_rule_is_registered():
+    result = rules.apply_rules(
+        "ArrangeTea", plan="unchanged plan",
+        subgoal="lift and carry the kettle to the tray",
+        subgoal_detail="move the kettle over the tray", est=100, state={},
+        general=True, task_tier=True,
+    )
+
+    expected = "lift and carry the kettle to the inner side of the tray"
+    assert result["subgoal"] == expected
+    assert result["subgoal_detail"] == expected
+    assert result["plan"] == "unchanged plan"
+    assert result["est"] == 100
+    assert any(i["rule"] == "arrangetea_kettle_inner_tray"
+               for i in result["interventions"])
     assert rules._rule_press_again(
         "CuttingToolSelection", "", "continue to press the cucumber against the board", 50, {},
     ) == {}
@@ -145,6 +203,100 @@ def test_regrasp_hit_suppresses_sink_est_for_injected_turn():
     held = rules.pending_resume(state)
     assert held["subgoal"] == "turn on the sink faucet handle"
     assert held["est"] == 50
+
+
+def test_regrasp_offset2_replays_intervening_motion_before_held_subgoal():
+    grasp_plan = """- [~] M1: place the bottle
+  * [~] M1.1: grasp the bottle
+  * [ ] M1.2: carry the bottle to the tray
+  * [ ] M1.3: release the bottle on the tray"""
+    carry_plan = """- [~] M1: place the bottle
+  * [x] M1.1: grasp the bottle
+  * [~] M1.2: carry the bottle to the tray
+  * [ ] M1.3: release the bottle on the tray"""
+    release_plan = """- [~] M1: place the bottle
+  * [x] M1.1: grasp the bottle
+  * [x] M1.2: carry the bottle to the tray
+  * [~] M1.3: release the bottle on the tray"""
+    state = {}
+
+    rules.apply_rules(
+        "AnyTask", plan=grasp_plan, subgoal="grasp the bottle",
+        subgoal_detail="close the gripper around the bottle", est=60, state=state,
+        general=True, task_tier=False,
+    )
+    rules.record_executed_subgoal(
+        state, subgoal="grasp the bottle",
+        subgoal_detail="close the gripper around the bottle", est=60,
+    )
+    state["grip_width"] = 0.04
+    rules.apply_rules(
+        "AnyTask", plan=carry_plan, subgoal="carry the bottle to the tray",
+        subgoal_detail="move the bottle left over the tray", est=110, state=state,
+        general=True, task_tier=False,
+    )
+    rules.record_executed_subgoal(
+        state, subgoal="carry the bottle to the tray",
+        subgoal_detail="move the bottle left over the tray", est=110,
+    )
+    state["grip_width"] = 0.001
+
+    result = rules.apply_rules(
+        "AnyTask", plan=release_plan, subgoal="release the bottle on the tray",
+        subgoal_detail="open the gripper over the tray", est=70, state=state,
+        general=True, task_tier=False,
+    )
+
+    assert result["subgoal"] == "reach and grasp the bottle again"
+    assert result["est"] == rules.REGRASP_FAR_EST
+    assert any(i["kind"] == "tx_replay_queued" for i in result["interventions"])
+
+    replay = rules.pending_resume(state)
+    assert replay == {
+        "key": "rg_M1.1", "rule": "regrasp_recovery",
+        "subgoal": "carry the bottle to the tray",
+        "subgoal_detail": "move the bottle left over the tray",
+        "est": 110, "held_kind": "offset2_replay", "tx_label": "tx_sg_replay",
+    }
+    assert state["rg_M1.1_held"] == "release the bottle on the tray"
+
+    held = rules.pending_resume(state)
+    assert held["subgoal"] == "release the bottle on the tray"
+    assert held["subgoal_detail"] == "open the gripper over the tray"
+    assert held["est"] == 70
+    assert held["held_kind"] == "s2_resume"
+    assert "rg_M1.1_held" not in state
+    assert rules.pending_resume(state) is None
+
+
+def test_regrasp_offset2_requeries_when_prior_action_is_unsafe_to_replay():
+    state = {
+        "rg_turn": 2,
+        "rg_active_fid": "M1.1",
+        "rg_M1.1_gturn": 1,
+        "rg_M1.1_bar": rules.REGRASP_MISS_WIDTH,
+        "rg_M1.1_fid": "M1.1",
+        "rg_M1.1_text": "grasp the bottle",
+        "grip_width": 0.001,
+    }
+    rules.record_executed_subgoal(
+        state, subgoal="lower and release the bottle",
+        subgoal_detail="open the gripper over the tray", est=50,
+    )
+    plan = """- [~] M1: place the bottle
+  * [x] M1.1: grasp the bottle
+  * [~] M1.2: release the bottle on the tray"""
+
+    result = rules.apply_rules(
+        "AnyTask", plan=plan, subgoal="release the bottle on the tray",
+        subgoal_detail="open the gripper over the tray", est=50, state=state,
+        general=True, task_tier=False,
+    )
+
+    assert result["subgoal"] == "reach and grasp the bottle again"
+    assert any(i["kind"] == "tx_replay_declined" for i in result["interventions"])
+    assert rules.pending_resume(state) is None
+    assert "rg_M1.1_held" not in state
 
 
 def test_skip_failed_regrasp_requires_judge_and_no_physical_recovery():
@@ -369,6 +521,8 @@ def test_current_general_registry():
 def test_rule_config_describes_selected_tiers():
     base = rules.rule_config(general=False, task_tier=False)
     assert base["mandatory_rules"] is True
+    assert base["behavior_version"] == 2
+    assert base["regrasp_recovery_version"] == "offset2-replay-v1"
     assert base["general_rules"] is False
     assert base["task_rules"] is False
     assert base["active_rules"]["mandatory"] == ["repeat_cap"]

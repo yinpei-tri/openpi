@@ -700,7 +700,7 @@ VAL_MSE_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 </style></head><body>
 <header>
   <h1>Train / Val <b>MSE</b></h1>
-  <nav><a href="/">home</a><a class="hi" href="/combine">combine</a><a href="/finestep">finestep</a><a href="/milestone">milestone</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
+  <nav><a href="/">home</a><a class="hi" href="/combine">combine</a><a href="/finestep">finestep</a><a href="/milestone">milestone</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/baseline">baseline</a><a href="/stats">stats</a></nav>
   <label>metric <select id="metric">
     <option value="action_mse">action_mse</option>
     <option value="progress_mae">progress_mae</option>
@@ -844,7 +844,7 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
 </style></head><body>
 <header>
   <h1>Eval <b>Statistics</b></h1>
-  <nav><a href="/">home</a><a class="hi" href="/combine">combine</a><a href="/finestep">finestep</a><a href="/milestone">milestone</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/stats">stats</a></nav>
+  <nav><a href="/">home</a><a class="hi" href="/combine">combine</a><a href="/finestep">finestep</a><a href="/milestone">milestone</a><a href="/episode">episode</a><a href="/val_mse">val_mse</a><a href="/baseline">baseline</a><a href="/stats">stats</a></nav>
 </header>
 <div id="wrap">
   <div id="loading" style="padding:10px 0;color:#b0431c;font-size:14px">⏳ loading stats… (first load scans the eval results; ~a few seconds)</div>
@@ -919,14 +919,27 @@ const _s2Parts=t=>{const s=t||'';
   return [s,''];};
 // ``br`` puts the System2 half on its own line, which is what the narrow table headers want; inline
 // otherwise (pickers, legends). Full name also in the tooltip.
+// PROVENANCE SUFFIX on baseline rows, so the table distinguishes a number we produced from a number
+// we copied. `kind` comes from the record (set by scripts/extract_baseline_results.py /
+// make_leaderboard_method.py) rather than from the name, so renaming a run cannot silently drop it.
+//   baseline_flat_policy -> "(replicate)"  we re-ran the model ourselves on this manifest
+//   baseline_published   -> "(published)"  transcribed from the leaderboard; no episode data exists
+// window._recOf is set by the #0 renderer, which is the only place the records are in scope.
+function mSuffix(m){
+  const k=((window._recOf||{})[m]||{}).kind||'';
+  if(k==='baseline_flat_policy')return ' <span style="color:#888;font-weight:400">(replicate)</span>';
+  if(k==='baseline_published')return ' <span style="color:#b0431c;font-weight:400">(published)</span>';
+  return '';
+}
 function mLabel(m, br){
   const x=/^s1-(.+?)_s2-(.+)$/.exec(m||'');
-  if(!x)return `<span title="${m}">${mName(m)}</span>`;
+  if(!x)return `<span title="${m}">${mName(m)}${mSuffix(m)}</span>`;
   const [ck,arm]=_s2Parts(x[2]);
   return `<span title="${m}"><b style="color:${s1Color(x[1])}">${s1Short(x[1])}</b>`
     +(br?'<br>':`<span style="color:#bbb">-</span>`)
     +`<span style="font-weight:400;color:${s2Color(ck)}">${ck}</span>`
     +(arm?`<span style="font-weight:400;color:#888">${arm}</span>`:'')
+    +mSuffix(m)
     +`</span>`;
 }
 // SHORT form, used by #0b and its compare controls only: the per-task matrix has 50 rows and one
@@ -1010,6 +1023,28 @@ const isDebugMethod=m=>/^debug-/i.test(String(m||''));
 // result, but it is a different PIPELINE (not a different checkpoint) and is usually run on a single
 // split, so its overall is not comparable with a cold run's -- hence the ability to drop it.
 const isMemoryMethod=m=>/-memory$/i.test(String(m||''));
+// TERSE-GOAL FAMILY. All the short-goal arms: ...-unseenshort (cold plan), ...-unseenshort-memory
+// (warm plan from the qwen3vl recipe library) and ...-unseenshort-gemini (warm plan from the gemini
+// library), plus the flat baseline xiaomi-robo1-unseenshort.
+//
+// CONTAINS, not a suffix test -- anchoring on the end would catch only the first of those. It also
+// means ...-unseenshort-memory is classified here rather than as a *-memory run, which is the useful
+// split now: every arm in this family shares the DEGRADED GOAL and differs only in where its plan
+// comes from. 480 episodes over the 16 composite_unseen tasks, so its overall is not comparable with
+// a 50-task overall -- hence the two boxes below (one to include it, one to see nothing else).
+const isUnseenShortMethod=m=>/unseenshort/i.test(String(m||''));
+// NEW-TASK runs: the 24-task held-out set, outside the 50-task manifest -- every task reports split
+// "other". Flagged server-side (`newtask`), with the name as a fallback. Their refined fields are
+// nulled by _combine_stats on purpose: the horizon gate is defined against the official manifest, so a
+// "refined" number here would be a copy of raw wearing a scored label.
+const isNewTaskMethod=(m,rec)=>((rec&&rec.newtask)||/newtask/i.test(String(m||'')));
+// SPLIT DISPLAY NAMES. "other" is the split TARGET_TASK_SPLIT assigns to anything off the 50-task
+// manifest, and in this tree it is owned exclusively by the newtask runs -- verified: 24 distinct
+// tasks, reported by newtask methods and nothing else. So it is labelled "newtask", because "other"
+// tells a reader nothing about what the column holds.
+const SPL_NAME={atomic_seen:'atomic-seen',composite_seen:'composite-seen',
+                composite_unseen:'composite-unseen',other:'newtask'};
+const splName=x=>SPL_NAME[x]||String(x||'').replace('_','-');
 // The -v2 RULE ARM. Its own toggle in #0, default ON: these are real 1500-episode results, but they
 // ran the SUPERSEDED rule layer (est_bump global + sink_faucet_est, before the three-tier split), so
 // when comparing a -base control against a -inst arm head to head they are noise in the middle of the
@@ -1028,7 +1063,7 @@ const isV2Method=m=>/-v2$/i.test(String(m||''));
 // runs budget per subgoal and per turn, so only their refined rate is scored the same way.
 // Keyed on the RECORD's `kind`, with the historic `baseline-` name prefix kept as a fallback for
 // files written before that field existed. Pass C[m] at every call site.
-const isBaselineMethod=(m,rec)=>((rec&&rec.kind==='baseline_flat_policy')
+const isBaselineMethod=(m,rec)=>((rec&&/^baseline/.test(String(rec.kind||'')))
                                  ||/^baseline-/i.test(String(m||'')));
 const pct=v=>v==null?'–':(100*v).toFixed(1)+'%';
 const f4=v=>v==null?'–':(+v).toFixed(4);
@@ -1150,8 +1185,12 @@ async function load(){
     //             is not comparable with a cold run's overall. Default ON (it is a real result), but
     //             one click removes it when comparing cold runs head to head.
     const ALL=Object.keys(C);
+    window._recOf=C;          // so mSuffix() can read each method's `kind`
     const DBG=ALL.filter(isDebugMethod);
-    const MEM=ALL.filter(isMemoryMethod);
+    // The *-memory toggle is GONE: every terse-goal arm is now identified by isUnseenShortMethod
+    // (including ...-unseenshort-memory), so a box keyed on the -memory suffix only ever hid part of
+    // that family. isMemoryMethod survives for the /combine picker label.
+    const US=ALL.filter(isUnseenShortMethod);
     // MANIFEST SIZE, the third toggle. The eval set grew from 50x20=1000 episodes to 50x30=1500 (the
     // leaderboard denominator), and runs of both sizes sit in this table. Their overalls are not the
     // same measurement: the 1500 set CONTAINS the 1000 set as its first 20 episodes per task, so an
@@ -1165,18 +1204,26 @@ async function load(){
     const maxTaskN=m=>{const pt=(C[m]||{}).per_task||{}; let x=0;
       for(const t in pt){const n=pt[t].n||0; if(n>x)x=n;} return x;};
     const isEval30=m=>maxTaskN(m)>20;
-    const OLD=ALL.filter(m=>!isEval30(m)&&!isDebugMethod(m));
-    const V2=ALL.filter(isV2Method);
+    const NT=ALL.filter(m=>isNewTaskMethod(m,C[m]));
+    // "OTHER RUNS" = the superseded -v2 rule arm PLUS the older 20-episodes-per-task sweeps, merged
+    // into one box because they are the same kind of thing: real results on a rule set or a
+    // denominator that is no longer the comparison. newtask is excluded (its 20 episodes/task would
+    // otherwise read as a 1000-episode run) and so are debug runs, which have their own box.
+    const isOtherRun=m=>!isDebugMethod(m)&&!isNewTaskMethod(m,C[m])
+                        &&(isV2Method(m)||!isEval30(m));
+    const OTH=ALL.filter(isOtherRun);
     const BL=ALL.filter(m=>isBaselineMethod(m,C[m]));
     if(window._showDebug===undefined)window._showDebug=false;    // default OFF
-    if(window._showMemory===undefined)window._showMemory=true;   // default ON
-    if(window._show1000===undefined)window._show1000=false;      // default OFF -- 1500 runs only
+    // Merged -v2 + 20/task box, and the newtask box. Both default OFF: the default view is the arms
+    // currently being compared on the 1500-episode manifest.
+    if(window._showOther===undefined)
+      window._showOther=(localStorage.getItem('cmbShowOther')==='1');
+    if(window._showNT===undefined)
+      window._showNT=(localStorage.getItem('cmbShowNT')==='1');
     // Default ON (a real result), but REMEMBERED like `refined` rather than reset on every reload:
     // hiding the superseded arm is a comparison mode you stay in for a whole session, unlike the
     // debug/memory boxes which you flick on to check one thing.
-    if(window._showV2===undefined)
-      window._showV2=(localStorage.getItem('cmbShowV2')!=='0');
-    // Default ON and REMEMBERED, like _showV2: whether the external baseline belongs in the table is
+    // Default ON and REMEMBERED: whether the external baseline belongs in the table is
     // a comparison mode you stay in, not something you flick on to check one number.
     if(window._showBaseline===undefined)
       window._showBaseline=(localStorage.getItem('cmbBaseline')!=='0');
@@ -1189,32 +1236,56 @@ async function load(){
     // choice is remembered, so unticking it sticks ('0' is stored explicitly).
     if(window._refined===undefined)
       window._refined=(localStorage.getItem('cmbRefined')!=='0');
-    const ms=ALL.filter(m=>(window._showDebug||!isDebugMethod(m))
-                        && (window._showMemory||!isMemoryMethod(m))
-                        && (window._showV2||!isV2Method(m))
+    if(window._showUS===undefined)
+      window._showUS=(localStorage.getItem('cmbShowUS')==='1');   // default OFF
+    if(window._onlyUS===undefined)
+      window._onlyUS=(localStorage.getItem('cmbOnlyUS')==='1');   // default OFF
+    // ONLY-MODE short-circuits every other visibility box: the point is to see the terse-goal arms
+    // and nothing else, so a stale debug/v2/baseline tick cannot silently drop one of them.
+    const ms=window._onlyUS ? ALL.filter(isUnseenShortMethod)
+      : ALL.filter(m=>(window._showDebug||!isDebugMethod(m))
                         && (window._showBaseline||!isBaselineMethod(m,C[m]))
-                        && (window._show1000||isEval30(m)||isDebugMethod(m)));
+                        && (window._showUS||!isUnseenShortMethod(m))
+                        && (window._showNT||!isNewTaskMethod(m,C[m]))
+                        && (window._showOther||!isOtherRun(m)));
     const dbgBar=document.getElementById('cmbdebug');
     if(dbgBar){
       const boxes=[];
       if(DBG.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px">`
         +`<input type="checkbox" id="cmbdbgcb" ${window._showDebug?'checked':''} `
         +`style="margin-right:4px">show ${DBG.length} debug-* run${DBG.length>1?'s':''}</label>`);
-      if(MEM.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px">`
-        +`<input type="checkbox" id="cmbmemcb" ${window._showMemory?'checked':''} `
-        +`style="margin-right:4px">show ${MEM.length} *-memory run${MEM.length>1?'s':''} `
-        +`<span style="color:#aaa">(different pipeline)</span></label>`);
-      if(OLD.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px">`
-        +`<input type="checkbox" id="cmb1000cb" ${window._show1000?'checked':''} `
-        +`style="margin-right:4px">show ${OLD.length} 1000-episode run${OLD.length>1?'s':''} `
-        +`<span style="color:#aaa">(20/task; the 1500 set is 30/task)</span></label>`);
-      if(V2.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px" `
-        +`title="The -v2 arm ran the superseded rule layer (global est_bump + sink_faucet_est, before `
-        +`the mandatory/general/task split). Untick to compare -base against -inst without it in `
-        +`between.">`
-        +`<input type="checkbox" id="cmbv2cb" ${window._showV2?'checked':''} `
-        +`style="margin-right:4px">show ${V2.length} *-v2 run${V2.length>1?'s':''} `
-        +`<span style="color:#aaa">(superseded rule layer)</span></label>`);
+      if(US.length){
+        // The first box is greyed and struck through while only-mode is on, because only-mode makes it
+        // inert -- a live unticked box would misdescribe what is on screen.
+        const ovr=window._onlyUS;
+        boxes.push(`<label style="cursor:pointer;color:${ovr?'#ccc':'#888'};margin-right:12px`
+          +`${ovr?';text-decoration:line-through':''}" `
+          +`title="The terse-goal family: the 16 composite_unseen tasks x 30 run with one-line goals `
+          +`(...-unseenshort cold plan, -memory and -gemini warm plans from a recipe library, plus the `
+          +`flat baseline). 480 episodes over the hardest split only, so its overall is NOT comparable `
+          +`with a 50-task overall.${ovr?' (overridden by only-mode)':''}">`
+          +`<input type="checkbox" id="cmbuscb" ${window._showUS?'checked':''} `
+          +`style="margin-right:4px">show ${US.length} unseen-short run${US.length>1?'s':''} `
+          +`<span style="color:#aaa">(terse goals, 16 tasks)</span></label>`);
+        boxes.push(`<label style="cursor:pointer;color:${window._onlyUS?'#b45309':'#888'};`
+          +`margin-right:12px" `
+          +`title="Show ONLY the terse-goal arms and hide everything else, so they sit on one `
+          +`denominator and can be read against each other. Overrides every other visibility box.">`
+          +`<input type="checkbox" id="cmbusonlycb" ${window._onlyUS?'checked':''} `
+          +`style="margin-right:4px">unseen-short ONLY</label>`);
+      }
+      if(OTH.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px" `
+        +`title="The superseded -v2 rule arm and the older 20-episodes-per-task sweeps. Real results, `
+        +`but on a rule set or a denominator that is no longer the comparison.">`
+        +`<input type="checkbox" id="cmbothcb" ${window._showOther?'checked':''} `
+        +`style="margin-right:4px">show ${OTH.length} other run${OTH.length>1?'s':''} `
+        +`<span style="color:#aaa">(-v2 and 20/task sweeps)</span></label>`);
+      if(NT.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px" `
+        +`title="The 24-task NEW-TASK held-out set. Outside the 50-task manifest, so it has no overall `
+        +`column and no refined scoring -- the horizon gate is defined against the manifest.">`
+        +`<input type="checkbox" id="cmbntcb" ${window._showNT?'checked':''} `
+        +`style="margin-right:4px">show ${NT.length} newtask run${NT.length>1?'s':''} `
+        +`<span style="color:#aaa">(24 held-out tasks)</span></label>`);
       if(BL.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px" `
         +`title="Flat-policy reference (Xiaomi-Robotics-1 RoboCasa365): one policy, no System2, no `
         +`turns, so the turns column is blank. Generated WITH RoboCasa's official per-task step `
@@ -1235,13 +1306,18 @@ async function load(){
     }
     const cb=document.getElementById('cmbdbgcb');
     if(cb)cb.onchange=()=>{window._showDebug=cb.checked; load();};
-    const mcb=document.getElementById('cmbmemcb');
-    if(mcb)mcb.onchange=()=>{window._showMemory=mcb.checked; load();};
-    const ocb=document.getElementById('cmb1000cb');
-    if(ocb)ocb.onchange=()=>{window._show1000=ocb.checked; load();};
-    const vcb=document.getElementById('cmbv2cb');
-    if(vcb)vcb.onchange=()=>{window._showV2=vcb.checked;
-      localStorage.setItem('cmbShowV2', window._showV2?'1':'0'); load();};
+    const uscb=document.getElementById('cmbuscb');
+    if(uscb)uscb.onchange=()=>{window._showUS=uscb.checked;
+      localStorage.setItem('cmbShowUS', window._showUS?'1':'0'); load();};
+    const usonly=document.getElementById('cmbusonlycb');
+    if(usonly)usonly.onchange=()=>{window._onlyUS=usonly.checked;
+      localStorage.setItem('cmbOnlyUS', window._onlyUS?'1':'0'); load();};
+    const ocb=document.getElementById('cmbothcb');
+    if(ocb)ocb.onchange=()=>{window._showOther=ocb.checked;
+      localStorage.setItem('cmbShowOther', window._showOther?'1':'0'); load();};
+    const ntcb=document.getElementById('cmbntcb');
+    if(ntcb)ntcb.onchange=()=>{window._showNT=ntcb.checked;
+      localStorage.setItem('cmbShowNT', window._showNT?'1':'0'); load();};
     const blcb=document.getElementById('cmbblcb');
     if(blcb)blcb.onchange=()=>{window._showBaseline=blcb.checked;
       localStorage.setItem('cmbBaseline', window._showBaseline?'1':'0'); load();};
@@ -1251,9 +1327,11 @@ async function load(){
     // Guard on EITHER kind being hidden: with only *-memory runs present and its box unticked,
     // DBG.length alone would be 0 and the page would claim there are no runs at all.
     if(!ms.length){document.getElementById('cmbtab').innerHTML=
-      '<span style="color:#888">'+((DBG.length||MEM.length||OLD.length||V2.length||BL.length)
-        ? 'Only hidden runs present (debug-* / *-memory / *-v2 / baseline-* / 1000-episode) — tick a '
-          +'box above to see them.'
+      '<span style="color:#888">'+((DBG.length||US.length||OTH.length||NT.length||BL.length)
+        ? (window._onlyUS
+            ? 'No unseen-short runs to show \u2014 untick \u201cunseen-short ONLY\u201d.'
+            : 'Only hidden runs present (debug-* / other / baseline / unseen-short / newtask) '
+              +'\u2014 tick a box above to see them.')
         : 'No combined runs yet — see /combine.')+'</span>';return;}
     // ONE table: overall + per-split, RANKED best -> worst by overall rate.
     //
@@ -1273,6 +1351,15 @@ async function load(){
     const sp=['atomic_seen','composite_seen','composite_unseen','other'];
     // Only show a split column some method actually has episodes for ('other' is normally empty).
     const spShown=sp.filter(x=>ms.some(m=>((C[m].per_split||{})[x]||{}).n));
+    // FULL-MANIFEST COVERAGE. A run evaluated on only one slice -- composite-unseen (16 tasks) or the
+    // newtask set (24 tasks) -- has no comparable "overall": averaging the hardest split alone against
+    // a 50-task average compares two different measurements. Such rows get an EMPTY overall cell and
+    // are ranked BELOW every complete run, so the leaderboard reads top-down as "best full eval" and
+    // the partial runs sit underneath rather than being interleaved by a number that is not the same
+    // quantity. Their per-split cells still show, which is where their result actually lives.
+    const MANIFEST=['atomic_seen','composite_seen','composite_unseen'];
+    const fullCov=m=>{const P=C[m].per_split||{};
+      return MANIFEST.every(x=>P[x]&&P[x].n);};
     // SUC reads a stat block through the refined toggle, and is the ONLY place the two scorings are
     // chosen between -- #0, #0b and the ranking all go through it, so they cannot disagree.
     // Returns null for an empty block, and {na:true} when refined was asked for but the block has no
@@ -1297,21 +1384,45 @@ async function load(){
     // by the refined rate, so the order matches the numbers on screen.
     const rateOf=m=>{const t=SUC(C[m]); if(t&&!t.na&&t.r!=null)return t.r;
       const o=overallOf(m); return (o&&o.rate!=null)?o.rate:-1;};
-    const ranked=ms.slice().sort((a,b)=>rateOf(b)-rateOf(a));
+    // Complete runs first, each group ranked by rate.
+    const ranked=ms.slice().sort((a,b)=>(fullCov(b)-fullCov(a))||(rateOf(b)-rateOf(a)));
+    // COLUMN BEST. One highlight per column, on the leading cell(s) only -- previously the overall
+    // column was tinted on every row, which marked nothing. Computed over the rows CURRENTLY VISIBLE
+    // (`ranked` is rebuilt by load() on every checkbox change) and under the CURRENT scoring, so
+    // ticking a box or flipping `refined` moves the highlight to whatever now leads. Ties are all
+    // highlighted rather than picking one arbitrarily.
+    const rateIn=b=>{const u=SUC(b); return (u&&!u.na&&u.r!=null)?u.r:null;};
+    const ovRate=m=>{if(!fullCov(m))return null;      // partial runs have no overall to win
+      const t0=SUC(C[m]); if(t0&&!t0.na&&t0.r!=null)return t0.r;
+      const o=overallOf(m); return (o&&o.rate!=null)?o.rate:null;};
+    const bestOf={overall:null};
+    ranked.forEach(m=>{const r=ovRate(m);
+      if(r!=null&&(bestOf.overall==null||r>bestOf.overall))bestOf.overall=r;});
+    spShown.forEach(x=>{let mx=null;
+      ranked.forEach(m=>{const r=rateIn((C[m].per_split||{})[x]);
+        if(r!=null&&(mx==null||r>mx))mx=r;});
+      bestOf[x]=mx;});
+    // Rates are exact fractions here, but compare with a tolerance so 24/30 vs 0.8 cannot miss.
+    const isBest=(r,key)=>r!=null&&bestOf[key]!=null&&Math.abs(r-bestOf[key])<1e-9;
+    const HL=' style="background:#eef2fb;box-shadow:inset 0 0 0 2px #7fa8f0"';
     // Named cellSp, NOT cell: #0b below declares its own `cell` in this same block scope, and a
     // duplicate `const` is a SyntaxError that kills the whole script -- the page then hangs forever
     // on "loading stats..." because load() never runs.
-    const cellSp=(b,bold)=>{
+    const cellSp=(b,key)=>{
       const u=SUC(b);
       if(!u)return '<td style="color:#ccc">–</td>';
       if(u.na)return `<td style="color:#ccc" title="not scorable under the horizon gate — `
         +`re-run scripts/extract_combine_results.py, or the raw episodes were pruned">n/a</td>`;
       const drop=u.drop?` · refined: ${u.drop} win${u.drop>1?'s':''} outside the horizon`:'';
-      return `<td title="${b.avg_seconds!=null?b.avg_seconds+'s/ep':''}${drop}"`
-        +`${bold?' style="background:#eef2fb"':''}>`
+      const top=isBest(u.r,key);
+      return `<td title="${b.avg_seconds!=null?b.avg_seconds+'s/ep':''}${drop}`
+        +`${top?' · best in this column':''}"${top?HL:''}>`
         +`<b>${pct(u.r)}</b><br><span style="color:#888;font-size:11px">${u.s}/${u.n}</span></td>`;};
     let h="<table class=cmbmain><tr><th>#</th><th class='exp'>method</th><th>overall</th>"
-      +spShown.map(x=>`<th>${x.replace('_','-')}</th>`).join('')
+      +spShown.map(x=>`<th title="${x==='other'
+          ?'the 24-task NEW-TASK held-out set, outside the 50-task manifest. The horizon gate demotes '
+           +'nothing on these tasks, so refined equals raw and the two scorings show the same number.'
+          :x}">${splName(x)}</th>`).join('')
       +"<th>avg s/ep</th><th>avg turns</th></tr>";
     ranked.forEach((m,i)=>{const v=C[m], P=v.per_split||{};
       const tt=Object.entries(v.terminations||{}).sort((a,b2)=>b2[1]-a[1])
@@ -1319,7 +1430,10 @@ async function load(){
       // Prefer the top-level record for the overall cell (it is what the extractor computed over
       // every episode); fall back to the split sum when a method predates per_split.
       const t0=SUC(v);
-      const ov=(t0&&v.n)?(t0.na?{n:v.n,na:true}:{n:v.n,n_success:t0.s,rate:t0.r}):overallOf(m);
+      // Partial-coverage runs get NO overall at all (see fullCov above), not a number computed over
+      // whichever slice they happen to cover.
+      const ov=!fullCov(m)?null
+        :(t0&&v.n)?(t0.na?{n:v.n,na:true}:{n:v.n,n_success:t0.s,rate:t0.r}):overallOf(m);
       // Under the toggle the name says "(refined)" too, so a screenshot of this table cannot be
       // mistaken for the raw one.
       // No "(refined)" suffix on the name: it doubled the width of every row label, and the toggle
@@ -1328,14 +1442,18 @@ async function load(){
       const dropTip=(window._refined&&t0&&!t0.na&&t0.drop)
         ? ` · horizon gate removed ${t0.drop} win${t0.drop>1?'s':''}`
         : (window._refined&&t0&&t0.na?' · not scorable under the horizon gate':'');
+      const ovTop=isBest(ovRate(m),'overall');
       h+=`<tr><td style="color:#888">${i+1}</td><td class='exp'>${nm}</td>`
-        +`<td title="errors: ${v.n_error??0} · terminations — ${tt||'n/a'}${dropTip}"`
-        +` style="background:#eef2fb">`
-        +(ov&&ov.na?'<span style="color:#ccc">n/a</span>'
-          :`<b>${pct(ov?ov.rate:null)}</b><br><span style="color:#888;font-size:11px">`
-           +`${ov?ov.n_success:'?'}/${ov?ov.n:'?'}</span>`)
+        +`<td title="errors: ${v.n_error??0} · terminations — ${tt||'n/a'}${dropTip}`
+        +`${ovTop?' · best overall':''}"${ovTop?HL:''}>`
+        +(!ov?`<span style="color:#ccc" title="evaluated on part of the manifest only `
+              +`(${Object.keys(v.per_split||{}).map(splName).join(', ')}) — `
+              +`no comparable overall">—</span>`
+          :ov.na?'<span style="color:#ccc">n/a</span>'
+          :`<b>${pct(ov.rate)}</b><br><span style="color:#888;font-size:11px">`
+           +`${ov.n_success}/${ov.n}</span>`)
         +`</td>`
-        +spShown.map(x=>cellSp(P[x],false)).join('')
+        +spShown.map(x=>cellSp(P[x],x)).join('')
         +`<td>${v.avg_seconds??'–'}</td><td>${v.avg_turns??'–'}</td></tr>`;});
     // No explanatory paragraph under the table, by request. Everything it said is either visible in
     // the table itself (rate + #success/#episodes per cell), in a hover title (errors, terminations,
@@ -1446,7 +1564,7 @@ async function load(){
       const rows=tasks.filter(t=>info[t]===sp);
       if(!rows.length)return;
       const sb=m=>(C[m].per_split||{})[sp];
-      h3+=`<tr><td class='exp' style="background:#dfe6f5;font-weight:700">${sp.replace('_','-')}</td>`
+      h3+=`<tr><td class='exp' style="background:#dfe6f5;font-weight:700">${splName(sp)}</td>`
         +cols.map(m=>cell(sb(m))).join('')
         +(cmpOn?dcell(sb(cols[0]),sb(cols[1])):'')+`</tr>`;
       rows.forEach(t=>{const tb=m=>(C[m].per_task||{})[t];
@@ -1529,6 +1647,9 @@ HOME_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   <a class="card" href="/finestep"><h2>Fine-step Eval<span class="path">/finestep</span></h2>
     <p>Per-child-subgoal CLOSED-LOOP rollouts: hard-reset to each subgoal start independently. Same
        rich per-frame panels, plus the oracle GT reference and the Gemini success verdict per span.</p></a>
+  <a class="card" href="/baseline"><h2>Flat-policy baseline<span class="path">/baseline</span></h2>
+    <p>Xiaomi-Robotics-1 RoboCasa365 rollouts: one policy, no System2. Each episode is just the task
+       goal and one video of the whole attempt, with its step count against the official horizon.</p></a>
   <a class="card" href="/stats"><h2>Statistics<span class="path">/stats</span></h2>
     <p>Aggregate success across methods: episode success rate (all / atomic / composite / seen /
        unseen), subtask Gemini success by primitive, and final-step validation MSE.</p></a>
@@ -2272,6 +2393,9 @@ loadMethods();
 # first existing "data" dir near this repo (<repo_root>/data, sibling, ~/data). Keeps both the
 # shared-filesystem layout and the classic repo+sibling-data layout working with no flags.
 COMBINE_ROOT: Path = _RESULTS / "combine"
+# Flat-policy baseline rollout tree (see /baseline). Populated by an aws s3 sync; summarised for
+# /stats by scripts/extract_baseline_results.py.
+BASELINE_ROOT = _RESULTS / "baseline"
 # Precomputed per-method summaries (scripts/extract_combine_results.py). /stats reads these
 # instead of aggregating raw rollout output.
 COMBINE_RESULTS_DIR: Path = _RESULTS / "combine_results"
@@ -2282,6 +2406,18 @@ COMBINE_RESULTS_DIR: Path = _RESULTS / "combine_results"
 # Used only to extrapolate a wall-clock estimate from the episodes actually run.
 COMBINE_BENCH_TASKS = 50
 COMBINE_BENCH_EPISODES = 25307
+
+
+def _is_newtask(rec: dict) -> bool:
+    """True for a run over the 24-task NEW-TASK set rather than the 50-task manifest.
+
+    Detected from the DATA (every per_task entry has split "other"), with the method name as a
+    fallback, so a future newtask run is classified without being renamed.
+    """
+    pt = rec.get("per_task") or {}
+    if pt and all((t.get("split") or "other") == "other" for t in pt.values()):
+        return True
+    return "newtask" in str(rec.get("method", "")).lower()
 
 
 def _combine_stats() -> dict:
@@ -2326,6 +2462,13 @@ def _combine_stats() -> dict:
                 # baseline toggle on this rather than on the method name, so a baseline run can be
                 # named anything.
                 "kind": rec.get("kind"),
+                # NEWTASK runs: the 24-task held-out set, which lives outside TARGET_TASK_SPLIT (every
+                # task reports split "other"). Used to hide these rows behind their own checkbox and to
+                # deny them an "overall" (they cover none of the manifest). Their REFINED figure is
+                # left INTACT and displayed: the gate does know these tasks' horizons and demotes
+                # nothing on them, so refined equals raw -- rendering n/a instead would hide a real
+                # result behind a technicality.
+                "newtask": _is_newtask(rec),
                 "src": "extracted",
             }
     # 2) live fallback for methods not extracted yet (a sweep still running)
@@ -2506,6 +2649,314 @@ def api_combine_media(method, episode, turn, fname):
         return jsonify({"error": "not found"}), 404
     return send_file(str(p))
 
+# =================================================================================================
+# FLAT-POLICY BASELINE browser (/baseline)
+#
+# A baseline unit is minimal by nature: ``baseline/<run>/<Task>/episode_NNNNNN/`` holds one
+# ``episode.json`` (goal, success, steps, horizon) and one ``rollout.mp4`` of the WHOLE episode.
+# There are no turns, no subgoals and no per-turn media, so /combine's turn-oriented UI has nothing
+# to show for it -- hence a separate page rather than a mode of that one. This is a viewer only; the
+# aggregate numbers live in /stats via scripts/extract_baseline_results.py.
+# =================================================================================================
+
+
+# TWO BASELINE LAYOUTS, same as scripts/extract_baseline_results.py:
+#   xiaomi-robo1*  <Task>/episode_NNNNNN/episode.json      (nested)
+#   pi05           <Task>__target__episode_NNNNNN/episode.json   (flat, combined_eval convention)
+def _baseline_episode_files(run: Path) -> list[Path]:
+    return (sorted(run.glob("*/episode_*/episode.json"))
+            or sorted(run.glob("*/episode.json")))
+
+
+def _baseline_runs() -> list[str]:
+    if not BASELINE_ROOT.is_dir():
+        return []
+    return sorted(d.name for d in BASELINE_ROOT.iterdir()
+                  if d.is_dir() and _baseline_episode_files(d))
+
+
+@app.route("/api/baseline/methods")
+def api_baseline_methods():
+    out = []
+    for name in _baseline_runs():
+        n = ns = 0
+        for f in _baseline_episode_files(BASELINE_ROOT / name):
+            try:
+                d = json.loads(f.read_text())
+            except Exception:  # noqa: BLE001 - a torn file must not hide the run
+                continue
+            n += 1
+            # RAW outcome. pi05's `episode_success` is already horizon-gated, so its raw rate lives in
+            # `raw_episode_success`; xiaomi has a plain `success`. Counting the wrong one understates
+            # pi05 by 64 episodes.
+            ns += bool(d.get("raw_episode_success", d.get("success", d.get("episode_success"))))
+        out.append({"method": name, "n_episodes": n, "n_success": ns})
+    return jsonify(out)
+
+
+@app.route("/api/baseline/episodes/<method>")
+def api_baseline_episodes(method):
+    """One row per episode: the goal, the outcome, and where the video is."""
+    base = (BASELINE_ROOT / method).resolve()
+    if not str(base).startswith(str(BASELINE_ROOT.resolve())) or not base.is_dir():
+        return jsonify({"error": "not found"}), 404
+    rows = []
+    for f in _baseline_episode_files(base):
+        try:
+            d = json.loads(f.read_text())
+        except Exception:  # noqa: BLE001
+            continue
+        task = d.get("task_name") or f.parent.parent.name
+        vids = [x for x in f.parent.iterdir() if x.suffix == ".mp4"]
+        raw = bool(d.get("raw_episode_success", d.get("success", d.get("episode_success"))))
+        scored = d.get("episode_success") if "raw_episode_success" in d else None
+        rows.append({
+            "task": task,
+            "task_split": _target_split_map().get(task, "other"),
+            "episode": int(d.get("episode_index", 0)),
+            # Relative to the run dir, so one media route serves both layouts.
+            "dir": str(f.parent.relative_to(base)),
+            # The GOAL as the policy received it, and the dataset's own wording when they differ
+            # (the -unseenshort runs were given a one-line goal instead of the full instruction).
+            "instruction": d.get("instruction"),
+            "source_instruction": d.get("source_instruction"),
+            "instruction_mode": d.get("instruction_mode"),
+            "success": raw,
+            # Present only where the producer also reports a horizon-gated outcome (pi05). When it
+            # differs from `success`, the episode solved the task PAST the official horizon.
+            "success_scored": scored,
+            "success_step": d.get("success_step"),
+            "termination": d.get("termination"),
+            # CAREFUL: pi05 uses "steps" for the steps.npz FILENAME and "n_steps" for the count,
+            # while xiaomi uses "steps" for the count. Take whichever is actually a number.
+            "steps": (d["steps"] if isinstance(d.get("steps"), (int, float))
+                      else d.get("n_steps")),
+            # Horizon key differs per producer: xiaomi `horizon`, pi05 `scoring_cap`,
+            # abot `official_max_steps` / `robocasa_task_horizon`.
+            "horizon": next((d[k] for k in ("horizon", "scoring_cap", "official_max_steps",
+                                            "robocasa_task_horizon") if d.get(k) is not None), None),
+            "seconds": d.get("seconds"),
+            # BASENAME ONLY. abot records an ABSOLUTE path from the machine that produced it
+            # (/tmp/ABot_eval_results/...), which is meaningless here; the file sits beside
+            # episode.json. `has_video` is reported because abot ships videos for only the first 10
+            # episodes of each task (500 of 1500), so the player must be able to say so rather than
+            # silently fail.
+            "video": os.path.basename(d.get("video") or "") or "rollout.mp4",
+            "has_video": bool(vids),
+        })
+    rows.sort(key=lambda r: (r["task"], r["episode"]))
+    return jsonify(rows)
+
+
+@app.route("/api/baseline/media/<method>/<path:relpath>")
+def api_baseline_media(method, relpath):
+    base = (BASELINE_ROOT / method).resolve()
+    p = (base / relpath).resolve()
+    if not str(p).startswith(str(base)) or not p.exists():   # no path traversal
+        return jsonify({"error": "not found"}), 404
+    return send_file(str(p))
+
+
+BASELINE_HTML = """<!doctype html><meta charset=utf-8>
+<title>flat-policy baseline rollouts</title>
+<style>
+ *{box-sizing:border-box}
+ body{font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;color:#1a1a1a;
+      background:#fafafb;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+ a{color:#0a58ca}
+ select,button{font:13px inherit;padding:3px 8px}
+ #top{flex:0 0 auto;background:#fff;border-bottom:1px solid #ddd;padding:7px 12px}
+ .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+ h1{font-size:14px;margin:0 6px 0 0}h1 b{color:#b0431c}
+ nav{margin-left:auto;display:flex;gap:10px}
+ .nav button{border:1px solid #bbb;background:#fff;border-radius:6px;cursor:pointer;padding:3px 11px}
+ .nav button:disabled{opacity:.4;cursor:default}
+ .pos{font-family:ui-monospace,monospace;font-size:12px;color:#555;min-width:110px}
+ #body{flex:1 1 auto;overflow:auto;padding:12px;display:flex;gap:14px;align-items:flex-start}
+ #vidwrap{flex:0 0 auto;display:flex;flex-direction:column;gap:6px}
+ video{background:#000;border-radius:8px;max-height:68vh}
+ /* video scrubber, same interaction model as /combine's .player: a range the timeupdate handler
+    drives, and which seeks (paused) on drag. */
+ .player{display:flex;align-items:center;gap:7px}
+ .player input[type=range]{flex:1;min-width:220px}
+ .player button{border:1px solid #bbb;background:#fff;border-radius:5px;cursor:pointer;padding:2px 9px}
+ .player .cnt{font-family:ui-monospace,monospace;font-size:11px;color:#555;min-width:150px;
+              text-align:right}
+ .card{background:#fff;border:1px solid #e2e2e6;border-radius:9px;padding:11px 13px;flex:1 1 320px;
+       min-width:300px}
+ .k{color:#666;font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:2px}
+ .v{margin-bottom:10px;font-size:13px}
+ .goal{font-size:15px;font-weight:600;color:#1a1a1a}
+ .mono{font-family:ui-monospace,monospace;font-size:12px}
+ .ok{color:#137333;font-weight:700}.bad{color:#b3261e;font-weight:700}
+ .pill{display:inline-block;border:1px solid #ddd;border-radius:999px;padding:1px 8px;font-size:11px;
+       color:#555;background:#fafafa;margin-right:5px}
+</style>
+<div id=top>
+ <div class=row>
+  <h1>flat-policy <b>baseline</b> rollouts</h1>
+  <select id=method></select>
+  <select id=tasktype></select>
+  <select id=task></select>
+  <label>episode <select id=episode></select></label>
+  <span class="nav"><button id=prev>&#8592; prev</button><button id=next>next &#8594;</button></span>
+  <span class=pos id=pos></span>
+  <nav><a href="/">home</a><a href="/combine">combine</a><a href="/stats">stats</a></nav>
+ </div>
+</div>
+<div id=body>
+ <div id=vidwrap>
+  <video id=vid playsinline muted></video>
+  <div class=player>
+   <button id=play>&#9654;</button>
+   <input type=range id=srange min=0 max=1000 value=0 step=1>
+   <span class=cnt id=cnt>-- / --</span>
+  </div>
+ </div>
+ <div class=card id=meta></div>
+</div>
+<script>
+const S={method:null,all:[],eps:[],i:0};
+const $=q=>document.querySelector(q);
+const esc=t=>String(t==null?'':t).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const mmss=t=>{if(!isFinite(t))return'--:--';const m=Math.floor(t/60),x=Math.floor(t%60);
+  return `${m}:${String(x).padStart(2,'0')}`;};
+
+async function boot(){
+  const ms=await (await fetch('/api/baseline/methods')).json();
+  if(!ms.length){$('#body').innerHTML='<div class=card>No baseline runs under the baseline root.</div>';return;}
+  $('#method').innerHTML=ms.map(m=>`<option value="${m.method}">${m.method} (${m.n_success}/${m.n_episodes})</option>`).join('');
+  $('#method').onchange=()=>loadMethod($('#method').value);
+  wirePlayer();
+  await loadMethod(ms[0].method);
+}
+async function loadMethod(m){
+  S.method=m;
+  S.all=await (await fetch(`/api/baseline/episodes/${m}`)).json();
+  // ONE split and ONE task at a time, exactly like /combine. An "all" option would make the episode
+  // labels ambiguous -- ep0 exists in every task -- and /combine's convention is that the episode
+  // dropdown is always scoped to a single task, so `\u2713 ep0` identifies a row on its own.
+  const order=['atomic_seen','composite_seen','composite_unseen','other'];
+  const present=new Set(S.all.map(e=>e.task_split||'other'));
+  const splits=order.filter(t=>present.has(t));
+  const keepSp=$('#tasktype').value;
+  $('#tasktype').innerHTML=splits.map(t=>{
+    const n=S.all.filter(e=>(e.task_split||'other')===t);
+    return `<option value="${t}">${t} (${n.filter(e=>e.success).length}/${n.length})</option>`;}).join('');
+  if(splits.includes(keepSp))$('#tasktype').value=keepSp;
+  $('#tasktype').onchange=fillTasks; fillTasks();
+}
+function fillTasks(){
+  const sp=$('#tasktype').value;
+  const pool=S.all.filter(e=>(e.task_split||'other')===sp);
+  const tasks=[...new Set(pool.map(e=>e.task))].sort();
+  const keep=$('#task').value;
+  $('#task').innerHTML=tasks.map(t=>{const n=pool.filter(e=>e.task===t);
+      return `<option value="${t}">${t} (${n.filter(e=>e.success).length}/${n.length})</option>`;}).join('');
+  if(tasks.includes(keep))$('#task').value=keep;
+  $('#task').onchange=applyFilter; applyFilter();
+}
+function applyFilter(){
+  const sp=$('#tasktype').value, tk=$('#task').value;
+  S.eps=S.all.filter(e=>(e.task_split||'other')===sp&&e.task===tk)
+             .sort((a,b)=>(a.episode??0)-(b.episode??0));
+  S.i=0; fillEpisodes(); show();
+}
+// SUCCESS MARK IN THE DROPDOWN, the same label /combine uses: "<mark> ep<N>". The list is always
+// scoped to one task by the selectors above, so the episode number alone identifies the row.
+function fillEpisodes(){
+  $('#episode').innerHTML=S.eps.map((e,i)=>{
+    const ep=e.episode!=null?`ep${e.episode}`:'ep?';
+    return `<option value="${i}">${e.success?'\u2713':'\u2717'} ${ep}</option>`;}).join('');
+  $('#episode').value=String(S.i);
+}
+$('#episode').onchange=e=>{S.i=+e.target.value; show();};
+
+function wirePlayer(){
+  const v=$('#vid'), rng=$('#srange');
+  v.ontimeupdate=()=>{
+    if(!isFinite(v.duration)||v.duration<=0)return;
+    const f=v.currentTime/v.duration;
+    if(!rng.dragging)rng.value=Math.round(f*1000);
+    renderCnt();
+  };
+  v.onloadedmetadata=()=>{rng.value=0;renderCnt();};
+  v.onplay=()=>{$('#play').innerHTML='&#10073;&#10073;';};
+  v.onpause=()=>{$('#play').innerHTML='&#9654;';};
+  v.onended=()=>{$('#play').innerHTML='&#9654;';};
+  $('#play').onclick=()=>{if(v.paused)v.play().catch(()=>{});else v.pause();};
+  rng.oninput=e=>{
+    if(!isFinite(v.duration))return;
+    v.pause(); v.currentTime=(+e.target.value/1000)*v.duration; renderCnt();
+  };
+  // Drag guard: while the thumb is held, timeupdate must not fight the user for the value.
+  rng.onpointerdown=()=>{rng.dragging=true;};
+  rng.onpointerup=()=>{rng.dragging=false;};
+}
+// The counter shows BOTH clocks: video time, and the env step the playhead implies. A flat rollout
+// ran `steps` env steps into a `horizon`-step budget, so "step 412 / 1223" is the number that makes
+// the video comparable with the /stats row.
+function renderCnt(){
+  const v=$('#vid'), e=S.eps[S.i];
+  if(!e){$('#cnt').textContent='-- / --';return;}
+  const d=isFinite(v.duration)?v.duration:0;
+  const f=d>0?v.currentTime/d:0;
+  const step=e.steps!=null?Math.round(f*e.steps):null;
+  $('#cnt').textContent=`${mmss(v.currentTime)} / ${mmss(d)}`
+    +(step!=null?`   step ${step} / ${e.steps}`:'');
+}
+function show(){
+  const e=S.eps[S.i];
+  if(!e){$('#meta').innerHTML='<div class=v>no episodes match</div>';$('#vid').removeAttribute('src');
+         $('#pos').textContent='0 / 0';$('#cnt').textContent='-- / --';return;}
+  $('#pos').textContent=`${S.i+1} / ${S.eps.length}`;
+  $('#prev').disabled=S.i<=0; $('#next').disabled=S.i>=S.eps.length-1;
+  if($('#episode').value!==String(S.i))$('#episode').value=String(S.i);
+  // abot ships video for only 10 episodes per task, so an absent file is normal, not an error.
+  if(e.has_video===false){$('#vid').removeAttribute('src');$('#cnt').textContent='no video for this episode';}
+  else $('#vid').src=`/api/baseline/media/${S.method}/${e.dir}/${e.video}`;
+  const pct=(e.steps!=null&&e.horizon)?Math.round(100*e.steps/e.horizon):null;
+  const orig=e.source_instruction&&e.source_instruction!==e.instruction
+    ? `<div class=k>dataset instruction</div><div class="v mono">${esc(e.source_instruction)}</div>`:'';
+  $('#meta').innerHTML=
+    `<div class=k>task goal given to the policy</div><div class="v goal">${esc(e.instruction)}</div>`
+   +orig
+   +`<div class=v>${e.instruction_mode?`<span class=pill>${esc(e.instruction_mode)}</span>`:''}`
+   +`<span class=pill>${esc(e.task_split)}</span><span class=pill>${esc(e.task)}</span>`
+   +`<span class=pill>episode ${e.episode}</span></div>`
+   +`<div class=k>outcome</div><div class=v>`
+   +(e.success?'<span class=ok>&#10003; SUCCESS</span>':'<span class=bad>&#10007; FAILURE</span>')
+   // A run that reports a horizon-gated outcome too (pi05): when the two disagree the task WAS solved
+   // but only after the official budget, which is the distinction /stats' refined column is built on.
+   +((e.success&&e.success_scored===false)
+      ? ' <span class=pill style="border-color:#dcae4a;color:#6b4a12;background:#fff8e8">past horizon'
+        +' \u2014 not counted as refined</span>':'')
+   +(e.success_step!=null?` <span class=pill>success at step ${e.success_step}</span>`:'')
+   +`</div>`
+   +(e.termination?`<div class=k>termination</div><div class="v mono">${esc(e.termination)}</div>`:'')
+   +`<div class=k>env steps</div><div class="v mono">${e.steps} / horizon ${e.horizon}`
+   +(pct!=null?`  (${pct}% of budget)`:'')+`</div>`
+   +`<div class=k>wall clock</div><div class="v mono">${e.seconds}s</div>`
+   +`<div class=k>dir</div><div class="v mono">${esc(e.dir)}</div>`;
+}
+$('#prev').onclick=()=>{if(S.i>0){S.i--;show();}};
+$('#next').onclick=()=>{if(S.i<S.eps.length-1){S.i++;show();}};
+document.addEventListener('keydown',ev=>{
+  if(ev.target.tagName==='SELECT'||ev.target.tagName==='INPUT')return;
+  if(ev.key==='ArrowLeft'){$('#prev').click();ev.preventDefault();}
+  if(ev.key==='ArrowRight'){$('#next').click();ev.preventDefault();}
+  if(ev.key===' '){$('#play').click();ev.preventDefault();}
+});
+boot();
+</script>
+"""
+
+
+@app.route("/baseline")
+def baseline_page():
+    return BASELINE_HTML.replace("<script>", _ERR_JS + "<script>", 1)
+
+
 COMBINE_HTML = """<!doctype html><meta charset=utf-8>
 <title>System2+System1 combined eval</title>
 <style>
@@ -2678,7 +3129,14 @@ async function loadMethods(){
   // with the rest (it keeps its "[memory]" tag below so the different pipeline stays visible).
   const isDbg=m=>/^debug-/i.test(String(m||''));
   const ordered=ms.slice().sort((a,b)=>(isDbg(a.method)?1:0)-(isDbg(b.method)?1:0));
-  $('#method').innerHTML=ordered.map(m=>`<option value="${m.method}">${/-memory$/i.test(m.method)?'[memory] ':isDbg(m.method)?'[debug] ':''}${m.method} (${m.n_success??'?'}/${m.n_episodes??'?'})</option>`).join('');
+  // TAG PRECEDENCE: [unseenshort] wins over [memory]. Every terse-goal arm carries "unseenshort" in
+  // its name, including ...-unseenshort-memory, and what matters when picking one to inspect is that
+  // the GOAL was degraded to one line -- the plan source is the axis those arms differ on, not a
+  // separate pipeline. [memory] is kept for a memory run that is NOT part of that family.
+  const tagOf=m=>/unseenshort/i.test(m)?'[unseenshort] '
+                :/-memory$/i.test(m)?'[memory] '
+                :isDbg(m)?'[debug] ':'';
+  $('#method').innerHTML=ordered.map(m=>`<option value="${m.method}">${tagOf(m.method)}${m.method} (${m.n_success??'?'}/${m.n_episodes??'?'})</option>`).join('');
   if(!ms.length){$('#left').innerHTML='<div class=card><span class=muted>No combined runs under eval_results/combine yet.</span></div>';return;}
   S.method=(ordered.find(m=>!isDbg(m.method))||ordered[0]).method;
   S.ruleConfig=window._combineRuleConfigs[S.method]||null;

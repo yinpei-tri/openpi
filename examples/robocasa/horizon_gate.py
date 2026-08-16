@@ -1,10 +1,11 @@
 """Re-score eval results under RoboCasa's OFFICIAL per-task step horizon -- the "refined" number.
 
 WHY THIS EXISTS. RoboCasa scores a rollout by stepping the env at most ``horizon`` steps (per task,
-from its dataset registry) while polling ``env._check_success()`` densely. Our hierarchical eval
-budgets per SUBGOAL (``est_length * horizon_mult``, capped by ``--max-steps-cap``) and per TURN
-(``max_turns``) and never counts total env steps, so an episode can legitimately execute far past the
-horizon -- which makes a raw rate incomparable with anything measured under the official protocol.
+from its dataset registry) while polling ``env._check_success()`` densely. Historical and default
+50-task hierarchical runs budget per SUBGOAL (``est_length * horizon_mult``, capped by
+``--max-steps-cap``) and per TURN (``max_turns``), not by cumulative steps, so an episode can execute
+far past the horizon. New extra-task runs can enforce ``max_official_steps`` online; this gate remains
+the shared scorer for both schemas and for old results.
 Worst case measured: a GetToastedBread wait subgoal forced 1200 steps against a 500-step toaster and a
 3000-step horizon, and 8 wins landed outside the budget.
 
@@ -80,7 +81,13 @@ def gate_episode(doc: dict, *, task: str | None = None, horizon: int | None = No
     reported, so a refined rate is never quietly computed over episodes nobody could score.
     """
     task = task or doc.get("task_name") or ""
-    h = horizon if horizon is not None else TASK_HORIZON.get(task)
+    # Procedural/extra tasks may carry a configured official-step cap in the episode itself even when
+    # they are absent from the generated 50-task table. Prefer an explicit function argument, then the
+    # episode's audited cap, then the vendored benchmark table.
+    h = (horizon if horizon is not None
+         else doc.get("max_official_steps")
+         if doc.get("max_official_steps") is not None
+         else TASK_HORIZON.get(task))
     ok = bool(doc.get("episode_success"))
     cum = success_cum_step(doc)
     unknown = bool(ok and (h is None or cum is None))

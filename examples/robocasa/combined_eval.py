@@ -22,7 +22,8 @@ Design decisions (confirmed with the user, not inferred):
   * ``Current task status`` is fed LIVE from ``env._check_success()``. System2's system prompt
     tells it to judge ``task_finish`` only when that reads ``finished``, so withholding it would
     prevent termination. It is a privileged (GT) bit by design -- recorded as such in the output.
-  * termination: S2 ``task_finish`` OR ``--max-turns`` OR env success already true.
+  * termination: S2 ``task_finish``, env success, or the configured rollout limit. ``auto`` uses
+    the saved per-task ``max_turns`` when available and otherwise uses ``max_official_steps``.
   * clip frame selection: near-static frames are dropped for motion subgoals, but KEPT for
     wait/hold subgoals where stillness is the content (see sys2_client.build_clip_frames).
 
@@ -588,6 +589,121 @@ def max_turns_for(task_name: str, flat_max: int, *, dynamic: bool = True) -> tup
             + (f" +{bonus} bonus" if bonus else ""))
 
 
+def _positive_int(value, *, field: str, where: str) -> int:
+    """Validate a rollout-limit value without accepting booleans as integers."""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{where}.{field} must be a positive integer, got {value!r}")
+    return int(value)
+
+
+def _load_task_limits(path: str | os.PathLike | None) -> dict[str, dict[str, int]]:
+    """Load optional per-task rollout limits.
+
+    Accepted JSON forms are either concise ``{"Task": 1500}`` (an official-step cap) or explicit
+    ``{"Task": {"max_turns": 20, "max_official_steps": 1500}}``. In ``auto`` mode max_turns wins
+    when both are present. Strict validation is deliberate: a typo here changes the benchmark.
+    """
+    if not path:
+        return {}
+    p = Path(path).expanduser()
+    try:
+        raw = json.loads(p.read_text())
+    except Exception as e:
+        raise ValueError(f"--task-limits-json unreadable: {p}: {e}") from e
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError(f"--task-limits-json must be a non-empty task -> limits object: {p}")
+    out: dict[str, dict[str, int]] = {}
+    for task, value in raw.items():
+        where = f"{p}:{task}"
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError(f"{p}: every task key must be a non-empty string")
+        if isinstance(value, int) and not isinstance(value, bool):
+            out[task] = {"max_official_steps": _positive_int(
+                value, field="max_official_steps", where=where)}
+            continue
+        if not isinstance(value, dict) or not value:
+            raise ValueError(
+                f"{where} must be a positive step integer or an object containing max_turns "
+                "and/or max_official_steps")
+        unknown = set(value) - {"max_turns", "max_official_steps"}
+        if unknown:
+            raise ValueError(f"{where} has unknown fields {sorted(unknown)}")
+        entry = {field: _positive_int(v, field=field, where=where)
+                 for field, v in value.items()}
+        if not entry:
+            raise ValueError(f"{where} contains no rollout limit")
+        out[task] = entry
+    return out
+
+
+def _registry_official_steps(task_name: str) -> int | None:
+    """Official RoboCasa registry horizon, when this task has a dataset-registry record."""
+    # Lazy because merely importing this script for light-weight report tooling should not add another
+    # eager registry import. The actual evaluator already requires RoboCasa and robosuite.
+    from robocasa.utils.dataset_registry import ATOMIC_TASK_DATASETS
+    from robocasa.utils.dataset_registry import COMPOSITE_TASK_DATASETS
+
+    cfg = ATOMIC_TASK_DATASETS.get(task_name) or COMPOSITE_TASK_DATASETS.get(task_name)
+    if not cfg or cfg.get("horizon") is None:
+        return None
+    return _positive_int(cfg["horizon"], field="horizon", where=f"registry:{task_name}")
+
+
+def rollout_limit_for(task_name: str, args) -> dict:
+    """Resolve the ONE outcome-bearing rollout limit for this task.
+
+    ``auto`` preserves the benchmark behavior for the existing 50 tasks: a known per-task turn cap
+    wins. For a task absent from that table, it requires an official-step cap from the CLI, the
+    optional JSON, or RoboCasa's dataset registry. It intentionally does *not* silently fall back to
+    the flat 20-turn cap, because that would starve previously unseen composite tasks.
+    """
+    mode = args.rollout_limit_mode
+    entry = _load_task_limits(args.task_limits_json).get(task_name, {})
+    configured_turns = entry.get("max_turns")
+    configured_steps = (args.max_official_steps
+                        if args.max_official_steps is not None
+                        else entry.get("max_official_steps"))
+
+    if mode == "auto":
+        if configured_turns is not None:
+            return {"mode": "max_turns", "max_turns": configured_turns,
+                    "max_official_steps": None, "reason": "task-limits JSON"}
+        if args.flat_max_turns:
+            turns, reason = max_turns_for(task_name, args.max_turns, dynamic=False)
+            return {"mode": "max_turns", "max_turns": turns,
+                    "max_official_steps": None, "reason": reason}
+        if task_name in TARGET_MAX_SUBGOAL_TURNS:
+            turns, reason = max_turns_for(task_name, args.max_turns, dynamic=True)
+            return {"mode": "max_turns", "max_turns": turns,
+                    "max_official_steps": None, "reason": reason}
+        mode = "max_official_steps"
+
+    if mode == "max_turns":
+        if configured_turns is not None:
+            turns, reason = configured_turns, "task-limits JSON"
+        else:
+            turns, reason = max_turns_for(
+                task_name, args.max_turns, dynamic=not args.flat_max_turns)
+        return {"mode": "max_turns", "max_turns": turns,
+                "max_official_steps": None, "reason": reason}
+
+    steps = configured_steps
+    reason = ("--max-official-steps" if args.max_official_steps is not None
+              else "task-limits JSON" if entry.get("max_official_steps") is not None
+              else "RoboCasa dataset registry")
+    if steps is None:
+        steps = _registry_official_steps(task_name)
+    if steps is None:
+        raise ValueError(
+            f"{task_name} has neither a saved max_turns nor a registered max_official_steps. "
+            "Provide --max-official-steps for this one-task invocation or add the task to "
+            "--task-limits-json.")
+    steps = _positive_int(steps, field="max_official_steps", where=task_name)
+    return {"mode": "max_official_steps", "max_turns": None,
+            "max_official_steps": steps, "reason": reason,
+            "max_s2_calls_safety": args.max_s2_calls_safety}
+
+
 def _episode_done(method_dir: Path, lerobot_dir: Path, ep_index: int) -> bool:
     """True if this episode already has a COMPLETE result under ``method_dir``.
 
@@ -982,6 +1098,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             "s1_ckpt": args.s1_dir, "s2_ckpt": args.s2_dir,
             "horizon_mult": args.horizon_mult, "max_steps_cap": args.max_steps_cap,
             "replan_steps": args.replan_steps, "max_turns_flat": args.max_turns,
+            "rollout_limit_requested": _rollout_limit_fingerprint(args),
             "stop": {"progress": args.stop_progress, "eps": args.stop_eps, "window": args.stop_window},
             "clip": {"fps": S2C.CLIP_FPS, "crf": S2C.CLIP_CRF, "tile": list(S2C.TILE_HW),
                      "sim_fps": S2C.SIM_FPS, "static_eps": args.static_eps},
@@ -1005,6 +1122,12 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
     try:
         if not instruction:
             raise ValueError(f"episode {ep_index} has no ep_meta['lang'] task goal")
+        rollout_limit = rollout_limit_for(task_name, args)
+        doc["rollout_limit"] = rollout_limit
+        doc["max_turns"] = rollout_limit["max_turns"]
+        doc["max_official_steps"] = rollout_limit["max_official_steps"]
+        doc["max_turns_reason"] = (rollout_limit["reason"]
+                                   if rollout_limit["mode"] == "max_turns" else None)
         states = LU.get_episode_states(ld, ep_index)
         # Reset to the FIRST frame of the recorded episode (states[0]) — the episode's own start
         # scene. The recorded actions are never read: System1 generates every action.
@@ -1063,7 +1186,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         # decide the privileged "Current gripper status" (see _gripper_status).
         seg_grip_cmds: list[float] = []
         turn = 0
-        term = "max_turns"
+        episode_steps = 0
         env_success = bool(env._check_success())
         # The clip System2 watches on turn N is the one PRODUCED by turn N-1's System1 segment, so
         # it lives in the PREVIOUS turn's dir. Carried forward explicitly instead of being rebuilt
@@ -1073,13 +1196,22 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         clip_info = None
         clip_stats = None
         n_clip_frames = 0
-        max_turns, mt_why = max_turns_for(task_name, args.max_turns,
-                                          dynamic=not args.flat_max_turns)
-        doc["max_turns"] = max_turns
-        doc["max_turns_reason"] = mt_why
-        print(f"  turn budget: {max_turns} ({mt_why})", flush=True)
+        if rollout_limit["mode"] == "max_turns":
+            turn_guard = int(rollout_limit["max_turns"])
+            term = "max_turns"
+            print(f"  rollout limit: {turn_guard} turns ({rollout_limit['reason']})", flush=True)
+        else:
+            turn_guard = _positive_int(args.max_s2_calls_safety,
+                                       field="max_s2_calls_safety", where="CLI")
+            term = "max_s2_calls_safety"
+            print(f"  rollout limit: {rollout_limit['max_official_steps']} cumulative env steps "
+                  f"({rollout_limit['reason']}); S2-call safety={turn_guard}", flush=True)
 
-        while turn < max_turns:
+        while turn < turn_guard:
+            if (rollout_limit["mode"] == "max_official_steps"
+                    and episode_steps >= rollout_limit["max_official_steps"]):
+                term = "max_official_steps"
+                break
             tdir = ep_out / f"turn{turn:02d}"
             tdir.mkdir(parents=True, exist_ok=True)
             task_status = "finished" if env_success else "ongoing"
@@ -1111,10 +1243,17 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 s2 = {"held_by_rule": held["rule"], "subgoal": held["subgoal"],
                       "subgoal_detail": held.get("subgoal_detail") or held["subgoal"],
                       "estimated_step": held.get("est"), "judge": None,
-                      "thought": (f"System2 NOT queried: {held['rule']} borrowed turn {turn - 1}, so "
-                                  "the subgoal it proposed there runs now against the same plan."),
+                      "held_kind": held.get("held_kind", "s2_resume"),
+                      "thought": (
+                          f"System2 NOT queried: {held['rule']} is replaying the intervening "
+                          "effective subgoal after an offset+2 reach-back, before resuming the "
+                          "held System2 subgoal."
+                          if held.get("held_kind") == "offset2_replay" else
+                          f"System2 NOT queried: {held['rule']} borrowed turn {turn - 1}, so "
+                          "the subgoal it proposed there runs now against the same plan."),
                       "plan_update": None}
-                s2_media = {"held_by_rule": held["rule"]}
+                s2_media = {"held_by_rule": held["rule"],
+                            "held_kind": held.get("held_kind", "s2_resume")}
                 s2_user = None
                 plan_in = plan          # unchanged: no plan_update is applied on a held turn
                 clip_stats = None
@@ -1179,7 +1318,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             s2_subgoal, s2_sg_detail, s2_est, s2_plan = subgoal, sg_detail, est, plan
             rule_ivs: list[dict] = []
             skip_s1 = False
-            tx_label = None
+            tx_label = held.get("tx_label") if held else None
             force_steps = 0
             rr_stop = False
             # Reset per turn: a HELD turn skips the rule call below, and without this rr would still
@@ -1279,6 +1418,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                     # all this turn -- so "no user_prompt / no judge" reads as deliberate rather than
                     # as a missing record.
                     "held_by_rule": s2.get("held_by_rule"),
+                    "held_kind": s2.get("held_kind"),
                     "latency_s": s2.get("latency_s"), "usage": s2.get("usage"),
                     "nframes_requested": s2.get("nframes"),
                     "media": s2_media,
@@ -1382,6 +1522,14 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             # longer than the cap is never mysterious.
             if force_steps > 0:
                 budget = force_steps
+            budget_before_episode_cap = budget
+            force_steps_requested = force_steps
+            if rollout_limit["mode"] == "max_official_steps":
+                # This is the actual benchmark boundary, so it also clips rule-forced waits that
+                # deliberately bypass the ordinary per-segment --max-steps-cap.
+                remaining = int(rollout_limit["max_official_steps"] - episode_steps)
+                budget = min(budget, remaining)
+                force_steps = min(force_steps, budget)
             s1_text = sg_detail if (args.prompt_source == "subgoal_detail" and sg_detail) else subgoal
 
             roll = run_s1_segment(
@@ -1395,6 +1543,15 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
 
             frames = roll.pop("_clean_frames")
             steps = roll.pop("_step_records")
+            episode_steps += int(roll["n_steps"])
+            doc["n_env_steps"] = episode_steps
+            # Offset+2 regrasp recovery needs the ONE effective segment executed between the
+            # original grasp and the detected drop. Snapshot every completed System1 segment here;
+            # the recovery rule copies the relevant record before its injected reach-back replaces
+            # this slot on the following segment.
+            SR.record_executed_subgoal(
+                rule_state, subgoal=subgoal, subgoal_detail=sg_detail, est=est,
+            )
             # Expose the gripper WIDTH left by this segment to the rules, so a rule can react to the
             # physical outcome rather than only to System2's text. Read on the NEXT turn, when the
             # env is still in the pose this segment ended in -- e.g. a near-zero width after a grasp
@@ -1460,6 +1617,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             _write_json(tdir / "s1_steps.json", {
                 "subgoal": subgoal, "subgoal_detail": sg_detail, "s1_prompt_text": s1_text,
                 "est_length": est_eff, "budget": budget,
+                "budget_before_episode_cap": budget_before_episode_cap,
+                "episode_steps_after": episode_steps,
                 "n_steps": roll["n_steps"], "stop_reason": roll["stop_reason"],
                 "success_step": roll.get("success_step"),
                 "progress_done": roll["progress_done"], "quiescent": roll["quiescent"],
@@ -1472,6 +1631,10 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 # Non-zero only when a rule forced the segment length; makes a segment that exceeds
                 # --max-steps-cap self-explanatory in the record and in the GUI.
                 "forced_steps": force_steps or None,
+                "forced_steps_requested": (force_steps_requested
+                                           if force_steps_requested != force_steps else None),
+                "budget_before_episode_cap": budget_before_episode_cap,
+                "episode_steps_after": episode_steps,
                 "n_steps": roll["n_steps"], "stop_reason": roll["stop_reason"],
                 "success_step": roll.get("success_step"),
                 "progress_done": roll["progress_done"], "quiescent": roll["quiescent"],
@@ -1498,6 +1661,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             doc["turns"].append({
                 "turn": turn, "dir": tdir.name, "judge": judge, "subgoal": subgoal,
                 "estimated_step": est, "budget": budget, "n_steps": roll["n_steps"],
+                "episode_steps_after": episode_steps,
                 "stop_reason": roll["stop_reason"], "success_step": roll.get("success_step"),
                 "env_success_after": env_success,
                 "clip_frames": n_clip_frames,
@@ -1512,7 +1676,12 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             if env_success and args.stop_on_env_success:
                 term = "env_success"
                 break
+            if (rollout_limit["mode"] == "max_official_steps"
+                    and episode_steps >= rollout_limit["max_official_steps"]):
+                term = "max_official_steps"
+                break
         doc["n_turns"] = turn
+        doc["n_env_steps"] = episode_steps
         doc["termination"] = term
         # Episode-level rule summary: the per-turn detail lives in each turn.json, this is the
         # roll-up the report script and the GUI read. `rule_interventions: []` with
@@ -1540,7 +1709,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         doc["timings"]["_note"] = ("per-component wall clock; s1_infer/env_* are summed per turn, "
                                   "s2_exec/s2_plan are per call")
         _write_json(ep_out / "episode.json", doc)
-        print(f"  {task_name}: success={doc['episode_success']} turns={turn} term={term}"
+        print(f"  {task_name}: success={doc['episode_success']} turns={turn} "
+              f"steps={episode_steps} term={term}"
               f" ({doc['seconds']}s)", flush=True)
         return doc
 
@@ -1629,13 +1799,33 @@ def _goal_fingerprint(args) -> dict:
             "strict": bool(getattr(args, "goal_json_strict", True))}
 
 
+def _rollout_limit_fingerprint(args) -> dict:
+    """Run-level termination configuration, including the contents of a task-limit map."""
+    limits = _load_task_limits(getattr(args, "task_limits_json", None))
+    blob = json.dumps(limits, sort_keys=True).encode() if limits else b""
+    return {
+        "mode": args.rollout_limit_mode,
+        "flat_max_turns": bool(args.flat_max_turns),
+        "fallback_max_turns": int(args.max_turns),
+        "max_official_steps_override": args.max_official_steps,
+        "max_s2_calls_safety": int(args.max_s2_calls_safety),
+        "task_limits_json": (str(Path(args.task_limits_json).expanduser())
+                             if args.task_limits_json else None),
+        "task_limits_sha256": hashlib.sha256(blob).hexdigest()[:16] if limits else None,
+        "n_task_limits": len(limits),
+    }
+
+
 def _write_run_rule_config(out_root: Path, method: str, args) -> dict:
-    """Persist the method's rule tiers and refuse to mix incompatible arms in one directory."""
-    # The guard covers the GOAL SOURCE as well as the rule tiers: a --goal-json run and a normal run
-    # are different arms, and with a derived method name or --resume they would otherwise merge into
-    # one directory and one success rate. (Found in review; the short-goal sweep was safe only because
-    # it was launched with an explicit RUN_LABEL.)
-    cfg = {**_rule_config(args), "goal": _goal_fingerprint(args)}
+    """Persist the run configuration and refuse to mix incompatible arms in one directory."""
+    # The guard covers the GOAL SOURCE and PLAN VARIANT as well as the rule tiers. A --goal-json run,
+    # a cold plan, and a memory plan built from a particular recipe library are different arms; with
+    # a reused --method/--resume they would otherwise merge into one directory and one success rate.
+    # Variant clients set ``run_plan_config`` before calling run_sweep. The ordinary client gets an
+    # explicit cold marker, so accidentally reusing a memory label for a cold run is caught too.
+    plan_cfg = getattr(args, "run_plan_config", None) or {"mode": "cold"}
+    cfg = {**_rule_config(args), "goal": _goal_fingerprint(args), "plan": plan_cfg,
+           "rollout_limit": _rollout_limit_fingerprint(args)}
     path = out_root / method / "rule_config.json"
     if path.exists():
         try:
@@ -1688,13 +1878,30 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                     help="pass media as file:// URIs instead of inlined base64 (server must share the FS)")
     # loop control
     ap.add_argument("--max-turns", type=int, default=20,
-                    help="fallback turn cap; by default the cap is PER TASK from "
-                         "robocasa_target_maxturns.json (max_subgoal_turns + headroom + offset)")
+                    help="fallback turn cap used by --rollout-limit-mode=max_turns or "
+                         "--flat-max-turns. In auto mode an unknown task uses its official-step cap "
+                         "instead of silently receiving this flat value.")
     ap.add_argument("--resume", action="store_true",
                     help="skip episodes already finished under --out-root/<method> (episode.json "
                          "present with a termination and no error). Makes a killed sweep restartable.")
     ap.add_argument("--flat-max-turns", action="store_true",
-                    help="ignore the per-task table and use --max-turns for every task")
+                    help="ignore the per-task table and use --max-turns for every task; this also "
+                         "forces the max_turns branch in auto mode")
+    ap.add_argument("--rollout-limit-mode",
+                    choices=["auto", "max_turns", "max_official_steps"], default="auto",
+                    help="auto (default): use saved per-task max_turns when present, otherwise the "
+                         "task's official cumulative-step cap. The other choices explicitly force "
+                         "one limit type.")
+    ap.add_argument("--max-official-steps", type=int, default=None,
+                    help="explicit cumulative env-step cap for this invocation; overrides the task "
+                         "JSON/registry value when the official-step branch is selected")
+    ap.add_argument("--task-limits-json", default=None,
+                    help="optional JSON task map. Values can be step integers or objects with "
+                         "max_turns and/or max_official_steps")
+    ap.add_argument("--max-s2-calls-safety", type=int, default=100,
+                    help="non-scoring deadlock guard used only in max_official_steps mode. It catches "
+                         "query/skip loops that execute zero env steps; normal termination is still "
+                         "the cumulative step cap.")
     ap.add_argument("--horizon-mult", type=float, default=2.0,
                     help="segment budget = estimated_step * this, capped by --max-steps-cap")
     ap.add_argument("--max-steps-cap", type=int, default=400,
@@ -1710,14 +1917,17 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                          "it, half of them the GetToastedBread waits that now bypass the cap. Runs at "
                          "400 ARE step-for-step comparable with the 1000-episode no-rules baseline and "
                          "are NOT comparable with the -estbump sweep, which used 800.")
-    ap.add_argument("--general-rules", action="store_true",
-                    help="add the GENERAL (task-agnostic) rule tier on top of the mandatory one. "
-                         "Implied by --task-rules, so the three arms are: no flag = mandatory only "
+    ap.add_argument("--general-rules", action=argparse.BooleanOptionalAction, default=True,
+                    help="the GENERAL (task-agnostic) rule tier. ON BY DEFAULT -- the full rule set "
+                         "is now the standard configuration; --no-general-rules drops this tier and "
+                         "--no-task-rules --no-general-rules gives the mandatory-only arm. "
+                         "Implied by --task-rules, so the three arms are: both off = mandatory only "
                          "(repeat_cap, the '-base' arm); --general-rules = mandatory + general; "
                          "--task-rules = mandatory + general + per-task. The general tier is "
                          f"currently {SR.TASKS_WITH_RULES[1]}.")
-    ap.add_argument("--task-rules", action="store_true",
-                    help="add the OPTIONAL rule tiers (general + per-task + any sys2_rules_exp*.py "
+    ap.add_argument("--task-rules", action=argparse.BooleanOptionalAction, default=True,
+                    help="ON BY DEFAULT (use --no-task-rules to drop it). Adds the OPTIONAL rule "
+                         "tiers (general + per-task + any sys2_rules_exp*.py "
                          "patch file) on top of the MANDATORY tier. The mandatory tier -- repeat_cap "
                          "-- runs on EVERY run whether or not this flag is given, because it is the "
                          "loop's termination policy rather than a revision of System2's output: "
@@ -1805,7 +2015,8 @@ def run_sweep(args, *, method_suffix: str = "") -> None:
         "success_rate": (ok / len(results)) if results else None,
         "episodes": [{k: r.get(k) for k in
                       ("episode_id", "task_name", "episode_success", "n_turns", "termination",
-                       "seconds", "error")} for r in results],
+                       "n_env_steps", "max_official_steps", "rollout_limit", "seconds", "error")}
+                     for r in results],
     }
     # CONCURRENCY: the fleet runs 8 workers against ONE method dir, so a shared index.json would be
     # clobbered (last writer wins, every other worker's episodes lost). Each invocation writes its

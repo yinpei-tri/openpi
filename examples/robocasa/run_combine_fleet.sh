@@ -87,6 +87,13 @@ S2_BASE=${S2_BASE:-8100}
 XLA_FRAC=${XLA_FRAC:-0.32}                 # System1 JAX share
 GPU_FRAC=${GPU_FRAC:-0.42}                 # System2 vLLM share
 MAX_TURNS=${MAX_TURNS:-20}
+# Rollout termination. auto preserves the 50-task benchmark's saved per-task max_turns and switches
+# an unknown task to its cumulative official-step cap. TASK_LIMITS_JSON supplies heterogeneous caps
+# for a multi-task fleet; MAX_OFFICIAL_STEPS is a one-value override useful for a one-task run.
+ROLLOUT_LIMIT_MODE=${ROLLOUT_LIMIT_MODE:-auto}  # auto | max_turns | max_official_steps
+MAX_OFFICIAL_STEPS=${MAX_OFFICIAL_STEPS:-}
+TASK_LIMITS_JSON=${TASK_LIMITS_JSON:-}
+MAX_S2_CALLS_SAFETY=${MAX_S2_CALLS_SAFETY:-100}
 # Hard ceiling on ONE subgoal segment (budget = min(this, est_length*horizon_mult)).
 # Back to 400: the 800 round existed only because long WAIT subgoals were being truncated, and the
 # wait rule in sys2_rules now returns force_steps, which bypasses this cap entirely. Measured on the
@@ -108,13 +115,14 @@ UNITS_FILE=${UNITS_FILE:-}
 # nothing advancing. So there is no "zero rules" arm here; the floor is repeat_cap, which is exactly
 # what the historical "-base" methods measured.
 #
-#   (neither)                     mandatory only            == the -base arm
-#   GENERAL_RULES=1               + task-agnostic rules
-#   TASK_RULES=1                  + task-agnostic AND per-task rules (implies GENERAL_RULES)
+#   default                       mandatory + general + task rules
+#   TASK_RULES=0 GENERAL_RULES=1  mandatory + task-agnostic rules
+#   TASK_RULES=0 GENERAL_RULES=0  mandatory only            == the -base arm
 #
-# Every override is recorded in the results, and episode.json:rule_tier names the arm.
-GENERAL_RULES=${GENERAL_RULES:-0}
-TASK_RULES=${TASK_RULES:-0}
+# Every override is recorded in the results, and episode.json:rule_tier names the arm. New runs use
+# the full rule stack by default; explicitly set the variables to 0 for historical control arms.
+GENERAL_RULES=${GENERAL_RULES:-1}
+TASK_RULES=${TASK_RULES:-1}
 # GOAL_JSON replaces the dataset task goal per task (JSON: {task_name: goal}). Used to test a
 # different goal phrasing -- e.g. terse composite-unseen goals -- without touching the dataset.
 GOAL_JSON=${GOAL_JSON:-}
@@ -349,6 +357,10 @@ for i in "${!GPULIST[@]}"; do
           --s1-port "$(s1_port "$i")" --s2-port "$(s2_port "$i")" --s2-model system2-full \
           --norm-stats "$S1_CKPT/assets/robocasa_system1/norm_stats.json" \
           --out-root "$SYS1_RESULTS_DIR/combine" --max-turns "$MAX_TURNS" \
+          --rollout-limit-mode "$ROLLOUT_LIMIT_MODE" \
+          --max-s2-calls-safety "$MAX_S2_CALLS_SAFETY" \
+          ${MAX_OFFICIAL_STEPS:+--max-official-steps "$MAX_OFFICIAL_STEPS"} \
+          ${TASK_LIMITS_JSON:+--task-limits-json "$TASK_LIMITS_JSON"} \
           --max-steps-cap "$MAX_STEPS_CAP" \
           ${RUN_LABEL:+--method "$RUN_LABEL"} \
           $([[ "$GENERAL_RULES" == 1 ]] && echo --general-rules) \

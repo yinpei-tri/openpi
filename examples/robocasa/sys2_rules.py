@@ -2326,6 +2326,19 @@ def _rule_pil_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -
 _REGRASP_RE = re.compile(r"^(reach\s+and\s+)?grasp\b", re.IGNORECASE)
 _REGRASP_BARE_RE = re.compile(r"^grasp\b", re.IGNORECASE)
 _REGRASP_REACH_RE = re.compile(r"^reach\s+and\s+grasp\b", re.IGNORECASE)
+# An offset+2 recovery rewinds the arm to the object, so the ONE executed action between the
+# original grasp and the reach-back has to run again before System2's held next action is safe. Keep
+# the gate positive and manipulation/motion-oriented: a stale release is precisely what this replay
+# exists to prevent, and must never itself become the replay candidate.
+_REGRASP_REPLAY_ACTION_RE = re.compile(
+    r"^(?:(?:continue|finish)(?:\s+to)?\s+)?"
+    r"(?:lift|carry|move|transport|transfer|bring|take|pull|extract|retract|lower|insert|"
+    r"turn|rotate|swivel|navigate|go|search|align|position)\b",
+    re.IGNORECASE,
+)
+_REGRASP_REPLAY_RELEASE_RE = re.compile(
+    r"\b(?:release|drop|let\s+go|open\s+(?:the\s+)?gripper)\b", re.IGNORECASE,
+)
 # WIDTH LADDER, not a single bar. A binary skip list threw away real drops: PickPlaceDrawerToCounter's
 # three successful re-grasps were on a pizza cutter (0.0021), a measuring cup (0.0024) and a dish brush
 # (0.0043) -- and two of those objects were on the skip list, so skipping them lost the very cases the
@@ -2395,6 +2408,43 @@ def regrasp_bar(text: str | None) -> float:
     return REGRASP_MISS_WIDTH
 
 
+def record_executed_subgoal(state: dict | None, *, subgoal: str,
+                            subgoal_detail: str, est) -> None:
+    """Remember the effective System1 segment for a possible offset+2 replay.
+
+    The rollout loop calls this only after System1 has executed the segment. A far regrasp snapshots
+    the record before the injected reach-back replaces it on the next segment.
+    """
+    if state is None or not (subgoal or "").strip():
+        return
+    state["_last_executed_subgoal"] = {
+        "subgoal": subgoal,
+        "subgoal_detail": subgoal_detail or subgoal,
+        "est": est,
+    }
+
+
+def _regrasp_replay_candidate(state: dict) -> tuple[dict | None, str | None]:
+    """Return the prior effective motion when it is safe to replay, else a reason."""
+    last = state.get("_last_executed_subgoal")
+    if not isinstance(last, dict):
+        return None, "no previously executed effective subgoal was recorded"
+    text = (last.get("subgoal") or "").strip()
+    if not text:
+        return None, "the previously executed effective subgoal is empty"
+    if _REGRASP_REPLAY_RELEASE_RE.search(text):
+        return None, f"the previous subgoal is release-like: {text!r}"
+    if not _REGRASP_REPLAY_ACTION_RE.match(text):
+        return None, f"the previous subgoal is not a recognized object motion: {text!r}"
+    return {
+        "subgoal": text,
+        "subgoal_detail": last.get("subgoal_detail") or text,
+        "est": last.get("est"),
+        "held_kind": "offset2_replay",
+        "tx_label": "tx_sg_replay",
+    }, None
+
+
 def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> dict:
     """ALL tasks: one injected re-grasp per grasp step whose fingers closed on nothing."""
     state["rg_turn"] = turn = state.get("rg_turn", 0) + 1
@@ -2454,6 +2504,38 @@ def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> di
                        f"{floor} = max({REGRASP_FAR_EST if far else REGRASP_NEAR_EST}, "
                        f"grasp est {state.get(f'{key}_gest')})",
              "before": est, "after": floor})
+        if far:
+            # _inject_after_step has just stashed System2's current proposal in _resume_pending.
+            # Prepend the intervening executed motion so the physical sequence becomes:
+            # reach/grasp again -> replay lift/carry/etc. -> resume System2's held next action.
+            pending = state.get("_resume_pending")
+            replay, declined = _regrasp_replay_candidate(state)
+            if replay is not None and pending is not None:
+                pending.setdefault("before_resume", []).append(replay)
+                r["interventions"].append(
+                    {"rule": "regrasp_recovery", "kind": "tx_replay_queued",
+                     "detail": "offset+2 reach-back rewinds the physical state; queued the "
+                               "intervening executed subgoal before System2's held subgoal",
+                     "before": subgoal, "after": replay["subgoal"]})
+            else:
+                # Blindly resuming a release after a reach-back is unsafe. With no trustworthy
+                # motion to replay, discard the hold and let System2 inspect the reach-back clip on
+                # the next turn. The plan remains untouched.
+                reason = declined or "the pending held subgoal record is missing"
+                state.pop("_resume_pending", None)
+                state.pop(f"{key}_held", None)
+                for intervention in r["interventions"]:
+                    if intervention.get("kind") == "tx_sg_failed":
+                        intervention["detail"] = intervention["detail"].replace(
+                            "System2's subgoal is held and resumes after.",
+                            "No safe replay is available, so System2 will be re-queried after.",
+                        )
+                r["interventions"].append(
+                    {"rule": "regrasp_recovery", "kind": "tx_replay_declined",
+                     "detail": f"offset+2 replay unavailable ({reason}); System2 will be "
+                               "queried after the reach-back instead of blindly resuming its held "
+                               "subgoal. Plan untouched.",
+                     "before": subgoal, "after": "re-query System2 next turn"})
     return r
 
 
@@ -2901,6 +2983,10 @@ def rule_config(*, general: bool, task_tier: bool) -> dict:
 
     return {
         "schema_version": 1,
+        # Incremented when rule behaviour changes without changing the config schema. This prevents
+        # old and corrected regrasp results from looking like the same evaluation arm.
+        "behavior_version": 2,
+        "regrasp_recovery_version": "offset2-replay-v1",
         "mandatory_rules": mandatory,
         "general_rules": bool(general),
         "task_rules": bool(task_tier),
@@ -3025,20 +3111,31 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
 
 
 def pending_resume(state: dict | None) -> dict | None:
-    """The subgoal a rule is holding, when the NEXT turn must run it instead of querying System2.
+    """The next queued recovery/resume subgoal to run without querying System2.
 
     Called by the rollout loop at the TOP of a turn, before the System2 call. Returns
-    ``{"key", "rule", "subgoal", "subgoal_detail", "est"}`` once and then forgets it, so the hold
-    lasts exactly one turn. Also clears the rule's own ``<key>_held`` slot: the loop is executing the
-    held subgoal now, so the rule's tx_resume branch must NOT fire a turn later and run it twice.
+    ``{"key", "rule", "subgoal", "subgoal_detail", "est"}``. Ordinarily this consumes the held
+    subgoal once. Offset+2 regrasp recovery may prepend the intervening executed motion; that replay
+    is returned first while the original held S2 action remains pending for the following turn.
+
+    The rule's own ``<key>_held`` slot is cleared only when the final held S2 action is returned, so
+    its tx_resume branch cannot run it twice after the queue drains.
 
     Returns None when no rule borrowed the previous turn -- the ordinary path, where the loop queries
     System2 as usual.
     """
     if not state:
         return None
-    pend = state.pop("_resume_pending", None)
+    pend = state.get("_resume_pending")
     if not pend:
         return None
+    queued = pend.get("before_resume") or []
+    if queued:
+        item = queued.pop(0)
+        if not queued:
+            pend.pop("before_resume", None)
+        return {"key": pend["key"], "rule": pend["rule"], **item}
+    state.pop("_resume_pending", None)
     state.pop(f"{pend['key']}_held", None)
+    pend.setdefault("held_kind", "s2_resume")
     return pend
