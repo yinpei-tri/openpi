@@ -540,8 +540,14 @@ class Sys2Client:
 
     # -- request ----------------------------------------------------------
     def chat(self, system: str, user_text: str, *, image: Path | None = None,
-             video: Path | None = None, n_video_frames: int | None = None) -> dict:
-        """One greedy completion. Returns {'text', 'latency_s', 'nframes', 'usage'}."""
+             video: Path | None = None, n_video_frames: int | None = None,
+             on_text=None) -> dict:
+        """One greedy completion, optionally reporting the accumulated streamed text.
+
+        Batch evaluation keeps the original non-streaming request.  The interactive GUI passes
+        ``on_text`` and receives the real vLLM token stream as an ever-growing string; callback
+        failures are deliberately ignored so browser telemetry can never fail an evaluation.
+        """
         payload = {
             "model": self.model,
             "messages": [
@@ -573,6 +579,10 @@ class Sys2Client:
                 payload["media_io_kwargs"] = {"video": {"num_frames": -1, "frame_recovery": True}}
                 payload["mm_processor_kwargs"] = {"do_sample_frames": True, "num_frames": nframes}
 
+        if on_text is not None:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
+
         body = json.dumps(payload).encode()
         last_err: Exception | None = None
         for attempt in range(self.retries):
@@ -581,10 +591,37 @@ class Sys2Client:
                 req = urllib.request.Request(self.url, data=body,
                                              headers={"Content-Type": "application/json"})
                 with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    d = json.loads(r.read())
-                return {"text": d["choices"][0]["message"]["content"],
-                        "latency_s": round(time.time() - t0, 2),
-                        "nframes": nframes, "usage": d.get("usage", {})}
+                    if on_text is None:
+                        d = json.loads(r.read())
+                        text = d["choices"][0]["message"]["content"]
+                        usage = d.get("usage", {})
+                    else:
+                        text = ""
+                        usage = {}
+                        try:
+                            on_text(text)
+                        except Exception:
+                            pass
+                        for raw_line in r:
+                            line = raw_line.decode("utf-8", errors="replace").strip()
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            event = json.loads(data)
+                            usage = event.get("usage") or usage
+                            choices = event.get("choices") or []
+                            delta = (choices[0].get("delta") or {}) if choices else {}
+                            piece = delta.get("content")
+                            if isinstance(piece, str) and piece:
+                                text += piece
+                                try:
+                                    on_text(text)
+                                except Exception:
+                                    pass
+                return {"text": text, "latency_s": round(time.time() - t0, 2),
+                        "nframes": nframes, "usage": usage}
             except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError) as e:
                 last_err = e
                 if attempt < self.retries - 1:
@@ -600,22 +637,22 @@ class Sys2Client:
             return False
 
     # -- high-level mode calls -------------------------------------------
-    def plan_cold(self, goal: str, scene_png: Path) -> dict:
-        r = self.chat(SYS_PLAN_COLD, user_plan_cold(goal), image=scene_png)
+    def plan_cold(self, goal: str, scene_png: Path, *, on_text=None) -> dict:
+        r = self.chat(SYS_PLAN_COLD, user_plan_cold(goal), image=scene_png, on_text=on_text)
         out = parse_plan(r["text"])
         out.update(latency_s=r["latency_s"], usage=r["usage"])
         return out
 
-    def exec_first(self, goal: str, plan: str, scene_png: Path) -> dict:
-        r = self.chat(SYS_EXEC, user_exec_first(goal, plan), image=scene_png)
+    def exec_first(self, goal: str, plan: str, scene_png: Path, *, on_text=None) -> dict:
+        r = self.chat(SYS_EXEC, user_exec_first(goal, plan), image=scene_png, on_text=on_text)
         out = parse_exec(r["text"])
         out.update(latency_s=r["latency_s"], usage=r["usage"], nframes=None)
         return out
 
     def exec_turn(self, goal: str, plan: str, clip_mp4: Path, n_frames: int,
-                  task_status: str, gripper_status: str) -> dict:
+                  task_status: str, gripper_status: str, *, on_text=None) -> dict:
         r = self.chat(SYS_EXEC, user_exec_turn(goal, plan, task_status, gripper_status),
-                      video=clip_mp4, n_video_frames=n_frames)
+                      video=clip_mp4, n_video_frames=n_frames, on_text=on_text)
         out = parse_exec(r["text"])
         out.update(latency_s=r["latency_s"], usage=r["usage"], nframes=r["nframes"])
         return out

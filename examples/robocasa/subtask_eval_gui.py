@@ -15,8 +15,9 @@ video (with play + frame-by-frame prev/next / arrow keys), the language prompt, 
 raw + normalized anchor/current state, the full predicted action chunk, progress, and the
 executed-vs-oracle action — all synced to the current frame.
 
-Run:
-    python examples/robocasa/subtask_eval_gui.py --rollout-root subtask_rollouts --port 8092
+Run both the rollout browser and live human-interactive evaluator:
+    bash examples/robocasa/run_sys1_eval_gui.sh \
+        --port 8092 --s1-port 8060 --s2-port 8100
 """
 
 from __future__ import annotations
@@ -1744,6 +1745,13 @@ HOME_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
        raw response and parsed tags, the System1 prompt + anchor image, the raw 20-fps rollout and
        the condensed clip actually fed back (with a per-frame keep/drop audit), plus per-component
        wall-clock timings.</p></a>
+  <a class="card hero" href="/human-interactive"><h2>Human-interactive System2 + System1<span class="path">/human-interactive</span></h2>
+    <p>Run an official target episode live against the deployed System2 and System1 servers. Review
+       the raw planner output and rule-adjusted decision, then edit the checklist, judge, subgoal,
+       detail, or estimated length before execution. Live action/progress curves are shown while
+       System1 acts, and one-turn rollback restores the exact turn-start state by reset-and-replay.
+       Every model decision, rule intervention, human edit, execution, and abandoned retry is saved
+       with its target split, task, and episode provenance.</p></a>
   <a class="card" href="/episode"><h2>Episode Eval<span class="path">/episode</span></h2>
     <p>Whole-episode OPEN-LOOP rollouts: reset once to the first subgoal, then roll the policy
        continuously through the subgoal list. Per-subgoal video, prompt, anchor, action chunk, and
@@ -4111,6 +4119,20 @@ def combine_page():
     return COMBINE_HTML.replace("<script>", _ERR_JS + "<script>", 1)
 
 
+# The live evaluator is a separate blueprint/controller so the existing read-only rollout browser
+# and batch output contract stay untouched. Simulator/model imports inside it are lazy: browsing
+# /combine still works in a lightweight environment, while /human-interactive clearly reports that
+# it needs the RoboCasa launcher if those dependencies are absent.
+try:
+    from human_interactive_gui import configure_human_interactive
+    from human_interactive_gui import register_human_interactive
+except ImportError:  # package-style import in tests
+    from examples.robocasa.human_interactive_gui import configure_human_interactive
+    from examples.robocasa.human_interactive_gui import register_human_interactive
+
+register_human_interactive(app)
+
+
 def main():
     global ROOT, ROOTS, VAL_MSE_DIR, COMBINE_ROOT
     p = argparse.ArgumentParser()
@@ -4125,6 +4147,55 @@ def main():
                    help="dir of scripts/eval_val_mse.py output JSONs (the /val_mse curves)")
     p.add_argument("--combine-root", type=Path, default=None,
                    help="COMBINED System2+System1 tree (combined_eval.py output) -> /combine")
+    p.add_argument("--hitl", action=argparse.BooleanOptionalAction, default=True,
+                   help="enable the live /human-interactive System2+System1 controller")
+    p.add_argument("--hitl-data-root", type=Path,
+                   default=_DATA / "robocasa_dataset" / "v1.0" / "target",
+                   help="official target LeRobot root used by the interactive episode picker")
+    p.add_argument("--hitl-results-root", type=Path,
+                   default=_RESULTS / "human_interactive",
+                   help="durable human-interactive sessions and branch artifacts")
+    p.add_argument("--s1-host", "--hitl-s1-host", dest="hitl_s1_host",
+                   default=os.environ.get("HITL_S1_HOST", "127.0.0.1"),
+                   help="System1 websocket server host used by /human-interactive")
+    p.add_argument("--s1-port", "--hitl-s1-port", dest="hitl_s1_port", type=int,
+                   default=int(os.environ.get("HITL_S1_PORT", "8060")))
+    p.add_argument("--hitl-s1-checkpoint", default=os.environ.get("HITL_S1_CHECKPOINT"),
+                   help="served System1 checkpoint path, recorded as provenance")
+    p.add_argument("--hitl-norm-stats", type=Path,
+                   default=(Path(os.environ["HITL_NORM_STATS"])
+                            if os.environ.get("HITL_NORM_STATS") else None))
+    p.add_argument("--s2-host", "--hitl-s2-host", dest="hitl_s2_host",
+                   default=os.environ.get("HITL_S2_HOST", "127.0.0.1"),
+                   help="System2 OpenAI-compatible server host used by /human-interactive")
+    p.add_argument("--s2-port", "--hitl-s2-port", dest="hitl_s2_port", type=int,
+                   default=int(os.environ.get("HITL_S2_PORT", "8100")))
+    p.add_argument("--s2-model", "--hitl-s2-model", dest="hitl_s2_model",
+                   default=os.environ.get("HITL_S2_MODEL", "system2-full"))
+    p.add_argument("--hitl-s2-checkpoint", default=os.environ.get("HITL_S2_CHECKPOINT"),
+                   help="served System2 checkpoint path, recorded as provenance")
+    p.add_argument("--hitl-s2-max-tokens", type=int, default=512)
+    p.add_argument("--hitl-s2-file-uri", action="store_true")
+    p.add_argument("--hitl-general-rules", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--hitl-task-rules", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument(
+        "--hitl-last-milestone-retry",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="retry the final milestone on a false finish (default: follow effective general rules)",
+    )
+    p.add_argument("--hitl-prompt-source", choices=("subgoal", "subgoal_detail"),
+                   default="subgoal")
+    p.add_argument("--hitl-horizon-mult", type=float, default=2.0)
+    p.add_argument("--hitl-max-steps-cap", type=int, default=400)
+    p.add_argument("--hitl-default-est-length", type=int, default=50)
+    p.add_argument("--hitl-replan-steps", type=int, default=16)
+    p.add_argument("--hitl-resize-size", type=int, default=224)
+    p.add_argument("--hitl-stop-progress", type=float, default=0.95)
+    p.add_argument("--hitl-stop-eps", type=float, default=0.03)
+    p.add_argument("--hitl-stop-window", type=int, default=5)
+    p.add_argument("--hitl-static-eps", type=float, default=0.003)
+    p.add_argument("--hitl-zero-arm-in-base", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8092)
     args = p.parse_args()
@@ -4144,6 +4215,40 @@ def main():
     VAL_MSE_DIR = args.val_mse_dir.resolve()
     if args.combine_root is not None:
         COMBINE_ROOT = args.combine_root.resolve()
+    hitl_cfg = None
+    if args.hitl:
+        # The task tier includes the general tier, matching combined_eval.run_sweep.
+        hitl_general_rules = bool(args.hitl_general_rules or args.hitl_task_rules)
+        hitl_last_milestone_retry = (
+            hitl_general_rules
+            if args.hitl_last_milestone_retry is None
+            else bool(args.hitl_last_milestone_retry)
+        )
+        hitl_cfg = {
+            "dataset_root": args.hitl_data_root.resolve(),
+            "results_root": args.hitl_results_root.resolve(),
+            "s1_host": args.hitl_s1_host, "s1_port": args.hitl_s1_port,
+            "s1_checkpoint": args.hitl_s1_checkpoint, "norm_stats": args.hitl_norm_stats,
+            "s2_host": args.hitl_s2_host, "s2_port": args.hitl_s2_port,
+            "s2_model": args.hitl_s2_model, "s2_checkpoint": args.hitl_s2_checkpoint,
+            "s2_max_tokens": args.hitl_s2_max_tokens,
+            "s2_file_uri": args.hitl_s2_file_uri,
+            "general_rules": hitl_general_rules,
+            "task_rules": bool(args.hitl_task_rules),
+            "last_milestone_retry": hitl_last_milestone_retry,
+            "prompt_source": args.hitl_prompt_source,
+            "horizon_mult": args.hitl_horizon_mult,
+            "max_steps_cap": args.hitl_max_steps_cap,
+            "default_est_length": args.hitl_default_est_length,
+            "replan_steps": args.hitl_replan_steps,
+            "resize_size": args.hitl_resize_size,
+            "stop_progress": args.hitl_stop_progress,
+            "stop_eps": args.hitl_stop_eps,
+            "stop_window": args.hitl_stop_window,
+            "static_eps": args.hitl_static_eps,
+            "zero_arm_in_base": args.hitl_zero_arm_in_base,
+        }
+    configure_human_interactive(hitl_cfg)
     print(f"Serving finestep rollouts from {ROOT}  ->  http://{args.host}:{args.port}/finestep")
     print(f"  combined S2+S1 rollouts from {COMBINE_ROOT}  ->  /combine")
     if "milestone" in ROOTS:
@@ -4151,6 +4256,12 @@ def main():
     if "episode" in ROOTS:
         print(f"  episode rollouts from {ROOTS['episode']}  ->  /episode")
     print(f"  val_mse curves from {VAL_MSE_DIR}  ->  /val_mse")
+    if hitl_cfg:
+        print("  human-interactive target sessions -> /human-interactive")
+        print(f"    episodes: {hitl_cfg['dataset_root']}")
+        print(f"    results:  {hitl_cfg['results_root']}")
+        print(f"    S1 {args.hitl_s1_host}:{args.hitl_s1_port} | "
+              f"S2 {args.hitl_s2_host}:{args.hitl_s2_port} ({args.hitl_s2_model})")
     app.run(host=args.host, port=args.port, threaded=True)
 
 
