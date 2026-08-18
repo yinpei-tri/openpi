@@ -1,0 +1,898 @@
+{
+  "definition": "RoboCasa365 composite tasks absent from pretrain300, excluding the official composite_unseen16",
+  "n_derived": 48,
+  "n_registered": 1,
+  "n_tasks": 49,
+  "parameters": {
+    "atomic_task_count_proxy": "task_attributes.num_subtasks",
+    "selection": "maximum registered composite horizon at identical num_subtasks"
+  },
+  "robocasa_revision": "26a7ba9",
+  "schema": 1,
+  "task_set": "extra_unseen",
+  "tasks": {
+    "AddToSoupPot": {
+      "activity": "Slow Cooking",
+      "derived": true,
+      "eligible_registered_donor_count": 48,
+      "longest_donors": [
+        {
+          "activity": "Organizing Utensils",
+          "moma_required": "Yes",
+          "num_subtasks": 4,
+          "registered_horizon": 5100,
+          "task": "ArrangeUtensilsByType"
+        }
+      ],
+      "max_official_steps": 5100,
+      "moma_required": "Yes",
+      "num_subtasks": 4,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "ArrangeCuttingFruits": {
+      "activity": "Chopping Food",
+      "derived": true,
+      "eligible_registered_donor_count": 25,
+      "longest_donors": [
+        {
+          "activity": "Slicing Meat",
+          "moma_required": "Yes",
+          "num_subtasks": 7,
+          "registered_horizon": 4800,
+          "task": "CleanBoard"
+        }
+      ],
+      "max_official_steps": 4800,
+      "moma_required": "Yes",
+      "num_subtasks": 7,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "ArrangeSinkSanitization": {
+      "activity": "Sanitizing Surface",
+      "derived": true,
+      "eligible_registered_donor_count": 25,
+      "longest_donors": [
+        {
+          "activity": "Slicing Meat",
+          "moma_required": "Yes",
+          "num_subtasks": 7,
+          "registered_horizon": 4800,
+          "task": "CleanBoard"
+        }
+      ],
+      "max_official_steps": 4800,
+      "moma_required": "Yes",
+      "num_subtasks": 7,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "BeginSlowCooking": {
+      "activity": "Slow Cooking",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "BlendSalsaMix": {
+      "activity": "Mixing Ingredients",
+      "derived": true,
+      "eligible_registered_donor_count": 7,
+      "longest_donors": [
+        {
+          "activity": "Washing Fruits and Vegetables",
+          "moma_required": "Yes",
+          "num_subtasks": 6,
+          "registered_horizon": 3300,
+          "task": "ClearClutter"
+        },
+        {
+          "activity": "Preparing Marinade",
+          "moma_required": "Yes",
+          "num_subtasks": 6,
+          "registered_horizon": 3300,
+          "task": "GatherMarinadeIngredients"
+        }
+      ],
+      "max_official_steps": 3300,
+      "moma_required": "Yes",
+      "num_subtasks": 6,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "BlendVegetableSauce": {
+      "activity": "Mixing Ingredients",
+      "derived": true,
+      "eligible_registered_donor_count": 7,
+      "longest_donors": [
+        {
+          "activity": "Washing Fruits and Vegetables",
+          "moma_required": "Yes",
+          "num_subtasks": 6,
+          "registered_horizon": 3300,
+          "task": "ClearClutter"
+        },
+        {
+          "activity": "Preparing Marinade",
+          "moma_required": "Yes",
+          "num_subtasks": 6,
+          "registered_horizon": 3300,
+          "task": "GatherMarinadeIngredients"
+        }
+      ],
+      "max_official_steps": 3300,
+      "moma_required": "Yes",
+      "num_subtasks": 6,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "BoilCorn": {
+      "activity": "Boiling",
+      "derived": true,
+      "eligible_registered_donor_count": 48,
+      "longest_donors": [
+        {
+          "activity": "Organizing Utensils",
+          "moma_required": "Yes",
+          "num_subtasks": 4,
+          "registered_horizon": 5100,
+          "task": "ArrangeUtensilsByType"
+        }
+      ],
+      "max_official_steps": 5100,
+      "moma_required": "Yes",
+      "num_subtasks": 4,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "BoilEggs": {
+      "activity": "Boiling",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "BoilPot": {
+      "activity": "Boiling",
+      "derived": true,
+      "eligible_registered_donor_count": 48,
+      "longest_donors": [
+        {
+          "activity": "Organizing Utensils",
+          "moma_required": "Yes",
+          "num_subtasks": 4,
+          "registered_horizon": 5100,
+          "task": "ArrangeUtensilsByType"
+        }
+      ],
+      "max_official_steps": 5100,
+      "moma_required": "Yes",
+      "num_subtasks": 4,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "CheeseMixing": {
+      "activity": "Mixing Ingredients",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "CleanBlenderJug": {
+      "activity": "Cleaning Appliances",
+      "derived": true,
+      "eligible_registered_donor_count": 36,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 3,
+          "registered_horizon": 4350,
+          "task": "SearingMeat"
+        }
+      ],
+      "max_official_steps": 4350,
+      "moma_required": "Yes",
+      "num_subtasks": 3,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "ClusterItemsForClearing": {
+      "activity": "Clearing Table",
+      "derived": true,
+      "eligible_registered_donor_count": 25,
+      "longest_donors": [
+        {
+          "activity": "Slicing Meat",
+          "moma_required": "Yes",
+          "num_subtasks": 7,
+          "registered_horizon": 4800,
+          "task": "CleanBoard"
+        }
+      ],
+      "max_official_steps": 4800,
+      "moma_required": "Yes",
+      "num_subtasks": 7,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "ClusterUtensilsInDrawer": {
+      "activity": "Organizing Utensils",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "CoolBakedCookies": {
+      "activity": "Baking",
+      "derived": true,
+      "eligible_registered_donor_count": 20,
+      "longest_donors": [
+        {
+          "activity": "Mixing and Blending",
+          "moma_required": "No",
+          "num_subtasks": 5,
+          "registered_horizon": 5400,
+          "task": "SpicyMarinade"
+        }
+      ],
+      "max_official_steps": 5400,
+      "moma_required": "Yes",
+      "num_subtasks": 5,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "CountertopCleanup": {
+      "activity": "Sanitizing Surface",
+      "derived": true,
+      "eligible_registered_donor_count": 20,
+      "longest_donors": [
+        {
+          "activity": "Mixing and Blending",
+          "moma_required": "No",
+          "num_subtasks": 5,
+          "registered_horizon": 5400,
+          "task": "SpicyMarinade"
+        }
+      ],
+      "max_official_steps": 5400,
+      "moma_required": "Yes",
+      "num_subtasks": 5,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "DistributeSteakOnPans": {
+      "activity": "Frying",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "DrawerUtensilSort": {
+      "activity": "Tidying Cabinets and Drawers",
+      "derived": true,
+      "eligible_registered_donor_count": 36,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 3,
+          "registered_horizon": 4350,
+          "task": "SearingMeat"
+        }
+      ],
+      "max_official_steps": 4350,
+      "moma_required": "Yes",
+      "num_subtasks": 3,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "EmptyDishRack": {
+      "activity": "Organizing Dishes and Containers",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "GarnishCake": {
+      "activity": "Garnishing Dishes",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "GatherProduceWashing": {
+      "activity": "Washing Fruits and Vegetables",
+      "derived": true,
+      "eligible_registered_donor_count": 25,
+      "longest_donors": [
+        {
+          "activity": "Slicing Meat",
+          "moma_required": "Yes",
+          "num_subtasks": 7,
+          "registered_horizon": 4800,
+          "task": "CleanBoard"
+        }
+      ],
+      "max_official_steps": 4800,
+      "moma_required": "Yes",
+      "num_subtasks": 7,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "MakeBananaMilkshake": {
+      "activity": "Mixing and Blending",
+      "derived": true,
+      "eligible_registered_donor_count": 9,
+      "longest_donors": [
+        {
+          "activity": "Serving Beverages",
+          "moma_required": "Yes",
+          "num_subtasks": 11,
+          "registered_horizon": 5850,
+          "task": "PrepareDrinkStation"
+        }
+      ],
+      "max_official_steps": 5850,
+      "moma_required": "Yes",
+      "num_subtasks": 11,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "MakeCheesecakeFilling": {
+      "activity": "Mixing Ingredients",
+      "derived": true,
+      "eligible_registered_donor_count": 20,
+      "longest_donors": [
+        {
+          "activity": "Mixing and Blending",
+          "moma_required": "No",
+          "num_subtasks": 5,
+          "registered_horizon": 5400,
+          "task": "SpicyMarinade"
+        }
+      ],
+      "max_official_steps": 5400,
+      "moma_required": "Yes",
+      "num_subtasks": 5,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "MakeChocolateMilk": {
+      "activity": "Mixing Ingredients",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "No",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "OrganizeMeasuringCups": {
+      "activity": "Measuring Ingredients",
+      "derived": true,
+      "eligible_registered_donor_count": 36,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 3,
+          "registered_horizon": 4350,
+          "task": "SearingMeat"
+        }
+      ],
+      "max_official_steps": 4350,
+      "moma_required": "No",
+      "num_subtasks": 3,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "PJSandwichPrep": {
+      "activity": "Toasting Bread",
+      "derived": true,
+      "eligible_registered_donor_count": 20,
+      "longest_donors": [
+        {
+          "activity": "Mixing and Blending",
+          "moma_required": "No",
+          "num_subtasks": 5,
+          "registered_horizon": 5400,
+          "task": "SpicyMarinade"
+        }
+      ],
+      "max_official_steps": 5400,
+      "moma_required": "Yes",
+      "num_subtasks": 5,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "PackSnack": {
+      "activity": "Packing Lunches",
+      "derived": true,
+      "eligible_registered_donor_count": 36,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 3,
+          "registered_horizon": 4350,
+          "task": "SearingMeat"
+        }
+      ],
+      "max_official_steps": 4350,
+      "moma_required": "Yes",
+      "num_subtasks": 3,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "PlaceBreakfastItemsAway": {
+      "activity": "Tidying Cabinets and Drawers",
+      "derived": true,
+      "eligible_registered_donor_count": 25,
+      "longest_donors": [
+        {
+          "activity": "Slicing Meat",
+          "moma_required": "Yes",
+          "num_subtasks": 7,
+          "registered_horizon": 4800,
+          "task": "CleanBoard"
+        }
+      ],
+      "max_official_steps": 4800,
+      "moma_required": "Yes",
+      "num_subtasks": 7,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "PlaceLidToBoil": {
+      "activity": "Boiling",
+      "derived": true,
+      "eligible_registered_donor_count": 36,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 3,
+          "registered_horizon": 4350,
+          "task": "SearingMeat"
+        }
+      ],
+      "max_official_steps": 4350,
+      "moma_required": "Yes",
+      "num_subtasks": 3,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "PlaceOnDishRack": {
+      "derived": false,
+      "max_official_steps": 1500,
+      "source": "robocasa_dataset_registry"
+    },
+    "PrepareSandwichStation": {
+      "activity": "Preparing Sandwiches",
+      "derived": true,
+      "eligible_registered_donor_count": 25,
+      "longest_donors": [
+        {
+          "activity": "Slicing Meat",
+          "moma_required": "Yes",
+          "num_subtasks": 7,
+          "registered_horizon": 4800,
+          "task": "CleanBoard"
+        }
+      ],
+      "max_official_steps": 4800,
+      "moma_required": "Yes",
+      "num_subtasks": 7,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "PrepareVegetableRoasting": {
+      "activity": "Washing Fruits and Vegetables",
+      "derived": true,
+      "eligible_registered_donor_count": 48,
+      "longest_donors": [
+        {
+          "activity": "Organizing Utensils",
+          "moma_required": "Yes",
+          "num_subtasks": 4,
+          "registered_horizon": 5100,
+          "task": "ArrangeUtensilsByType"
+        }
+      ],
+      "max_official_steps": 5100,
+      "moma_required": "Yes",
+      "num_subtasks": 4,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "PrepareVeggieDip": {
+      "activity": "Mixing Ingredients",
+      "derived": true,
+      "eligible_registered_donor_count": 4,
+      "longest_donors": [
+        {
+          "activity": "Organizing Recycling",
+          "moma_required": "Yes",
+          "num_subtasks": 9,
+          "registered_horizon": 6750,
+          "task": "RecycleSodaCans"
+        }
+      ],
+      "max_official_steps": 6750,
+      "moma_required": "Yes",
+      "num_subtasks": 9,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "PrepareVeggiesForSteaming": {
+      "activity": "Steaming Vegetables",
+      "derived": true,
+      "eligible_registered_donor_count": 48,
+      "longest_donors": [
+        {
+          "activity": "Organizing Utensils",
+          "moma_required": "Yes",
+          "num_subtasks": 4,
+          "registered_horizon": 5100,
+          "task": "ArrangeUtensilsByType"
+        }
+      ],
+      "max_official_steps": 5100,
+      "moma_required": "Yes",
+      "num_subtasks": 4,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "ReheatMeatOnStove": {
+      "activity": "Reheating Food",
+      "derived": true,
+      "eligible_registered_donor_count": 36,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 3,
+          "registered_horizon": 4350,
+          "task": "SearingMeat"
+        }
+      ],
+      "max_official_steps": 4350,
+      "moma_required": "Yes",
+      "num_subtasks": 3,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "RemoveSteamedVegetables": {
+      "activity": "Steaming Vegetables",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "RinseFragileItem": {
+      "activity": "Washing Dishes",
+      "derived": true,
+      "eligible_registered_donor_count": 48,
+      "longest_donors": [
+        {
+          "activity": "Organizing Utensils",
+          "moma_required": "Yes",
+          "num_subtasks": 4,
+          "registered_horizon": 5100,
+          "task": "ArrangeUtensilsByType"
+        }
+      ],
+      "max_official_steps": 5100,
+      "moma_required": "Yes",
+      "num_subtasks": 4,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "SanitizeSink": {
+      "activity": "Sanitizing Surface",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "SeparateRawIngredients": {
+      "activity": "Sorting Ingredients",
+      "derived": true,
+      "eligible_registered_donor_count": 9,
+      "longest_donors": [
+        {
+          "activity": "Serving Beverages",
+          "moma_required": "Yes",
+          "num_subtasks": 11,
+          "registered_horizon": 5850,
+          "task": "PrepareDrinkStation"
+        }
+      ],
+      "max_official_steps": 5850,
+      "moma_required": "Yes",
+      "num_subtasks": 11,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "ServeMealJuice": {
+      "activity": "Serving Beverages",
+      "derived": true,
+      "eligible_registered_donor_count": 25,
+      "longest_donors": [
+        {
+          "activity": "Slicing Meat",
+          "moma_required": "Yes",
+          "num_subtasks": 7,
+          "registered_horizon": 4800,
+          "task": "CleanBoard"
+        }
+      ],
+      "max_official_steps": 4800,
+      "moma_required": "Yes",
+      "num_subtasks": 7,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "SortBreakfastIngredients": {
+      "activity": "Sorting Ingredients",
+      "derived": true,
+      "eligible_registered_donor_count": 25,
+      "longest_donors": [
+        {
+          "activity": "Slicing Meat",
+          "moma_required": "Yes",
+          "num_subtasks": 7,
+          "registered_horizon": 4800,
+          "task": "CleanBoard"
+        }
+      ],
+      "max_official_steps": 4800,
+      "moma_required": "Yes",
+      "num_subtasks": 7,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "SteamFish": {
+      "activity": "Steaming Food",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "SteamVeggiesWithWater": {
+      "activity": "Steaming Vegetables",
+      "derived": true,
+      "eligible_registered_donor_count": 36,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 3,
+          "registered_horizon": 4350,
+          "task": "SearingMeat"
+        }
+      ],
+      "max_official_steps": 4350,
+      "moma_required": "Yes",
+      "num_subtasks": 3,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "StopSlowCooking": {
+      "activity": "Slow Cooking",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "ToastHeatableIngredients": {
+      "activity": "Preparing Sandwiches",
+      "derived": true,
+      "eligible_registered_donor_count": 48,
+      "longest_donors": [
+        {
+          "activity": "Organizing Utensils",
+          "moma_required": "Yes",
+          "num_subtasks": 4,
+          "registered_horizon": 5100,
+          "task": "ArrangeUtensilsByType"
+        }
+      ],
+      "max_official_steps": 5100,
+      "moma_required": "No",
+      "num_subtasks": 4,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "ToastOneSlotPair": {
+      "activity": "Toasting Bread",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "No",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "ToasterOvenBroilFish": {
+      "activity": "Broiling Fish",
+      "derived": true,
+      "eligible_registered_donor_count": 48,
+      "longest_donors": [
+        {
+          "activity": "Organizing Utensils",
+          "moma_required": "Yes",
+          "num_subtasks": 4,
+          "registered_horizon": 5100,
+          "task": "ArrangeUtensilsByType"
+        }
+      ],
+      "max_official_steps": 5100,
+      "moma_required": "Yes",
+      "num_subtasks": 4,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "UtensilShuffle": {
+      "activity": "Tidying Cabinets and Drawers",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "Yes",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "WashInSaucepan": {
+      "activity": "Washing Fruits and Vegetables",
+      "derived": true,
+      "eligible_registered_donor_count": 25,
+      "longest_donors": [
+        {
+          "activity": "Slicing Meat",
+          "moma_required": "Yes",
+          "num_subtasks": 7,
+          "registered_horizon": 4800,
+          "task": "CleanBoard"
+        }
+      ],
+      "max_official_steps": 4800,
+      "moma_required": "Yes",
+      "num_subtasks": 7,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    },
+    "WipeTable": {
+      "activity": "Sanitizing Surface",
+      "derived": true,
+      "eligible_registered_donor_count": 74,
+      "longest_donors": [
+        {
+          "activity": "Frying",
+          "moma_required": "Yes",
+          "num_subtasks": 2,
+          "registered_horizon": 3150,
+          "task": "SetupFrying"
+        }
+      ],
+      "max_official_steps": 3150,
+      "moma_required": "No",
+      "num_subtasks": 2,
+      "source": "longest_registered_horizon_with_same_num_subtasks"
+    }
+  }
+}

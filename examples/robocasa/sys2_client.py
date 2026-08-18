@@ -198,7 +198,11 @@ def user_exec_turn(goal: str, plan: str, task_status: str, gripper_status: str) 
 
 
 def tag_text(s: str, tag: str) -> str | None:
-    m = re.search(rf"<{tag}>(.*?)</{tag}>", s or "", re.DOTALL)
+    # Qwen occasionally closes a correctly opened <subgoal> with </goal>. Treat that one known
+    # mismatch as recoverable; all other tags stay strict so malformed output cannot make one field
+    # consume another field's contents.
+    closing = r"(?:subgoal|goal)" if tag == "subgoal" else re.escape(tag)
+    m = re.search(rf"<{re.escape(tag)}>(.*?)</{closing}>", s or "", re.DOTALL)
     return m.group(1).strip() if m else None
 
 

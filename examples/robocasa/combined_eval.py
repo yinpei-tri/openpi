@@ -22,8 +22,9 @@ Design decisions (confirmed with the user, not inferred):
   * ``Current task status`` is fed LIVE from ``env._check_success()``. System2's system prompt
     tells it to judge ``task_finish`` only when that reads ``finished``, so withholding it would
     prevent termination. It is a privileged (GT) bit by design -- recorded as such in the output.
-  * termination: S2 ``task_finish``, env success, or the configured rollout limit. ``auto`` uses
-    the saved per-task ``max_turns`` when available and otherwise uses ``max_official_steps``.
+  * termination: S2 ``task_finish``, env success, or the configured rollout limit. The default uses
+    RoboCasa's per-task ``max_official_steps``; historical ``max_turns`` and ``auto`` behavior remain
+    available as explicit modes.
   * clip frame selection: near-static frames are dropped for motion subgoals, but KEPT for
     wait/hold subgoals where stillness is the content (see sys2_client.build_clip_frames).
 
@@ -78,6 +79,7 @@ import numpy as np
 from openpi_client import websocket_client_policy as _wcp
 from robocasa.scripts.dataset_scripts.playback_dataset import reset_to
 from robocasa.scripts.eval.subtask_env import base_reference
+from robocasa.scripts.eval.subtask_env import build_prompt_text
 from robocasa.scripts.eval.subtask_env import images_from_obs
 from robocasa.scripts.eval.subtask_env import lerobot_action_to_sim
 from robocasa.scripts.eval.subtask_env import make_camera_env
@@ -846,7 +848,7 @@ def run_s1_segment(
     base_pos_ref, base_yaw_ref, anchor_imgs, anchor_state, resize: int,
     replan_steps: int, budget: int, stop_cfg: StopConfig, norm_stats,
     last_cmd_grip_init: float, zero_arm_in_base: bool, act_override: dict | None = None,
-    force_steps: int = 0,
+    force_steps: int = 0, step_callback=None, should_cancel=None,
 ) -> dict:
     """Roll System1 on ONE System2 subgoal until the stop rule fires or the budget runs out.
 
@@ -878,6 +880,10 @@ def run_s1_segment(
     grip_cmds: list[float] = []               # per-step commanded gripper (+1 close / -1 open)
     grip_widths: list[float] = []              # per-step OBSERVED gripper width (pad distance, m)
     prompts_seen: list[str] = []             # every distinct S1 prompt string the server tokenized
+    # Exact controls handed to env.step, AFTER zero-arm-in-base and action overrides. These are the
+    # authoritative replay trace for the human-interactive evaluator: action_raw12 above is the
+    # policy prediction and is deliberately kept separate because it may not be what reached MuJoCo.
+    applied_actions: list[np.ndarray] = []
 
     timings: dict[str, list[float]] = {
         "s1_infer": [], "s1_obs_build": [], "env_render": [], "env_step": [],
@@ -896,6 +902,9 @@ def run_s1_segment(
     action_plan: collections.deque = collections.deque()
 
     while executed < budget:
+        if should_cancel is not None and should_cancel():
+            stop_reason = "human_stop"
+            break
         replanned = False
         prog = None
         query = None
@@ -927,7 +936,9 @@ def run_s1_segment(
                 prog["at_step"] = executed
             action_plan.extend(chunk_sim[:replan_steps])
             # The REAL prompt the server tokenized (true discretized state ints) when available.
-            real_prompt = result.get("prompt_text") if isinstance(result, dict) else None
+            real_prompt = (result.get("prompt_text") if isinstance(result, dict) else None) or build_prompt_text(
+                task_goal, subgoal_text, "Success", est_length, executed, gripper_flag
+            )
             if real_prompt and (not prompts_seen or prompts_seen[-1] != real_prompt):
                 prompts_seen.append(real_prompt)
             # Record the WHOLE predicted action chunk (not just the steps we execute) plus its
@@ -941,6 +952,7 @@ def run_s1_segment(
             query = dict(prompt=real_prompt, gripper_flag=gripper_flag,
                          executed_step=int(executed), replan_steps=int(replan_steps),
                          horizon=int(HORIZON), s1_infer_s=round(t_infer, 4),
+                         s1_obs_build_s=round(t_obs_build, 4),
                          chunk_progress=(prog.get("progress_chunk") if prog else None),
                          progress_now=(prog.get("progress_now") if prog else None),
                          chunk_raw12=np.round(chunk_sim, 4).tolist(),
@@ -996,8 +1008,10 @@ def run_s1_segment(
         if zero_arm_in_base and action_sim[SIM_CTRL_IDX] > 0.0:
             a_step = action_sim.copy()
             a_step[0:6] = 0.0
+        fld["action_applied_raw12"] = np.round(np.asarray(a_step, float), 4).tolist()
         _t = time.perf_counter()
         env.step(a_step)
+        applied_actions.append(np.asarray(a_step, dtype=np.float64).copy())
         t_step = time.perf_counter() - _t
         timings["env_step"].append(t_step)
         fld["t_env_step_s"] = round(t_step, 4)
@@ -1014,10 +1028,20 @@ def run_s1_segment(
         if env_ok:
             success_step = executed - 1
             stop_reason = "env_success"
+            if step_callback is not None:
+                try:
+                    step_callback(fld, clean_frames[-1])
+                except Exception as e:  # noqa: BLE001 - telemetry must not abort robot execution
+                    fld["step_callback_error"] = f"{type(e).__name__}: {e}"
             break
 
         tracker.update(action_sim, prog, raw16=fld["cur_raw16"])
         fld["stop_signals"] = tracker.debug()
+        if step_callback is not None:
+            try:
+                step_callback(fld, clean_frames[-1])
+            except Exception as e:  # noqa: BLE001 - telemetry must not abort robot execution
+                fld["step_callback_error"] = f"{type(e).__name__}: {e}"
         # The tracker is still UPDATED inside the force window (above), so its history is continuous
         # and the recorded stop_signals stay truthful -- only the decision to break is withheld.
         if executed < force_steps:
@@ -1039,6 +1063,7 @@ def run_s1_segment(
         "s1_prompts": prompts_seen,
         "timings": _timing_summary(timings),
         "_clean_frames": clean_frames, "_step_records": step_records, "_motion": motion_norms,
+        "_applied_actions": applied_actions,
     }
 
 
@@ -1198,19 +1223,30 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         n_clip_frames = 0
         if rollout_limit["mode"] == "max_turns":
             turn_guard = int(rollout_limit["max_turns"])
+            zero_step_safety = None
             term = "max_turns"
             print(f"  rollout limit: {turn_guard} turns ({rollout_limit['reason']})", flush=True)
         else:
-            turn_guard = _positive_int(args.max_s2_calls_safety,
-                                       field="max_s2_calls_safety", where="CLI")
+            # There is deliberately no total-turn guard in official-step mode. This counter catches
+            # only a consecutive zero-env-step loop (normally repeated rule skips), and resets as
+            # soon as System1 actually advances the simulator.
+            turn_guard = None
+            zero_step_safety = _positive_int(args.max_s2_calls_safety,
+                                             field="max_s2_calls_safety", where="CLI")
+            zero_step_streak = 0
             term = "max_s2_calls_safety"
             print(f"  rollout limit: {rollout_limit['max_official_steps']} cumulative env steps "
-                  f"({rollout_limit['reason']}); S2-call safety={turn_guard}", flush=True)
+                  f"({rollout_limit['reason']}); consecutive zero-step safety={zero_step_safety}",
+                  flush=True)
 
-        while turn < turn_guard:
+        while turn_guard is None or turn < turn_guard:
             if (rollout_limit["mode"] == "max_official_steps"
                     and episode_steps >= rollout_limit["max_official_steps"]):
                 term = "max_official_steps"
+                break
+            if (rollout_limit["mode"] == "max_official_steps"
+                    and zero_step_streak >= zero_step_safety):
+                term = "max_s2_calls_safety"
                 break
             tdir = ep_out / f"turn{turn:02d}"
             tdir.mkdir(parents=True, exist_ok=True)
@@ -1321,6 +1357,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             tx_label = held.get("tx_label") if held else None
             force_steps = 0
             rr_stop = False
+            suppress_task_finish = False
             # Reset per turn: a HELD turn skips the rule call below, and without this rr would still
             # be the PREVIOUS turn's result -- a stale requery_s2 would fire a spurious second
             # System2 call. (Latent before the mandatory tier existed, because the requery guard also
@@ -1339,7 +1376,9 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 rule_state["judge"] = judge
                 rr = SR.apply_rules(task_name, plan=plan, subgoal=subgoal,
                                     subgoal_detail=sg_detail, est=est, state=rule_state,
-                                    general=bool(args.general_rules), task_tier=bool(args.task_rules))
+                                    general=bool(args.general_rules), task_tier=bool(args.task_rules),
+                                    task_status=task_status,
+                                    last_milestone_retry=bool(args.last_milestone_retry))
                 plan, subgoal, sg_detail, est = rr["plan"], rr["subgoal"], rr["subgoal_detail"], rr["est"]
                 skip_s1 = rr["skip_s1"]
                 tx_label = rr.get("tx_label")
@@ -1350,6 +1389,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 # running. Only a rule can know a subgoal is a wait, hence the channel.
                 force_steps = int(rr.get("force_steps") or 0)
                 rr_stop = bool(rr.get("stop_episode"))
+                suppress_task_finish = bool(rr.get("suppress_task_finish"))
                 rule_ivs = rr["interventions"]
                 if rule_ivs:
                     ep_rule_log.append({"turn": turn, "interventions": rule_ivs})
@@ -1385,12 +1425,15 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 rule_state["judge"] = judge
                 rr = SR.apply_rules(task_name, plan=plan, subgoal=subgoal,
                                     subgoal_detail=sg_detail, est=est, state=rule_state,
-                                    general=bool(args.general_rules), task_tier=bool(args.task_rules))
+                                    general=bool(args.general_rules), task_tier=bool(args.task_rules),
+                                    task_status=task_status,
+                                    last_milestone_retry=bool(args.last_milestone_retry))
                 plan, subgoal, sg_detail, est = (rr["plan"], rr["subgoal"],
                                                  rr["subgoal_detail"], rr["est"])
                 skip_s1, tx_label = rr["skip_s1"], rr.get("tx_label")
                 force_steps = int(rr.get("force_steps") or 0)
                 rr_stop = bool(rr.get("stop_episode"))
+                suppress_task_finish = bool(rr.get("suppress_task_finish"))
                 rule_ivs = rule_ivs + rr["interventions"]
                 if rr["interventions"]:
                     ep_rule_log.append({"turn": turn, "requery": True,
@@ -1438,11 +1481,12 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                           # What System1 was ACTUALLY given, after any override. Equal to the "s2"
                           # block above when no rule fired, so the two are always comparable.
                           "effective": {"subgoal": subgoal, "subgoal_detail": sg_detail,
-                                        "estimated_step": est},
+                                        "estimated_step": est,
+                                        "task_finish_suppressed": suppress_task_finish},
                           "s2_plan_before_rules": (s2_plan if s2_plan != plan else None)},
             }
 
-            if judge == "task_finish":
+            if judge == "task_finish" and not suppress_task_finish:
                 term = "task_finish"
                 turn_rec["s1"] = None
                 _write_json(tdir / "turn.json", turn_rec)
@@ -1491,6 +1535,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                                      "rules": turn_rec["rules"], "plan_after": plan})
                 print(f"  turn {turn}: System1 SKIPPED by rule (subgoal={subgoal!r})", flush=True)
                 turn += 1
+                if rollout_limit["mode"] == "max_official_steps":
+                    zero_step_streak += 1
                 continue
 
             # -- System1: execute that subgoal --
@@ -1543,7 +1589,13 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
 
             frames = roll.pop("_clean_frames")
             steps = roll.pop("_step_records")
+            # The interactive evaluator uses this exact post-transform trace for rollback replay.
+            # Batch rollouts already persist the same values per step as action_applied_raw12 and
+            # do not need a second in-memory copy.
+            roll.pop("_applied_actions", None)
             episode_steps += int(roll["n_steps"])
+            if rollout_limit["mode"] == "max_official_steps":
+                zero_step_streak = 0 if int(roll["n_steps"]) > 0 else zero_step_streak + 1
             doc["n_env_steps"] = episode_steps
             # Offset+2 regrasp recovery needs the ONE effective segment executed between the
             # original grasp and the detected drop. Snapshot every completed System1 segment here;
@@ -1688,6 +1740,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         # `task_rules: true` means the rules were ON but nothing matched this episode.
         doc["task_rules"] = bool(args.task_rules)
         doc["general_rules"] = bool(args.general_rules)
+        doc["last_milestone_retry"] = bool(args.last_milestone_retry)
         # The mandatory tier (repeat_cap) runs regardless; task_rules above is the
         # OPTIONAL tier only. Recorded explicitly so an arm is self-describing.
         doc["rule_tier"] = _rule_tier(args)
@@ -1717,6 +1770,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
     except Exception as e:
         doc["task_rules"] = bool(args.task_rules)
         doc["general_rules"] = bool(args.general_rules)
+        doc["last_milestone_retry"] = bool(args.last_milestone_retry)
         # The mandatory tier (repeat_cap) runs regardless; task_rules above is the
         # OPTIONAL tier only. Recorded explicitly so an arm is self-describing.
         doc["rule_tier"] = _rule_tier(args)
@@ -1737,28 +1791,33 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
 def _rule_tier(args) -> str:
     """Which rule tiers this run applied -- recorded so an arm is self-describing.
 
-    Three arms, matching the CLI: "mandatory" (repeat_cap only -- this is the historical '-base'
-    arm), "mandatory+general", "mandatory+general+task". A leading "none" appears only when the
-    mandatory tier was explicitly disabled with SYS2_RULES_NO_MANDATORY=1.
+    Ordinary tiers remain mandatory/general/task. The independently switchable ``horizon_retry``
+    suffix records the strong last-milestone replay rule, which always executes after those tiers.
+    A leading "none" appears only when the mandatory tier was explicitly disabled.
     """
     tiers = ["mandatory"] if SR.mandatory_on() else ["none"]
     if getattr(args, "general_rules", False):
         tiers.append("general")
     if getattr(args, "task_rules", False):
         tiers.append("task")
+    if getattr(args, "last_milestone_retry", False):
+        tiers.append("horizon_retry")
     return "+".join(tiers)
 
 
 def _rule_config(args) -> dict:
     """Stable, serializable configuration shared by result files and the GUI."""
     cfg = SR.rule_config(general=bool(getattr(args, "general_rules", False)),
-                         task_tier=bool(getattr(args, "task_rules", False)))
+                         task_tier=bool(getattr(args, "task_rules", False)),
+                         last_milestone_retry=bool(
+                             getattr(args, "last_milestone_retry", False)))
     return {**cfg, "tier": _rule_tier(args)}
 
 
 def _rules_present(args) -> bool:
     cfg = _rule_config(args)
-    return bool(cfg["mandatory_rules"] or cfg["general_rules"] or cfg["task_rules"])
+    return bool(cfg["mandatory_rules"] or cfg["general_rules"] or cfg["task_rules"]
+                or cfg["last_milestone_retry"])
 
 
 def _load_goal_map(path: str | os.PathLike) -> dict[str, str]:
@@ -1878,9 +1937,8 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                     help="pass media as file:// URIs instead of inlined base64 (server must share the FS)")
     # loop control
     ap.add_argument("--max-turns", type=int, default=20,
-                    help="fallback turn cap used by --rollout-limit-mode=max_turns or "
-                         "--flat-max-turns. In auto mode an unknown task uses its official-step cap "
-                         "instead of silently receiving this flat value.")
+                    help="turn cap used only by explicitly selected max_turns/auto behavior. It is "
+                         "not an outcome-bearing limit in the default max_official_steps mode.")
     ap.add_argument("--resume", action="store_true",
                     help="skip episodes already finished under --out-root/<method> (episode.json "
                          "present with a termination and no error). Makes a killed sweep restartable.")
@@ -1888,10 +1946,12 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                     help="ignore the per-task table and use --max-turns for every task; this also "
                          "forces the max_turns branch in auto mode")
     ap.add_argument("--rollout-limit-mode",
-                    choices=["auto", "max_turns", "max_official_steps"], default="auto",
-                    help="auto (default): use saved per-task max_turns when present, otherwise the "
-                         "task's official cumulative-step cap. The other choices explicitly force "
-                         "one limit type.")
+                    choices=["auto", "max_turns", "max_official_steps"],
+                    default="max_official_steps",
+                    help="max_official_steps (default): use the task's RoboCasa cumulative env-step "
+                         "horizon. max_turns reproduces the historical turn-limited evaluation; "
+                         "auto uses saved per-task max_turns when present and otherwise the official "
+                         "horizon.")
     ap.add_argument("--max-official-steps", type=int, default=None,
                     help="explicit cumulative env-step cap for this invocation; overrides the task "
                          "JSON/registry value when the official-step branch is selected")
@@ -1899,9 +1959,9 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                     help="optional JSON task map. Values can be step integers or objects with "
                          "max_turns and/or max_official_steps")
     ap.add_argument("--max-s2-calls-safety", type=int, default=100,
-                    help="non-scoring deadlock guard used only in max_official_steps mode. It catches "
-                         "query/skip loops that execute zero env steps; normal termination is still "
-                         "the cumulative step cap.")
+                    help="non-scoring deadlock guard used only in max_official_steps mode. It caps "
+                         "consecutive loop iterations that execute zero env steps, resetting after "
+                         "any real execution; it is not a total-turn limit.")
     ap.add_argument("--horizon-mult", type=float, default=2.0,
                     help="segment budget = estimated_step * this, capped by --max-steps-cap")
     ap.add_argument("--max-steps-cap", type=int, default=400,
@@ -1938,6 +1998,13 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                          "turn.json:rules (with the tier) and episode.json:rule_interventions. To "
                          "reproduce the historical zero-rules baseline that predates the mandatory "
                          "tier, set SYS2_RULES_NO_MANDATORY=1 as well.")
+    ap.add_argument(
+        "--last-milestone-retry", action=argparse.BooleanOptionalAction, default=None,
+        help="independent HORIZON POST-RULE. When enabled, false task_finish, terminal retract/finish "
+             "wording, or repeat_cap max_cap restores and retries the final milestone until the "
+             "official step horizon is exhausted. It always runs after general/task rules. When "
+             "unspecified, it follows --general-rules for backward compatibility.",
+    )
     ap.add_argument("--default-est-length", type=int, default=50,
                     help="fallback when System2 omits/garbles <estimated_step>")
     ap.add_argument("--replan-steps", type=int, default=16)
@@ -1971,6 +2038,8 @@ def run_sweep(args, *, method_suffix: str = "") -> None:
     # Resolved ONCE here rather than at each use, so the rule call, the recorded tier and the log
     # line can never disagree about which arm ran.
     args.general_rules = bool(getattr(args, "general_rules", False) or args.task_rules)
+    if getattr(args, "last_milestone_retry", None) is None:
+        args.last_milestone_retry = args.general_rules
     """Connect to both servers, roll every requested episode, write the index part.
 
     Shared by ``main()`` and by plan-variant scripts: a variant only has to set ``args.plan_fn``

@@ -1042,11 +1042,11 @@ const isUnseenShortMethod=m=>/unseenshort/i.test(String(m||''));
 const isNewTaskMethod=(m,rec)=>((rec&&rec.newtask)||/newtask/i.test(String(m||'')));
 // HUMAN-RECIPE runs: the composite_unseen split re-run with a HAND-WRITTEN recipe supplied to the
 // planner, so its 16-task result is not truth-free the way every other arm's is -- a human read the
-// task and wrote the plan. It borrows its other two splits from the matching -inst run (see donorOf)
-// to get a composed overall, which makes it look like a full 50-task row; hidden by default so that
-// composed number never sits in the default ranking unasked. Matched on the name suffix, which is the
-// only thing that distinguishes it from -inst (same checkpoint, same tasks, different goal source).
-const isHumanRecipeMethod=m=>/-human-recipe$/.test(String(m||''));
+// task and wrote the plan. Both the ordinary and official-step retry variants stay behind this
+// toggle. The retry variant also matches isRetryMethod below, so visibility is deliberately the AND
+// of "human-recipe" and "other runs"; the ordinary variant needs only "human-recipe". Their donor
+// mappings live in donorOf.
+const isHumanRecipeMethod=m=>/-human-recipe(?:-retry)?$/.test(String(m||''));
 // SPLIT DISPLAY NAMES. "other" is the split TARGET_TASK_SPLIT assigns to anything off the 50-task
 // manifest, and in this tree it is owned exclusively by the newtask runs -- verified: every task in it
 // is reported by a newtask method and by nothing else (34 distinct tasks as of 2026-08-16, up from 24;
@@ -1061,6 +1061,11 @@ const splName=x=>SPL_NAME[x]||String(x||'').replace('_','-');
 // ranking. One click removes them. Deliberately matches on the SUFFIX only, so a future "-v2-foo"
 // variant is not silently swept up with them.
 const isV2Method=m=>/-v2$/i.test(String(m||''));
+// EXPERIMENTAL OFFICIAL-STEP RETRY ARM. It is a complete 30/task sweep, but it changes the rollout
+// stopping policy by replaying the last milestone until the official horizon is exhausted. Keep it
+// behind "other runs" while that policy is being evaluated, rather than placing its raw score in the
+// default ranking beside the established -inst arm.
+const isRetryMethod=m=>/-retry$/i.test(String(m||''));
 // FLAT-POLICY BASELINE (Xiaomi-Robotics-1 RoboCasa365): one policy, no System2, no turns. Summarised
 // into combine_results/ by scripts/extract_baseline_results.py, which is also what stamps the
 // `baseline-` prefix this keys on. Its own toggle in #0, default ON: it is the external reference the
@@ -1215,12 +1220,13 @@ async function load(){
       for(const t in pt){const n=pt[t].n||0; if(n>x)x=n;} return x;};
     const isEval30=m=>maxTaskN(m)>20;
     const NT=ALL.filter(m=>isNewTaskMethod(m,C[m]));
-    // "OTHER RUNS" = the superseded -v2 rule arm PLUS the older 20-episodes-per-task sweeps, merged
-    // into one box because they are the same kind of thing: real results on a rule set or a
-    // denominator that is no longer the comparison. newtask is excluded (its 20 episodes/task would
-    // otherwise read as a 1000-episode run) and so are debug runs, which have their own box.
+    // "OTHER RUNS" = the superseded -v2 rule arm, experimental -retry arms, and the older
+    // 20-episodes-per-task sweeps, merged into one box because they are the same kind of thing: real
+    // results on a rule set, stopping policy, or denominator that is not currently the default
+    // comparison. newtask is excluded (its 20 episodes/task would otherwise read as a 1000-episode
+    // run) and so are debug runs, which have their own box.
     const isOtherRun=m=>!isDebugMethod(m)&&!isNewTaskMethod(m,C[m])
-                        &&(isV2Method(m)||!isEval30(m));
+                        &&(isV2Method(m)||isRetryMethod(m)||!isEval30(m));
     const OTH=ALL.filter(isOtherRun);
     // debug-* excluded so the count matches what ticking the box reveals: a debug human-recipe run
     // stays behind the debug box, and counting it here would promise a row that never appears.
@@ -1257,15 +1263,33 @@ async function load(){
       window._showHR=(localStorage.getItem('cmbShowHR')==='1');   // default OFF
     if(window._onlyUS===undefined)
       window._onlyUS=(localStorage.getItem('cmbOnlyUS')==='1');   // default OFF
+    // FAMILY FILTERS. Two INDEPENDENT axes -- the System1 progress head and the System2 planner --
+    // because a run is a pair of checkpoints and either half can be the thing you want to hold fixed.
+    // Exclusive WITHIN an axis (progact-only and progreg-only cannot both be on; the second click
+    // releases the first), and ANDed ACROSS axes, so "progreg-only + qwen3vl-only" is one cell of the
+    // 2x2. Read off the method NAME, which is where the pair is encoded.
+    //
+    // A run with no family -- every external baseline (xr1 / abot / pi05) -- is hidden while any family
+    // filter is on. That is the point of the filter (compare like with like) but it is easy to forget,
+    // so the button title says it.
+    const s1Fam=m=>{const x=String(m||'').toLowerCase();
+      return x.includes('progact')?'progact':x.includes('progreg')?'progreg':'';};
+    const s2Fam=m=>{const x=String(m||'').toLowerCase();
+      return x.includes('qwen3vl')?'qwen3vl':x.includes('qwen35')?'qwen35':'';};
+    if(window._famS1===undefined)window._famS1=(localStorage.getItem('cmbFamS1')||'');
+    if(window._famS2===undefined)window._famS2=(localStorage.getItem('cmbFamS2')||'');
+    const famOK=m=>(!window._famS1||s1Fam(m)===window._famS1)
+                  &&(!window._famS2||s2Fam(m)===window._famS2);
     // ONLY-MODE short-circuits every other visibility box: the point is to see the terse-goal arms
-    // and nothing else, so a stale debug/v2/baseline tick cannot silently drop one of them.
-    const ms=window._onlyUS ? ALL.filter(isUnseenShortMethod)
+    // and nothing else, so a stale debug/v2/baseline tick cannot silently drop one of them. The family
+    // filters still apply -- they narrow WHICH arms, not which kind.
+    const ms=(window._onlyUS ? ALL.filter(isUnseenShortMethod)
       : ALL.filter(m=>(window._showDebug||!isDebugMethod(m))
                         && (window._showBaseline||!isBaselineMethod(m,C[m]))
                         && (window._showUS||!isUnseenShortMethod(m))
                         && (window._showHR||!isHumanRecipeMethod(m))
                         && (window._showNT||!isNewTaskMethod(m,C[m]))
-                        && (window._showOther||!isOtherRun(m)));
+                        && (window._showOther||!isOtherRun(m)))).filter(famOK);
     const dbgBar=document.getElementById('cmbdebug');
     if(dbgBar){
       const boxes=[];
@@ -1301,11 +1325,12 @@ async function load(){
         +`style="margin-right:4px">include ${HR.length} human-recipe run${HR.length>1?'s':''} `
         +`<span style="color:#aaa">(hand-written recipe)</span></label>`);
       if(OTH.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px" `
-        +`title="The superseded -v2 rule arm and the older 20-episodes-per-task sweeps. Real results, `
-        +`but on a rule set or a denominator that is no longer the comparison.">`
+        +`title="The superseded -v2 rule arm, experimental -retry arms, and older 20-episodes-per-task `
+        +`sweeps. Real results, but on a rule set, stopping policy, or denominator that is not the `
+        +`default comparison.">`
         +`<input type="checkbox" id="cmbothcb" ${window._showOther?'checked':''} `
         +`style="margin-right:4px">show ${OTH.length} other run${OTH.length>1?'s':''} `
-        +`<span style="color:#aaa">(-v2 and 20/task sweeps)</span></label>`);
+        +`<span style="color:#aaa">(-v2, -retry, and 20/task sweeps)</span></label>`);
       if(NT.length)boxes.push(`<label style="cursor:pointer;color:#888;margin-right:12px" `
         +`title="The 24-task NEW-TASK held-out set. Outside the 50-task manifest, so it has no overall `
         +`column and no refined scoring -- the horizon gate is defined against the manifest.">`
@@ -1320,6 +1345,25 @@ async function load(){
         +`<input type="checkbox" id="cmbblcb" ${window._showBaseline?'checked':''} `
         +`style="margin-right:4px">show ${BL.length} baseline run${BL.length>1?'s':''} `
         +`<span style="color:#aaa">(flat policy, no System2)</span></label>`);
+      // Family buttons: counts are of what the button would SHOW, so a 0 never hides silently.
+      const famBtn=(axis,val,label)=>{
+        const cur=axis==='s1'?window._famS1:window._famS2;
+        const on=cur===val;
+        const n=ALL.filter(m=>(axis==='s1'?s1Fam(m):s2Fam(m))===val).length;
+        return `<button class="fambtn" data-axis="${axis}" data-val="${val}" `
+          +`title="Show only ${label} runs. Exclusive with the other button on this axis; combines `
+          +`with the planner/head axis. Runs with no ${axis==='s1'?'progress head':'planner'} in their `
+          +`name (the external baselines) are hidden while this is on." `
+          +`style="font-size:11px;margin-right:4px;cursor:pointer;`
+          +`${on?'background:#b45309;color:#fff;border:1px solid #92400e':'background:#f3f4f6'}">`
+          +`${label}-only (${n})</button>`;};
+      boxes.push(`<span style="margin-right:10px">`
+        +famBtn('s1','progact','progact')+famBtn('s1','progreg','progreg')
+        +`<span style="color:#ddd">|</span> `
+        +famBtn('s2','qwen35','qwen35')+famBtn('s2','qwen3vl','qwen3vl')
+        +((window._famS1||window._famS2)
+          ?`<button id="famclear" style="font-size:11px;margin-left:4px;cursor:pointer">clear</button>`
+          :'')+`</span>`);
       boxes.push(`<label style="cursor:pointer;color:${window._refined?'#b45309':'#888'}" `
         +`title="A success counts only if the env's success check fired within RoboCasa's official `
         +`per-task step horizon (450-4350 env steps, robocasa dataset_registry). Our loop budgets per `
@@ -1350,6 +1394,14 @@ async function load(){
     const blcb=document.getElementById('cmbblcb');
     if(blcb)blcb.onchange=()=>{window._showBaseline=blcb.checked;
       localStorage.setItem('cmbBaseline', window._showBaseline?'1':'0'); load();};
+    document.querySelectorAll('.fambtn').forEach(b=>{b.onclick=()=>{
+      const axis=b.dataset.axis, val=b.dataset.val;
+      const key=axis==='s1'?'_famS1':'_famS2', store=axis==='s1'?'cmbFamS1':'cmbFamS2';
+      window[key]=(window[key]===val)?'':val;      // clicking the active one releases it
+      localStorage.setItem(store, window[key]); load();};});
+    const fclr=document.getElementById('famclear');
+    if(fclr)fclr.onclick=()=>{window._famS1=''; window._famS2='';
+      localStorage.setItem('cmbFamS1',''); localStorage.setItem('cmbFamS2',''); load();};
     const rcb=document.getElementById('cmbrefcb');
     if(rcb)rcb.onchange=()=>{window._refined=rcb.checked;
       localStorage.setItem('cmbRefined', window._refined?'1':'0'); load();};
@@ -1389,10 +1441,11 @@ async function load(){
     const MANIFEST=['atomic_seen','composite_seen','composite_unseen'];
     const fullCov=m=>{const P=C[m].per_split||{};
       return MANIFEST.every(x=>P[x]&&P[x].n);};
-    // BORROWED SPLITS -- deliberately scoped to ONE method pattern, `<x>-inst-human-recipe`, whose
-    // donor is `<x>-inst`. That arm re-runs composite-unseen with a human-written recipe and is the
-    // -inst run untouched elsewhere, so filling its other two splits from -inst gives a comparable
-    // 1500-episode overall.
+    // BORROWED SPLITS -- deliberately scoped to the two human-recipe method patterns. The ordinary
+    // `<x>-inst-human-recipe` arm borrows from `<x>-inst`; the official-step retry arm
+    // `<x>-inst-human-recipe-retry` borrows from `<x>-inst-retry`. Each recipe arm re-runs only
+    // composite-unseen, so filling atomic-seen and composite-seen from its exact cold-plan twin gives
+    // a comparable 1500-episode overall without mixing rollout-limit policies.
     //
     // NOT a general "longest full-coverage prefix" rule. That was tried and it silently paired
     // `xiaomi-robo1-unseenshort` with `xiaomi-robo1` -- the prefix matched and the size guard passed,
@@ -1401,9 +1454,10 @@ async function load(){
     // and that is a fact about the arm, not about its name. So it is enumerated, not inferred: adding
     // another borrowing arm means adding it here on purpose.
     const donorOf=m=>{
-      const x=/^(.*-inst)-human-recipe$/.exec(m||'');
-      if(!x)return null;
-      const dn=x[1];
+      const retry=/^(.*-inst)-human-recipe-retry$/.exec(m||'');
+      const ordinary=/^(.*-inst)-human-recipe$/.exec(m||'');
+      if(!retry&&!ordinary)return null;
+      const dn=retry ? `${retry[1]}-retry` : ordinary[1];
       if(!C[dn]||!fullCov(dn))return null;
       // Still guarded on size: if this arm's own split is smaller than the donor's (a sweep still in
       // flight), composing would put a mongrel denominator in the overall column.

@@ -128,6 +128,23 @@ def _norm(s: str | None) -> str:
 # not.
 _RETRACT_RE = re.compile(r"^retract(ing)?\s+(the\s+)?(robot\s+)?arm\b")
 
+# Broader terminal-loop detector for the experimental final-milestone retry. Unlike _RETRACT_RE,
+# this deliberately accepts planner wrappers such as "finish retracting the arm". The executed-
+# streak fallback still requires an arm, while the explicit continuation trigger below follows the
+# planner's wording and accepts "continue to release the pan and retract" as requested.
+_FINAL_RETRY_RETRACT_RE = re.compile(
+    r"\bretract(?:ing)?\b.*\b(?:robot\s+)?arm\b", re.IGNORECASE)
+_FINAL_RETRY_CONTINUE_RETRACT_RE = re.compile(
+    r"\bcontinue\s+to\b.*\bretract(?:ing)?\b|\bcontinue\s+retracting\b", re.IGNORECASE)
+_FINAL_RETRY_FINISH_TASK_RE = re.compile(r"\bfinish\s+the\s+task\b", re.IGNORECASE)
+# Zero means no rule-local retry cap. The evaluator's selected rollout limit (normally the official
+# RoboCasa horizon) remains the outcome-bearing stop; a positive value is useful for controlled
+# ablations and debugging.
+FINAL_MILESTONE_RETRY_MAX = int(os.environ.get(
+    "SYS2_RULES_FINAL_MILESTONE_RETRY_MAX", "0"))
+if FINAL_MILESTONE_RETRY_MAX < 0:
+    raise ValueError("SYS2_RULES_FINAL_MILESTONE_RETRY_MAX must be >= 0 (0 means unlimited)")
+
 # Which tasks have retract steps stripped from the plan. Overridable via SYS2_RULES_STRIP_RETRACT
 # (comma list, or empty to disable) so the strip can be scoped per run WITHOUT editing this file --
 # MEASURED, one variable at a time, on the same 8 TurnOnMicrowave episodes:
@@ -618,6 +635,11 @@ def _rule_repeat_cap(task: str, plan: str, subgoal: str, est, state) -> dict:
         # >= not >: limit 3 stops ON the 3rd decline (5 executed attempts, the configuration
         # the 0.33%/0.47% cost was measured against), and limit 0 stops on the first (3 executed).
         if n_dec >= (limit or 1):
+            # Ephemeral signal consumed by final_milestone_retry later in this SAME rule pass. A
+            # max-cap at the true end of the plan is a harness stop, not an environment outcome; if
+            # a final-milestone snapshot exists, the retry rule cancels this stop and spends the
+            # remaining official-step budget replaying that milestone.
+            state["_repeat_cap_max_cap"] = True
             return {"stop_episode": True,
                     "interventions": [{"rule": "repeat_cap", "kind": "max_cap",
                                        "detail": f"repeat #{count}, decline #{n_dec} at the END of "
@@ -1575,7 +1597,15 @@ def _inject_after_step(task_key: str, plan: str, subgoal: str, state, milestone:
     # being executed). The loop consumes this via pending_resume() and skips the S2 call entirely, so
     # the held subgoal runs against an unchanged plan and System2's next query sees the clip of THAT
     # segment. apply_rules fills in subgoal_detail/est below.
-    state["_resume_pending"] = {"key": task_key, "rule": rule, "subgoal": subgoal}
+    state["_resume_pending"] = {
+        "key": task_key,
+        "rule": rule,
+        "subgoal": subgoal,
+        # A later post-rule may supersede this borrowed turn before System1 executes it. Name the
+        # exact credit booked above so cancellation can refund only this transaction rather than
+        # guessing from whichever grasp happens to be current later.
+        "_injection_credit_key": f"{task_key}_injected",
+    }
     return {"subgoal": extra, "subgoal_detail": extra, "tx_label": tx_label,
             "interventions": [{"rule": rule, "kind": tx_label,
                                "detail": f"{state[f'{task_key}_fid']} completed; borrowed turn "
@@ -1583,6 +1613,44 @@ def _inject_after_step(task_key: str, plan: str, subgoal: str, state, milestone:
                                          f"({why() if callable(why) else why}). Plan untouched; "
                                          "System2's subgoal is held and resumes after.",
                                "before": subgoal, "after": extra}]}
+
+
+def _cancel_pending_transaction(state: dict, *, canceled_by: str) -> dict | None:
+    """Cancel one borrowed-turn transaction and refund the credit it booked but never executed.
+
+    This is intentionally different from consuming ``pending_resume``: normal consumption keeps the
+    one-shot credit because the injected physical action ran. Cancellation happens within the same
+    rule pass, before System1 sees that action, so retaining the credit would disable a legitimate
+    recovery after the plan is restarted.
+    """
+    pending = state.pop("_resume_pending", None)
+    if not isinstance(pending, dict):
+        return None
+    key = pending.get("key")
+    if key:
+        state.pop(f"{key}_held", None)
+
+    credit_key = pending.get("_injection_credit_key")
+    credit_before = state.get(credit_key, 0) if credit_key else 0
+    refunded = isinstance(credit_before, int) and credit_before > 0
+    credit_after = credit_before
+    if refunded:
+        credit_after = credit_before - 1
+        if credit_after:
+            state[credit_key] = credit_after
+        else:
+            state.pop(credit_key, None)
+
+    original_rule = pending.get("rule") or key or "unknown rule"
+    return {
+        "rule": canceled_by,
+        "kind": "tx_canceled",
+        "detail": (f"superseded {original_rule}'s borrowed turn before System1 execution; "
+                   + (f"refunded {credit_key} from {credit_before} to {credit_after}"
+                      if refunded else "no booked injection credit to refund")),
+        "before": pending.get("subgoal") or f"pending transaction from {original_rule}",
+        "after": f"canceled by {canceled_by}",
+    }
 
 
 def _rule_drawer_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> dict:
@@ -2422,6 +2490,13 @@ def record_executed_subgoal(state: dict | None, *, subgoal: str,
         "subgoal_detail": subgoal_detail or subgoal,
         "est": est,
     }
+    # Count EFFECTIVE executed retract-arm segments, not S2 proposals. An explicit "continue ...
+    # retract" triggers immediately; this counter is the fallback for planners that repeat the bare
+    # retract wording and therefore provide no lexical continuation signal.
+    if _FINAL_RETRY_RETRACT_RE.search(_norm(subgoal)):
+        state["_executed_retract_streak"] = state.get("_executed_retract_streak", 0) + 1
+    else:
+        state["_executed_retract_streak"] = 0
 
 
 def _regrasp_replay_candidate(state: dict) -> tuple[dict | None, str | None]:
@@ -2539,6 +2614,226 @@ def _rule_regrasp_recovery(task: str, plan: str, subgoal: str, est, state) -> di
     return r
 
 
+def _final_milestone_start(plan: str, subgoal: str, subgoal_detail: str, est) -> dict | None:
+    """Snapshot the exact logical state at the first fine step of the last milestone."""
+    blocks = _blocks(plan)
+    if not blocks:
+        return None
+    last = blocks[-1]
+    if last["mark"] != "~" or not last["fine"]:
+        return None
+    first = last["fine"][0]
+    if first["mark"] != "~" or current_fine_id(plan) != first["fid"]:
+        return None
+    forced = (subgoal or first["text"]).strip()
+    if not forced:
+        return None
+    return {
+        "mid": last["mid"],
+        "milestone_text": last["text"],
+        "fid": first["fid"],
+        "plan": plan,
+        "subgoal": forced,
+        "subgoal_detail": (subgoal_detail or forced).strip(),
+        "est": est,
+        "retry_count": 0,
+    }
+
+
+_FINAL_RETRY_DEST_RE = re.compile(
+    r"\s+(?:back\s+to|away(?:\s+from)?|to|into|onto|over|above|toward|towards|on|in)\b",
+    re.IGNORECASE)
+_FINAL_RETRY_ACTION_PREFIX_RE = re.compile(
+    r"^(?:(?:finish\s+)?(?:lift(?:ing)?|pick(?:ing)?\s+up)\s+and\s+)?"
+    r"(?:carry|move|lift|lower|place|put|transfer|return|release|dump)"
+    r"(?:ing)?(?:\s+and\s+(?:lower|place|release|align)(?:ing)?)?\s+",
+    re.IGNORECASE)
+_FINAL_RETRY_REGRASP_ACTION_RE = re.compile(
+    r"^(?:lift\s+and\s+carry|carry(?:\s+and\s+lower)?)\b|"
+    r"^lower\b.*\brelease\b",
+    re.IGNORECASE)
+
+
+def _final_retry_grasp_target(*texts: str) -> str | None:
+    """Extract X only for the explicit action whitelist that needs ``reach and grasp X``.
+
+    Eligible: carry, lift-and-carry, carry-and-lower, and lower-and-release. Everything else is a
+    direct replay, including reach/search/navigation/base motion, release alone, lower alone, lift
+    alone, move, and place.
+    """
+    first = _norm(texts[0] if texts else "")
+    if not _FINAL_RETRY_REGRASP_ACTION_RE.search(first):
+        return None
+    recognized_first = False
+    for index, raw in enumerate(texts):
+        text = _norm(raw)
+        if not text or _FINAL_RETRY_RETRACT_RE.search(text):
+            continue
+        rest = _FINAL_RETRY_ACTION_PREFIX_RE.sub("", text, count=1)
+        recognized = rest != text
+        if rest == text:
+            # Milestones occasionally use gerunds without an auxiliary: "placing the pan ...".
+            rest = re.sub(
+                r"^(?:finish\s+)?(?:placing|putting|moving|carrying|lowering)\s+", "", text,
+                count=1, flags=re.IGNORECASE)
+            recognized = rest != text
+        if index == 0:
+            recognized_first = recognized
+        # The milestone text is only a naming fallback for a recognized object action (e.g.
+        # "release it" -> milestone "release the sponge"). It must not turn an unrelated first
+        # action such as "reach to the button", "search for the toaster", or "reposition the base"
+        # into a fabricated object grasp merely because the milestone later names an object.
+        if not recognized or (index > 0 and not recognized_first):
+            continue
+        dest = _FINAL_RETRY_DEST_RE.search(rest)
+        target = (rest[:dest.start()] if dest else rest).strip(" ,.")
+        target = re.sub(r"\s+and\s+release$", "", target, flags=re.IGNORECASE).strip()
+        if re.search(r"\b(?:robot\s+)?base\b", target, re.IGNORECASE):
+            return None
+        if not target:
+            continue
+        if re.match(r"^(?:to|into|onto|over|above|toward|towards|on|in)\b", target,
+                    re.IGNORECASE):
+            continue
+        if target.lower() in {"it", "this", "that", "the arm", "the robot arm", "task"}:
+            continue
+        return target
+    return None
+
+
+def _rule_final_milestone_retry(task: str, plan: str, subgoal: str, est, state) -> dict:
+    """ALL tasks: retry the last milestone before accepting a false terminal loop.
+
+    This is official-step loop v6. It does not reset the simulator. It restores the checklist
+    snapshot from when the final milestone first started. Only carry, lift-and-carry,
+    carry-and-lower, and lower-and-release borrow one turn to reach and grasp the named object before
+    replaying the cached subgoal. Every other first subgoal is replayed directly, followed by a
+    normal System2 query. By default the retry can recur until the evaluator reaches its rollout
+    limit; ``SYS2_RULES_FINAL_MILESTONE_RETRY_MAX=N`` supplies an optional positive retry cap.
+
+    Trigger only while the privileged environment status is still ongoing, on any of:
+      * System2 judging ``task_finish``; or
+      * System2 issuing ``finish the task``;
+      * System2 issuing ``continue to ... retract ...`` at the final milestone; or
+      * repeat_cap requesting ``max_cap`` at the final subgoal.
+
+    A third repeated bare retract remains a fallback for planners that omit the word "continue".
+    """
+    blocks = _blocks(plan)
+    cached = state.get("_final_milestone_start")
+    # If System2 appended a genuinely later milestone, the old one is no longer the final
+    # milestone. Drop its checkpoint and allow the new final milestone to establish its own.
+    if cached and blocks and blocks[-1]["mid"] != cached.get("mid"):
+        state.pop("_final_milestone_start", None)
+        cached = None
+
+    if cached is None:
+        cached = _final_milestone_start(
+            plan, subgoal, state.get("_current_effective_subgoal_detail")
+            or state.get("_current_subgoal_detail") or subgoal,
+            state.get("_current_effective_est", est))
+        if cached is not None:
+            state["_final_milestone_start"] = cached
+
+    if state.get("_current_task_status") != "ongoing" or cached is None:
+        return {}
+    if (FINAL_MILESTONE_RETRY_MAX > 0
+            and cached.get("retry_count", 0) >= FINAL_MILESTONE_RETRY_MAX):
+        return {}
+
+    fake_finish = state.get("judge") == "task_finish"
+    max_cap = bool(state.get("_repeat_cap_max_cap"))
+    finish_task = bool(_FINAL_RETRY_FINISH_TASK_RE.search((subgoal or "").strip()))
+    continued_retract = bool(_FINAL_RETRY_CONTINUE_RETRACT_RE.search((subgoal or "").strip()))
+    bare_retract_loop = (
+        state.get("_executed_retract_streak", 0) >= 2
+        and bool(_FINAL_RETRY_RETRACT_RE.search(_norm(subgoal))))
+    retract_loop = continued_retract or bare_retract_loop
+    if not (fake_finish or max_cap or finish_task or retract_loop):
+        return {}
+
+    replay = cached["subgoal"]
+    target = _final_retry_grasp_target(replay, cached.get("milestone_text") or "")
+    effective = f"reach and grasp {target}" if target else replay
+    cached["retry_count"] = cached.get("retry_count", 0) + 1
+    # Keep repeat_cap aligned with the action that physically runs now and cancel a max_cap decision
+    # from earlier in this same rule pass.
+    state["rep_sg"] = _norm(effective)
+    state["rep_n"] = 1
+    state["rep_declines"] = 0
+    state["_executed_retract_streak"] = 0
+    # Another recovery may have tentatively borrowed this same S2 turn before this last-priority
+    # rule saw the terminal condition. Discard that transaction before installing our own explicit
+    # reach/grasp -> replay queue.
+    canceled_tx = _cancel_pending_transaction(
+        state, canceled_by="final_milestone_retry")
+    if target:
+        # Object-motion path: the triggering turn executes the borrowed re-grasp. The following
+        # held turn executes the cached milestone action, after which pending_resume is empty and
+        # the loop queries S2 normally.
+        state["_resume_pending"] = {
+            "key": "final_milestone_retry",
+            "rule": "final_milestone_retry",
+            "subgoal": replay,
+            "subgoal_detail": cached["subgoal_detail"],
+            "est": cached.get("est"),
+            "held_kind": "final_milestone_replay",
+            "tx_label": "tx_final_milestone_replay",
+        }
+
+    why = "false task_finish while the environment is ongoing" if fake_finish else (
+        "repeat_cap requested max_cap at the final subgoal" if max_cap else (
+        "'finish the task' proposal while the environment is ongoing" if finish_task else (
+        "continued retract proposal at the final milestone" if continued_retract else
+        "third consecutive bare retract-arm proposal at the final milestone")))
+    result = {
+        "plan": cached["plan"],
+        "subgoal": effective,
+        "subgoal_detail": effective if target else cached["subgoal_detail"],
+        "tx_label": "tx_final_milestone_retry",
+        "stop_episode": False,
+        "requery_s2": False,
+        "interventions": ([canceled_tx] if canceled_tx else []) + [
+            {"rule": "final_milestone_retry", "kind": "plan_revised",
+             "detail": f"{why}; restore {cached['mid']} to its exact starting checklist",
+             "before": plan, "after": cached["plan"]},
+            {"rule": "final_milestone_retry", "kind": "subgoal_override",
+             "detail": ("official-step loop v6: borrow this turn to reacquire the object, replay "
+                        "the cached first milestone subgoal next turn, then query System2" if target
+                        else "official-step loop v6: the cached first milestone subgoal is not one "
+                             "of the four re-grasp forms, so replay it directly and query System2 "
+                             "next turn"),
+             "before": subgoal or state.get("judge"), "after": effective},
+        ],
+    }
+    if target:
+        result["interventions"].extend([
+            {"rule": "final_milestone_retry", "kind": "tx_replay_queued",
+             "detail": "queued the cached first final-milestone subgoal immediately after the "
+                       "borrowed re-grasp",
+             "before": "query System2 next turn", "after": replay},
+            {"rule": "final_milestone_retry", "kind": "est_proposed",
+             "detail": f"borrowed reach-back grasp gets est floor {REGRASP_FAR_EST}",
+             "before": est, "after": REGRASP_FAR_EST},
+        ])
+        result["est_proposal"] = REGRASP_FAR_EST
+    elif isinstance(cached.get("est"), int) and cached["est"] > 0:
+        result["est_assign"] = cached["est"]
+    if fake_finish:
+        result["suppress_task_finish"] = True
+        result["interventions"].append(
+            {"rule": "final_milestone_retry", "kind": "task_finish_suppressed",
+             "detail": "environment reports ongoing, so execute the retry instead of terminating",
+             "before": "task_finish", "after": "ongoing retry"})
+    if max_cap:
+        result["interventions"].append(
+            {"rule": "final_milestone_retry", "kind": "max_cap_suppressed",
+             "detail": "repeat_cap is a harness stop and official env steps remain, so replay the "
+                       "last milestone instead of terminating",
+             "before": "max_cap", "after": "ongoing retry"})
+    return result
+
+
 # ---- THE THREE TIERS -----------------------------------------------------------------------------
 # MANDATORY: always runs, even with --task-rules OFF. repeat_cap is not an optional revision of
 # System2's output -- it is the loop's own termination policy. Without it a stuck subgoal is re-issued
@@ -2557,7 +2852,7 @@ def mandatory_on() -> bool:
     """Whether the mandatory tier is active. Public because callers record the arm they ran."""
     return _MANDATORY_ON
 
-# OPTIONAL, and NOT gated on a task name -- that is what makes a rule general here. Two of the three
+# OPTIONAL, and NOT gated on a task name -- that is what makes a rule general here. Some
 # are gated on the SUBGOAL TEXT instead, so they fire on whichever task performs that operation; the
 # tier means "selected by semantics, not by task", not "fires on all 50 tasks".
 #
@@ -2590,9 +2885,53 @@ def mandatory_on() -> bool:
 #                      floor: System2 normally predicts >=100 there, so it is usually a no-op.
 #
 # ORDER: rewrite text first, then let the physical recovery replace the turn when needed. The faucet
-# estimate runs last and explicitly declines a recovery turn, so its estimate cannot leak from the
-# held faucet action onto the injected re-grasp. est proposals are still resolved once below.
-_GENERAL_RULES: tuple = (_rule_press_again, _rule_regrasp_recovery, _rule_sink_faucet_est)
+# estimate explicitly declines a recovery turn, so its estimate cannot leak from the held faucet
+# action onto the injected re-grasp. Est proposals are still resolved once below.
+_GENERAL_RULES_CATALOG: tuple = (
+    _rule_press_again,
+    _rule_regrasp_recovery,
+    _rule_sink_faucet_est,
+)
+
+# Targeted ablation hook.  Empty/unset preserves the production stack byte-for-byte; a comma list
+# selects only those general rules, and ``none`` selects no general rule while still allowing the
+# task-specific tier to be measured on its own.  This is deliberately resolved at import time so a
+# rollout process has one immutable registry, and rule_config() records the effective selection.
+# It is an environment hook rather than another broad CLI tier because these arms are experiments,
+# not new production configurations.
+_GENERAL_RULE_ALLOWLIST_RAW = os.environ.get("SYS2_RULES_GENERAL_ALLOWLIST", "").strip()
+_GENERAL_RULE_NAMES = {
+    fn.__name__.removeprefix("_rule_"): fn for fn in _GENERAL_RULES_CATALOG
+}
+if not _GENERAL_RULE_ALLOWLIST_RAW:
+    _GENERAL_RULE_SELECTION = "all"
+    _GENERAL_RULES = _GENERAL_RULES_CATALOG
+else:
+    _requested = {
+        x.strip() for x in _GENERAL_RULE_ALLOWLIST_RAW.split(",") if x.strip()
+    }
+    if _requested == {"none"}:
+        _requested = set()
+    _unknown = sorted(_requested - set(_GENERAL_RULE_NAMES))
+    if _unknown:
+        raise ValueError(
+            "SYS2_RULES_GENERAL_ALLOWLIST contains unknown rule(s): "
+            + ", ".join(_unknown)
+            + "; choose from "
+            + ", ".join(sorted(_GENERAL_RULE_NAMES))
+            + ", or use 'none'"
+        )
+    _GENERAL_RULE_SELECTION = sorted(_requested)
+    _GENERAL_RULES = tuple(
+        fn for fn in _GENERAL_RULES_CATALOG
+        if fn.__name__.removeprefix("_rule_") in _requested
+    )
+
+# HORIZON POST-RULE: deliberately separate from the ordinary general tier. When enabled it ALWAYS
+# runs after mandatory, general, task-specific, and experimental execution rules. It may supersede
+# their terminal decision (not their normal behavior) by cancelling task_finish/max_cap and replaying
+# the final milestone until the evaluator consumes max_official_steps.
+_HORIZON_RULES: tuple = (_rule_final_milestone_retry,)
 
 # =============================================================================================
 # GRADUATED: CloseToasterOvenDoor -- pin est to 100, and name the door HANDLE on a bare-door reach.
@@ -2756,8 +3095,8 @@ _TASK_RULES = (_rule_drawer_base_align, _rule_drawer_base_align_est,
                # Order: rewrite the subgoal first so the est record is against the final text.
                _rule_ctod_reach_handle, _rule_ctod_est_100)
 
-# THE FINALISED SET: everything task-agnostic, plus every graduated per-task rule. There are exactly
-# TWO execution registries and no third category -- a rule is either general or gated on one task.
+# THE FINALISED SET: ordinary task-agnostic rules, graduated per-task rules, and the separately
+# switchable horizon post-rule.
 #
 # It used to read `_GENERAL_RULES + _COFFEE_RULES + _GTB_RULES`, where those two tuples were
 # per-task SUBSETS of _TASK_RULES (the same function objects, not copies) assembled so a sweep could
@@ -2772,7 +3111,7 @@ _TASK_RULES = (_rule_drawer_base_align, _rule_drawer_base_align_est,
 #
 # _RULES is the OPTIONAL set -- what --task-rules switches on. The mandatory tier is applied by
 # apply_rules regardless and is NOT in here, so that `--task-rules` off still gets repeat_cap.
-_RULES = _GENERAL_RULES + _TASK_RULES
+_RULES = _GENERAL_RULES + _TASK_RULES + _HORIZON_RULES
 
 # ---- PLAN-MODE rules -------------------------------------------------------------------------
 # apply_rules above runs on EXECUTION turns only. A rule that must replace the checklist System2
@@ -2914,14 +3253,16 @@ _TASK_TIER_RULES: tuple = _TASK_RULES + tuple(_EXP_RULES)
 def _tasks_with_rules() -> tuple[str, ...]:
     per: dict[str, int] = {}
     for fn in (*_RULES, *_PLAN_RULES, *_EXP_PLAN_RULES):
-        if fn in _GENERAL_RULES:
+        if fn in _GENERAL_RULES + _HORIZON_RULES:
             continue
         for t in _RULE_TASKS.get(fn.__name__, ()):
             per[t] = per.get(t, 0) + 1
     mand = ", ".join(f.__name__.removeprefix("_rule_") for f in _MANDATORY_RULES) or "none"
     gen = ", ".join(f.__name__.removeprefix("_rule_") for f in _GENERAL_RULES) or "none"
+    horizon = ", ".join(f.__name__.removeprefix("_rule_") for f in _HORIZON_RULES) or "none"
     return (f"<always on, no flag needed: {mand}>",
             f"<+general, task-agnostic: {gen}>",
+            f"<+horizon post-rule, independently switchable: {horizon}>",
             *(f"{t} ({n})" for t, n in sorted(per.items())))
 
 
@@ -2965,7 +3306,8 @@ for _rn, _rt in _EXP_RULE_TASKS.items():
 _UNMAPPED = sorted(
     fn.__name__
     for fn in (*_RULES, *_PLAN_RULES, *_EXP_PLAN_RULES)
-    if fn not in _GENERAL_RULES + _MANDATORY_RULES and fn.__name__ not in _RULE_TASKS
+    if fn not in _GENERAL_RULES + _HORIZON_RULES + _MANDATORY_RULES
+    and fn.__name__ not in _RULE_TASKS
 )
 if _UNMAPPED:
     print(f"WARNING: sys2_rules._RULE_TASKS is missing {len(_UNMAPPED)} registered rule(s): "
@@ -2974,26 +3316,34 @@ if _UNMAPPED:
 TASKS_WITH_RULES = _tasks_with_rules()
 
 
-def rule_config(*, general: bool, task_tier: bool) -> dict:
+def rule_config(*, general: bool, task_tier: bool,
+                last_milestone_retry: bool | None = None) -> dict:
     """Serializable description of the exact rule tiers selected for one evaluation run."""
     mandatory = bool(_MANDATORY_ON)
+    horizon_retry = bool(general) if last_milestone_retry is None else bool(last_milestone_retry)
 
     def names(fns) -> list[str]:
         return [fn.__name__.removeprefix("_rule_").removeprefix("_plan_rule_") for fn in fns]
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         # Incremented when rule behaviour changes without changing the config schema. This prevents
-        # old and corrected regrasp results from looking like the same evaluation arm.
-        "behavior_version": 2,
+        # old and behaviorally distinct rule results from looking like the same evaluation arm.
+        "behavior_version": 10,
         "regrasp_recovery_version": "offset2-replay-v1",
+        "final_milestone_retry_version": "official-step-loop-v7",
+        "final_milestone_retry_max": FINAL_MILESTONE_RETRY_MAX,
+        "final_milestone_retry_unlimited": FINAL_MILESTONE_RETRY_MAX == 0,
+        "general_rule_selection": _GENERAL_RULE_SELECTION,
         "mandatory_rules": mandatory,
         "general_rules": bool(general),
         "task_rules": bool(task_tier),
+        "last_milestone_retry": horizon_retry,
         "active_rules": {
             "mandatory": names(_MANDATORY_RULES) if mandatory else [],
             "general": names(_GENERAL_RULES) if general else [],
             "task": names(_TASK_TIER_RULES) if task_tier else [],
+            "horizon_post": names(_HORIZON_RULES) if horizon_retry else [],
             "task_plan": names(_PLAN_RULES + tuple(_EXP_PLAN_RULES)) if task_tier else [],
             "task_action": ["action_override"] if task_tier and _task_rules_active() else [],
         },
@@ -3001,7 +3351,9 @@ def rule_config(*, general: bool, task_tier: bool) -> dict:
 
 
 def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
-                state: dict | None = None, general: bool = True, task_tier: bool = True) -> dict:
+                state: dict | None = None, general: bool = True, task_tier: bool = True,
+                task_status: str | None = None,
+                last_milestone_retry: bool | None = None) -> dict:
     """Revise one turn's System2 output. Returns what the caller should actually use.
 
     ``general`` / ``task_tier`` select the TIERS, giving the three arms the CLI exposes:
@@ -3017,6 +3369,14 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
     ``interventions`` is empty when nothing fired.
     """
     st = state if state is not None else {}
+    # Ephemeral inputs for rules whose decision depends on the real environment status or on the
+    # full System2 phrasing. Assign every call so neither value can leak from a previous turn.
+    st["_current_task_status"] = task_status
+    st["_current_subgoal_detail"] = subgoal_detail
+    st["_current_effective_subgoal_detail"] = subgoal_detail
+    st["_current_effective_est"] = est
+    # Reset the same-pass repeat-cap signal so it can never leak from an earlier turn.
+    st["_repeat_cap_max_cap"] = False
     # Ephemeral coordination flag: later rules may need to know that THIS turn was replaced by a
     # physical re-grasp. Reset on every application so a hit never leaks into the following turn.
     st["regrasp_recovery_hit"] = False
@@ -3029,7 +3389,7 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
     # to set it wins and there is nothing to reconcile.
     cur = {"plan": plan, "subgoal": subgoal, "subgoal_detail": subgoal_detail, "est": est,
            "skip_s1": False, "tx_label": None, "force_steps": 0,
-           "stop_episode": False, "requery_s2": False}
+           "stop_episode": False, "requery_s2": False, "suppress_task_finish": False}
     ivs: list[dict] = []
     est_proposals: list[tuple] = []
     est_assign = None          # exact assignment (see the est_assign block at the end)
@@ -3037,10 +3397,18 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
     # Mandatory tier FIRST, so repeat_cap sees System2's own text and its cap counters are identical
     # whether or not the optional layer is on -- that is what keeps a rules arm comparable with its
     # no-rules control. (_MANDATORY_ON exists only to reproduce the pre-tier zero-rules baseline.)
+    # final_milestone_retry is a POST rule. In particular, CoffeeSetupMug can turn a bare pending
+    # final milestone into a detailed active milestone; checkpointing before that rewrite misses the
+    # only instant when its first fine step is [~]. Run every task/experimental rewrite first, then
+    # snapshot or trigger the terminal retry against the actual plan System1 is about to execute.
+    horizon_retry = bool(general) if last_milestone_retry is None else bool(last_milestone_retry)
+    horizon_post = _HORIZON_RULES if horizon_retry else ()
     active = ((_MANDATORY_RULES if _MANDATORY_ON else ())
               + (_GENERAL_RULES if general else ())
-              + (_TASK_TIER_RULES if task_tier else ()))
+              + (_TASK_TIER_RULES if task_tier else ())
+              + horizon_post)
     for fn in active:
+        st["_current_effective_subgoal_detail"] = cur["subgoal_detail"]
         r = fn(task, cur["plan"], cur["subgoal"], cur["est"], st)
         if not r:
             continue
@@ -3055,8 +3423,16 @@ def apply_rules(task: str, *, plan: str, subgoal: str, subgoal_detail: str, est,
             # proposal. They are resolved once, below, by taking the largest.
             est_proposals.append((r["est_proposal"], r["interventions"][0]["rule"]
                                   if r.get("interventions") else "?"))
+        # Expose the estimate that would win if the rule pass ended here to POST rules. This keeps
+        # the final-milestone checkpoint identical to what System1 will receive even when a task
+        # rewrite (CoffeeSetupMug) uses est_assign, whose public resolution happens below.
+        if est_assign is not None:
+            st["_current_effective_est"] = est_assign
+        elif est_proposals:
+            base = est if isinstance(est, int) else 0
+            st["_current_effective_est"] = max(base, max(p for p, _ in est_proposals))
         for k in ("plan", "subgoal", "subgoal_detail", "skip_s1", "tx_label", "force_steps",
-                  "stop_episode", "requery_s2"):
+                  "stop_episode", "requery_s2", "suppress_task_finish"):
             if k in r:
                 cur[k] = r[k]
         if cur["skip_s1"]:
@@ -3137,5 +3513,6 @@ def pending_resume(state: dict | None) -> dict | None:
         return {"key": pend["key"], "rule": pend["rule"], **item}
     state.pop("_resume_pending", None)
     state.pop(f"{pend['key']}_held", None)
+    pend.pop("_injection_credit_key", None)
     pend.setdefault("held_kind", "s2_resume")
     return pend

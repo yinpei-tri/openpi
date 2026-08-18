@@ -72,6 +72,7 @@ EPISODES=${EPISODES:-0}                    # per-task episode spec, e.g. "0", "0
 TASKS=${TASKS:-}                           # explicit comma list; overrides TASK_SET
 USE_EVAL_SET=${USE_EVAL_SET:-0}            # 1 = use the 1500-episode manifest inlined in
                                            # combined_eval.TARGET_EVAL_EPISODES; TASKS filters it
+EVAL_HALF=${EVAL_HALF:-}                    # with USE_EVAL_SET=1: 1 = first 15, 2 = last 15
 TASK_SET=${TASK_SET:-all}                  # all (the 50-task benchmark) | atomic_seen |
                                            # composite_seen | composite_unseen
 NGPU=${NGPU:-8}
@@ -87,10 +88,10 @@ S2_BASE=${S2_BASE:-8100}
 XLA_FRAC=${XLA_FRAC:-0.32}                 # System1 JAX share
 GPU_FRAC=${GPU_FRAC:-0.42}                 # System2 vLLM share
 MAX_TURNS=${MAX_TURNS:-20}
-# Rollout termination. auto preserves the 50-task benchmark's saved per-task max_turns and switches
-# an unknown task to its cumulative official-step cap. TASK_LIMITS_JSON supplies heterogeneous caps
-# for a multi-task fleet; MAX_OFFICIAL_STEPS is a one-value override useful for a one-task run.
-ROLLOUT_LIMIT_MODE=${ROLLOUT_LIMIT_MODE:-auto}  # auto | max_turns | max_official_steps
+# Rollout termination. The default follows the RoboCasa leaderboard's cumulative official horizon;
+# max_turns and auto remain configurable for historical reproduction. TASK_LIMITS_JSON supplies
+# heterogeneous caps; MAX_OFFICIAL_STEPS is a one-value override useful for a one-task run.
+ROLLOUT_LIMIT_MODE=${ROLLOUT_LIMIT_MODE:-max_official_steps}  # max_official_steps | max_turns | auto
 MAX_OFFICIAL_STEPS=${MAX_OFFICIAL_STEPS:-}
 TASK_LIMITS_JSON=${TASK_LIMITS_JSON:-}
 MAX_S2_CALLS_SAFETY=${MAX_S2_CALLS_SAFETY:-100}
@@ -110,19 +111,23 @@ RUN_LABEL=${RUN_LABEL:-}
 # UNITS_FILE supplies an explicit "<lerobot-dir> <episode>" manifest, one line per episode, and
 # bypasses worklist generation entirely -- for re-running a hand-picked set of episodes.
 UNITS_FILE=${UNITS_FILE:-}
-# THE THREE RULE ARMS. repeat_cap is MANDATORY and runs in all three -- it is the loop's termination
+# THE THREE ORDINARY RULE ARMS. repeat_cap is MANDATORY and runs in all three -- it is the loop's termination
 # policy, not a revision of System2, so without it a stuck subgoal is re-issued until max_turns with
 # nothing advancing. So there is no "zero rules" arm here; the floor is repeat_cap, which is exactly
 # what the historical "-base" methods measured.
 #
-#   default                       mandatory + general + task rules
+#   default                       mandatory + general + task rules + horizon retry
 #   TASK_RULES=0 GENERAL_RULES=1  mandatory + task-agnostic rules
 #   TASK_RULES=0 GENERAL_RULES=0  mandatory only            == the -base arm
+#
+# LAST_MILESTONE_RETRY is independent and executes after every ordinary rule. By default it follows
+# GENERAL_RULES for backward compatibility; set it explicitly to make an isolated horizon-retry arm.
 #
 # Every override is recorded in the results, and episode.json:rule_tier names the arm. New runs use
 # the full rule stack by default; explicitly set the variables to 0 for historical control arms.
 GENERAL_RULES=${GENERAL_RULES:-1}
 TASK_RULES=${TASK_RULES:-1}
+LAST_MILESTONE_RETRY=${LAST_MILESTONE_RETRY:-$GENERAL_RULES}
 # GOAL_JSON replaces the dataset task goal per task (JSON: {task_name: goal}). Used to test a
 # different goal phrasing -- e.g. terse composite-unseen goals -- without touching the dataset.
 GOAL_JSON=${GOAL_JSON:-}
@@ -132,6 +137,14 @@ GOAL_JSON=${GOAL_JSON:-}
 # EVAL_ARGS passes variant-specific flags through, e.g. EVAL_ARGS="--memory-episode 200".
 EVAL_SCRIPT=${EVAL_SCRIPT:-combined_eval.py}
 EVAL_ARGS=${EVAL_ARGS:-}
+case "$EVAL_HALF" in
+  ""|1|2) ;;
+  *) echo "FATAL: EVAL_HALF must be empty, 1, or 2" >&2; exit 1 ;;
+esac
+[[ -z "$EVAL_HALF" || "$USE_EVAL_SET" == 1 ]] || {
+  echo "FATAL: EVAL_HALF requires USE_EVAL_SET=1 (halves are ordinal slices of its manifest)" >&2
+  exit 1
+}
 [[ -f "$OPENPI_REPO/examples/robocasa/$EVAL_SCRIPT" ]] \
   || { echo "FATAL: no such eval script examples/robocasa/$EVAL_SCRIPT" >&2; exit 1; }
 ROBOCASA_PY=${ROBOCASA_PY:-/home/ec2-user/micromamba/envs/robocasa/bin/python}   # instance-local venv
@@ -197,10 +210,10 @@ if [[ -n "$UNITS_FILE" ]]; then
 fi
 if [[ -z "$UNITS_FILE" ]]; then
 # robocasa env: the registry import needs robosuite, absent from system python3.
-OPENPI_REPO="$OPENPI_REPO" "$ROBOCASA_PY" - "$DATA_ROOT" "$TASK_SET" "$TASKS" "$EPISODES" "$USE_EVAL_SET" \
+OPENPI_REPO="$OPENPI_REPO" "$ROBOCASA_PY" - "$DATA_ROOT" "$TASK_SET" "$TASKS" "$EPISODES" "$USE_EVAL_SET" "$EVAL_HALF" \
   >> "$WORK" 2>"$LOG/worklist.err" <<'PY'
 import sys, glob, os
-root, task_set, tasks_csv, eps, use_eval_set = sys.argv[1:6]
+root, task_set, tasks_csv, eps, use_eval_set, eval_half = sys.argv[1:7]
 sys.path.insert(0, os.path.join(os.environ["OPENPI_REPO"], "examples", "robocasa"))
 missing = []
 
@@ -230,6 +243,11 @@ if use_eval_set == "1":
         if not ld:
             missing.append(task)
             continue
+        if eval_half:
+            if len(episodes) != 30:
+                raise RuntimeError(
+                    f"EVAL_HALF requires exactly 30 manifest entries per task; {task} has {len(episodes)}")
+            episodes = episodes[:15] if eval_half == "1" else episodes[15:]
         for e in episodes:
             print(f"{ld} {int(e)}")
 else:
@@ -253,7 +271,7 @@ grep -E '^/.*/lerobot [0-9]' "$WORK" > "$WORK.clean" || true
 mv "$WORK.clean" "$WORK"
 fi   # end of generated-worklist branch
 NTASK=$(wc -l < "$WORK")
-echo "[fleet] method=$METHOD  src=$([[ $USE_EVAL_SET == 1 ]] && echo TARGET_EVAL_EPISODES || echo taskset:$TASK_SET)  lines=$NTASK  gpus=${GPULIST[*]}"
+echo "[fleet] method=$METHOD  src=$([[ $USE_EVAL_SET == 1 ]] && echo TARGET_EVAL_EPISODES${EVAL_HALF:+-half$EVAL_HALF} || echo taskset:$TASK_SET)  lines=$NTASK  gpus=${GPULIST[*]}"
 [[ -s "$LOG/worklist.err" ]] && grep -i "MISSING" "$LOG/worklist.err" || true
 [[ "$NTASK" -gt 0 ]] || { echo "FATAL: empty work list" >&2; exit 1; }
 
@@ -363,8 +381,10 @@ for i in "${!GPULIST[@]}"; do
           ${TASK_LIMITS_JSON:+--task-limits-json "$TASK_LIMITS_JSON"} \
           --max-steps-cap "$MAX_STEPS_CAP" \
           ${RUN_LABEL:+--method "$RUN_LABEL"} \
-          $([[ "$GENERAL_RULES" == 1 ]] && echo --general-rules) \
-          $([[ "$TASK_RULES" == 1 ]] && echo --task-rules) \
+          $([[ "$GENERAL_RULES" == 1 ]] && echo --general-rules || echo --no-general-rules) \
+          $([[ "$TASK_RULES" == 1 ]] && echo --task-rules || echo --no-task-rules) \
+          $([[ "$LAST_MILESTONE_RETRY" == 1 ]] && echo --last-milestone-retry || \
+                                                  echo --no-last-milestone-retry) \
           ${GOAL_JSON:+--goal-json "$GOAL_JSON"} \
           $([[ "$RESUME" == 1 ]] && echo --resume) \
           ${EVAL_ARGS:-} \
