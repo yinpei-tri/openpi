@@ -101,6 +101,9 @@ MAX_S2_CALLS_SAFETY=${MAX_S2_CALLS_SAFETY:-100}
 # 800 run, only 0.8% of segments had a budget above 400 and 28 actually ran past it. NOTE a run at 400
 # is comparable with the 1000-episode no-rules baseline and NOT with the -estbump sweep (which used 800).
 MAX_STEPS_CAP=${MAX_STEPS_CAP:-400}
+# High-resolution capture mode: 512x512 per camera, with three separate raw rollout videos. S1/S2
+# inputs retain their original dimensions inside combined_eval.py; native render pixels may differ.
+HIGHRES_VIDEO=${HIGHRES_VIDEO:-0}
 DATA_ROOT=${DATA_ROOT:-${ROBOCASA_LEROBOT_ROOT:-$DATA_DIR/robocasa_dataset}/v1.0/target}
 S2_CKPT=${S2_CKPT:-$CKPT_DIR/system2-full-0804-qwen35-4b-gb192-full-vitfull-lr1e5-vitlr2e6-alignerlr1e5-zero2-2n-ep3/checkpoint-11416}
 SKIP_SERVERS=${SKIP_SERVERS:-0}            # 1 = reuse servers already listening
@@ -380,6 +383,7 @@ for i in "${!GPULIST[@]}"; do
           ${MAX_OFFICIAL_STEPS:+--max-official-steps "$MAX_OFFICIAL_STEPS"} \
           ${TASK_LIMITS_JSON:+--task-limits-json "$TASK_LIMITS_JSON"} \
           --max-steps-cap "$MAX_STEPS_CAP" \
+          $([[ "$HIGHRES_VIDEO" == 1 ]] && echo --highres-video || echo --no-highres-video) \
           ${RUN_LABEL:+--method "$RUN_LABEL"} \
           $([[ "$GENERAL_RULES" == 1 ]] && echo --general-rules || echo --no-general-rules) \
           $([[ "$TASK_RULES" == 1 ]] && echo --task-rules || echo --no-task-rules) \

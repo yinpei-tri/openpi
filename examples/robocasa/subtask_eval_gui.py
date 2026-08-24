@@ -3205,6 +3205,9 @@ COMBINE_HTML = """<!doctype html><meta charset=utf-8>
     horizontal space for the text/number panels beside them */
  video,img.tile{width:66%;max-width:100%;border:1px solid #ccc;border-radius:4px;background:#000;display:block}
  video.full,img.tile.full{width:100%}
+ .rawviews{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px}
+ .rawviews figure{margin:0;min-width:0}.rawviews figcaption{font-size:10px;color:#666;margin:0 0 2px}
+ .rawviews video{width:100%;display:block}
  table{border-collapse:collapse;font-size:11px;width:100%} td,th{border:1px solid #e6e6ea;padding:1px 5px}
  th{background:#f5f5f8;position:sticky;top:0;z-index:1}
  .drop{color:#c0c0c0} .keep{background:rgba(46,139,61,.13);font-weight:600}
@@ -3696,6 +3699,16 @@ async function renderExec(t){
     replan: steps.map(v=>!!v.replanned),
   };
   S.fps=(s1.video_raw&&s1.video_raw.fps)||20;
+  const raw=s1.video_raw||{};
+  const rawViews=(raw.layout==='separate_views'&&raw.views)?raw.views:null;
+  const rawFile=info=>String((info||{}).path||'').split('/').pop();
+  const rawVideoHtml=rawViews
+    ?`<div class=rawviews>${(raw.camera_names||Object.keys(rawViews)).map((name,i)=>{
+        const file=rawFile(rawViews[name]);
+        return `<figure><figcaption>${esc(name)}${i===0?' (timeline master)':''}</figcaption>
+          <video ${i===0?'id=vid':'class=raw-peer controls'} preload=metadata src="${M(file)}"></video></figure>`;
+      }).join('')}</div>`
+    :`<video id=vid class=full preload=metadata src="${M('s1_rollout_raw.mp4')}"></video>`;
   $('#right').innerHTML=
    `<div class=card><h3>System1 input<span id=promptpos>${esc(s1.stop_reason)}</span>${ruleBadge(T)}</h3>
       ${ruleWhy(T)}
@@ -3712,8 +3725,8 @@ async function renderExec(t){
       <div class=mini>
         <div class=minicol>
           <div class=k>raw rollout, every executed step
-            (${(s1.video_raw&&s1.video_raw.n_frames)??s1.n_steps} frames @${S.fps}fps)</div>
-          <video id=vid class=full preload=metadata src="${M('s1_rollout_raw.mp4')}"></video>
+            (${raw.n_frames??s1.n_steps} frames @${S.fps}fps${rawViews?' · separate 512×512 views':''})</div>
+          ${rawVideoHtml}
           <div class=player>
             <button id=play>&#9654; play</button>
             <button id=bb>&lsaquo;</button>

@@ -100,6 +100,83 @@ SIM_CTRL_IDX = SE.SIM_CTRL_IDX
 import robocasa.utils.lerobot_utils as LU
 
 
+DEFAULT_CAMERA_SIZE = 256
+HIGHRES_CAMERA_SIZE = 512
+RAW_VIDEO_VIEW_NAMES = ("scene_left", "scene_right", "wrist")
+
+
+def _capture_size(args) -> int:
+    """Square RoboCasa render size for each of the three policy cameras."""
+    return HIGHRES_CAMERA_SIZE if bool(getattr(args, "highres_video", False)) else DEFAULT_CAMERA_SIZE
+
+
+def _model_tile(frame: np.ndarray) -> np.ndarray:
+    """Return one tiled frame at System2's immutable 256x768 training resolution.
+
+    S1 already resizes each individual camera to ``--resize-size``. System2 instead consumes the
+    tiled frame, so its input must be reduced here before planning or clip construction. Native
+    512 rendering can still change sampled pixels versus native 256 rendering; the run guard
+    therefore records this as a distinct capture configuration even though model dimensions stay
+    fixed.
+    """
+    a = np.asarray(frame, dtype=np.uint8)
+    if tuple(a.shape[:2]) == tuple(S2C.TILE_HW):
+        return np.ascontiguousarray(a)
+    out = S2C.downscale([a], hw=S2C.TILE_HW)[0]
+    if tuple(out.shape[:2]) != tuple(S2C.TILE_HW):
+        raise ValueError(
+            f"cannot map captured tile {list(a.shape[:2])} to model tile {list(S2C.TILE_HW)}")
+    return np.ascontiguousarray(out)
+
+
+def _model_tile_from_obs(obs: dict) -> np.ndarray:
+    return _model_tile(SE._stacked_from_obs(obs))
+
+
+def _split_raw_views(frames: list[np.ndarray]) -> dict[str, list[np.ndarray]]:
+    """Split three equally wide camera tiles without copying their pixel buffers."""
+    views = {name: [] for name in RAW_VIDEO_VIEW_NAMES}
+    for frame in frames:
+        a = np.asarray(frame, dtype=np.uint8)
+        if a.ndim != 3 or a.shape[2] != 3 or a.shape[1] % len(RAW_VIDEO_VIEW_NAMES):
+            raise ValueError(f"expected an RGB three-view tile, got {a.shape}")
+        width = a.shape[1] // len(RAW_VIDEO_VIEW_NAMES)
+        if width != a.shape[0]:
+            raise ValueError(f"expected three square camera views, got tiled shape {a.shape}")
+        for i, name in enumerate(RAW_VIDEO_VIEW_NAMES):
+            views[name].append(np.ascontiguousarray(a[:, i * width:(i + 1) * width]))
+    return views
+
+
+def _write_raw_rollout_video(
+    frames: list[np.ndarray], turn_dir: Path, *, separate_views: bool,
+) -> dict | None:
+    """Write the human-inspection rollout artifact in tiled or three-stream form."""
+    if not frames:
+        return None
+    if not separate_views:
+        saved = S2C.downscale(frames) if os.environ.get("SYS2_RAW_VIDEO_DOWNSCALE") else frames
+        info = S2C.write_clip(saved, turn_dir / "s1_rollout_raw.mp4", fps=S2C.SIM_FPS)
+        return {**info, "layout": "tiled"}
+
+    views = _split_raw_views(frames)
+    encoded = {
+        name: S2C.write_clip(view_frames, turn_dir / f"s1_rollout_raw_{name}.mp4",
+                             fps=S2C.SIM_FPS)
+        for name, view_frames in views.items()
+    }
+    first = encoded[RAW_VIDEO_VIEW_NAMES[0]]
+    return {
+        "layout": "separate_views",
+        "camera_names": list(RAW_VIDEO_VIEW_NAMES),
+        "n_frames": first["n_frames"],
+        "fps": first["fps"],
+        "crf": first["crf"],
+        "shape": first["shape"],
+        "views": encoded,
+    }
+
+
 # ---------------------------------------------------------------------------
 # PATHS. Nothing here is hardcoded to one machine's layout. Resolution order:
 #
@@ -874,7 +951,9 @@ def run_s1_segment(
             q01a = np.asarray(norm_stats["actions"]["q01"], np.float32)
             q99a = np.asarray(norm_stats["actions"]["q99"], np.float32)
 
-    clean_frames: list[np.ndarray] = []      # tiled 256x768 RGB, one per executed step
+    # Native captured tile, one per executed step: normally 256x768; 512x1536 under
+    # --highres-video. Model-facing clips are normalized to 256x768 after the segment.
+    clean_frames: list[np.ndarray] = []
     step_records: list[dict] = []
     motion_norms: list[float] = []           # per-step commanded-motion norm (for clip compaction)
     grip_cmds: list[float] = []               # per-step commanded gripper (+1 close / -1 open)
@@ -1080,7 +1159,8 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
     ld = Path(episode_dir)
     ep_index = int(args.episode_index)
     _t = time.perf_counter()
-    env = make_camera_env(str(ld))
+    camera_size = _capture_size(args)
+    env = make_camera_env(str(ld), camera_h=camera_size, camera_w=camera_size)
     t_env_make = time.perf_counter() - _t
     ep_meta = LU.get_episode_meta(ld, ep_index)
     task_name = _task_name_from_lerobot_dir(ld)
@@ -1127,6 +1207,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             "stop": {"progress": args.stop_progress, "eps": args.stop_eps, "window": args.stop_window},
             "clip": {"fps": S2C.CLIP_FPS, "crf": S2C.CLIP_CRF, "tile": list(S2C.TILE_HW),
                      "sim_fps": S2C.SIM_FPS, "static_eps": args.static_eps},
+            "capture": _capture_fingerprint(args),
             "video_policy_source": S2C.policy_source(),
             "privileged_task_status": True,   # fed from env._check_success(); GT bit by design
             # Overwritten by the plan step with the variant it actually ran ("cold" / "memory").
@@ -1170,7 +1251,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
         # Cold by default; ``args.plan_fn`` swaps in a variant (e.g. the memory/recipe planner)
         # without touching the execution loop below. ``args.scene0`` is the tiled opening still the
         # planner reads.
-        args.scene0 = SE._stacked_from_obs(obs0)
+        args.scene0 = _model_tile_from_obs(obs0)
         plan_dir = ep_out / "plan"
         _t = time.perf_counter()
         res = getattr(args, "plan_fn", None) or do_plan_cold
@@ -1295,7 +1376,7 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
                 clip_stats = None
             elif turn == 0:
                 cur = env._get_observations(force_update=True)
-                tile0 = SE._stacked_from_obs(cur)
+                tile0 = _model_tile_from_obs(cur)
                 S2C.write_image(tile0, tdir / "s2_input_scene_full.png")     # what the model reads
                 sc = S2C.write_image(S2C.downscale([tile0])[0], tdir / "s2_input_scene.png")
                 s2 = s2_client.exec_first(instruction, plan, tdir / "s2_input_scene_full.png")
@@ -1626,13 +1707,15 @@ def eval_episode(episode_dir: Path, s1_client, s2_client: S2C.Sys2Client, args,
             # never reads it -- System2's input is the separate 4-fps clip below, already at TILE_HW.
             # Cost measured on the v2 sweep: downscaled files averaged 56 KB, ~1.1 GB per 1500-episode
             # run; at 4x the pixels expect ~3 GB. SYS2_RAW_VIDEO_DOWNSCALE=1 restores the small copies.
-            _raw = S2C.downscale(frames) if os.environ.get("SYS2_RAW_VIDEO_DOWNSCALE") else frames
-            raw_info = (S2C.write_clip(_raw, tdir / "s1_rollout_raw.mp4",
-                                       fps=S2C.SIM_FPS) if frames else None)
+            raw_info = _write_raw_rollout_video(
+                frames, tdir, separate_views=bool(args.highres_video))
             # CONDENSED 4-fps clip = exactly what System2 sees next turn. Static frames are
             # dropped for motion subgoals and KEPT for wait/hold subgoals.
+            # High-resolution capture is reduced to the original model resolution here. Native
+            # 512 rendering can change pixels, but never System2's dimensions or token budget.
+            model_frames = [_model_tile(frame) for frame in frames]
             clip_frames, clip_stats = S2C.build_clip_frames(
-                frames, motion, subgoal, eps=args.static_eps)
+                model_frames, motion, subgoal, eps=args.static_eps)
             # The clip System2 consumes MUST stay at the training resolution (256x768). We write it
             # to a sidecar name, and a separate DOWNSCALED copy under the display name the GUI
             # serves -- so shrinking artifacts can never silently change model input.
@@ -1875,6 +1958,19 @@ def _rollout_limit_fingerprint(args) -> dict:
     }
 
 
+def _capture_fingerprint(args) -> dict:
+    """Camera and saved-video layout; guarded so one method cannot mix artifact formats."""
+    highres = bool(getattr(args, "highres_video", False))
+    size = _capture_size(args)
+    return {
+        "highres_video": highres,
+        "camera_hw": [size, size],
+        "raw_video_layout": "separate_views" if highres else "tiled",
+        "system2_tile_hw": list(S2C.TILE_HW),
+        "system1_resize": int(args.resize_size),
+    }
+
+
 def _write_run_rule_config(out_root: Path, method: str, args) -> dict:
     """Persist the run configuration and refuse to mix incompatible arms in one directory."""
     # The guard covers the GOAL SOURCE and PLAN VARIANT as well as the rule tiers. A --goal-json run,
@@ -1884,7 +1980,8 @@ def _write_run_rule_config(out_root: Path, method: str, args) -> dict:
     # explicit cold marker, so accidentally reusing a memory label for a cold run is caught too.
     plan_cfg = getattr(args, "run_plan_config", None) or {"mode": "cold"}
     cfg = {**_rule_config(args), "goal": _goal_fingerprint(args), "plan": plan_cfg,
-           "rollout_limit": _rollout_limit_fingerprint(args)}
+           "rollout_limit": _rollout_limit_fingerprint(args),
+           "capture": _capture_fingerprint(args)}
     path = out_root / method / "rule_config.json"
     if path.exists():
         try:
@@ -2009,6 +2106,14 @@ def build_argparser(description: str | None = None) -> argparse.ArgumentParser:
                     help="fallback when System2 omits/garbles <estimated_step>")
     ap.add_argument("--replan-steps", type=int, default=16)
     ap.add_argument("--resize-size", type=int, default=224)
+    ap.add_argument(
+        "--highres-video", action=argparse.BooleanOptionalAction, default=False,
+        help="render each RoboCasa camera at 512x512 and save the raw rollout as three separate "
+             "scene_left/scene_right/wrist videos. Model input dimensions remain unchanged: S1 "
+             "resizes each view to --resize-size and System2 clips are reduced to its trained "
+             "256x768 tile. Native 512 rendering may still change sampled pixels. "
+             "Default off preserves 256x256 capture and one tiled raw video.",
+    )
     ap.add_argument("--goal-json", default=None,
                     help="JSON map {task_name: goal} that REPLACES the dataset's ep_meta['lang'] task "
                          "goal for those tasks. Use to test a different goal phrasing (e.g. terse "

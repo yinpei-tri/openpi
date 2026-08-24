@@ -23,6 +23,7 @@ LAST_MILESTONE_RETRY=${LAST_MILESTONE_RETRY:-$GENERAL_RULES}
 ROLLOUT_LIMIT_MODE=${ROLLOUT_LIMIT_MODE:-max_official_steps}
 MAX_TURNS=${MAX_TURNS:-20}
 MAX_STEPS_CAP=${MAX_STEPS_CAP:-400}
+HIGHRES_VIDEO=${HIGHRES_VIDEO:-0}
 MAX_S2_CALLS_SAFETY=${MAX_S2_CALLS_SAFETY:-100}
 RESUME=${RESUME:-0}
 ROBOCASA_PY=${ROBOCASA_PY:-/home/ec2-user/micromamba/envs/robocasa/bin/python}
@@ -123,6 +124,7 @@ for i in $(seq 0 $((NGPU - 1))); do
         --max-s2-calls-safety "$MAX_S2_CALLS_SAFETY"
         --max-steps-cap "$MAX_STEPS_CAP"
       )
+      [[ "$HIGHRES_VIDEO" == 1 ]] && args+=(--highres-video) || args+=(--no-highres-video)
       [[ "$GENERAL_RULES" == 1 ]] && args+=(--general-rules) || args+=(--no-general-rules)
       [[ "$TASK_RULES" == 1 ]] && args+=(--task-rules) || args+=(--no-task-rules)
       [[ "$LAST_MILESTONE_RETRY" == 1 ]] \

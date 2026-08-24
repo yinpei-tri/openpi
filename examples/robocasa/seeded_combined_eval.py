@@ -287,13 +287,13 @@ class ProceduralResetAdapter:
             })
         return self.record
 
-    def _make_uninitialized_env(self, seed: int):
+    def _make_uninitialized_env(self, seed: int, *, camera_h: int, camera_w: int):
         return create_env(
             env_name=self.args.task,
             robots=self.args.robot,
             camera_names=CAMERA_NAMES,
-            camera_widths=256,
-            camera_heights=256,
+            camera_widths=camera_w,
+            camera_heights=camera_h,
             seed=seed,
             clutter_mode=self.args.clutter_mode,
             randomize_cameras=self.args.randomize_cameras,
@@ -301,10 +301,11 @@ class ProceduralResetAdapter:
             **self._scene_kwargs(),
         )
 
-    def make_env(self, _unused_path=None):
+    def make_env(self, _unused_path=None, *, camera_h: int = 256, camera_w: int = 256):
         seed = self.actual_seed()
         with _isolated_reset_rng(seed):
-            self.env = self._make_uninitialized_env(seed)
+            self.env = self._make_uninitialized_env(
+                seed, camera_h=int(camera_h), camera_w=int(camera_w))
             if self.args.load_reset_root is not None:
                 self.read_bundle(self.args.load_reset_root)
                 _DATASET_RESET_TO(
@@ -331,9 +332,10 @@ class ProceduralResetAdapter:
             if key not in obs:
                 raise RuntimeError(f"{self.args.task} seed {seed} did not render {key}")
             shape = list(np.asarray(obs[key]).shape)
-            if shape != [256, 256, 3]:
+            if shape != [int(camera_h), int(camera_w), 3]:
                 raise RuntimeError(
-                    f"{self.args.task} seed {seed} rendered {key} at {shape}, expected [256, 256, 3]")
+                    f"{self.args.task} seed {seed} rendered {key} at {shape}, expected "
+                    f"[{camera_h}, {camera_w}, 3]")
             camera_shapes[camera] = shape
             # robosuite camera observations are bottom-up. Save the exact top-down RGB orientation
             # consumed by the policy and displayed by the evaluation GUI.
@@ -363,7 +365,7 @@ class ProceduralResetAdapter:
             "clutter_mode": int(self.args.clutter_mode),
             "randomize_cameras": bool(self.args.randomize_cameras),
             "camera_names": list(CAMERA_NAMES),
-            "camera_size": [256, 256],
+            "camera_size": [int(camera_h), int(camera_w)],
             "camera_shapes": camera_shapes,
             "instruction": instruction,
             "initial_task_success": False,
@@ -429,15 +431,18 @@ class ProceduralResetAdapter:
         goal_lines = textwrap.wrap(str(self.ep_meta["lang"]).strip(), width=108) or [""]
         header_height = 24
         footer_height = 14 * len(goal_lines) + 20
-        canvas = Image.new("RGB", (256 * len(CAMERA_NAMES), 256 + header_height + footer_height),
+        first = np.asarray(self.initial_images[CAMERA_NAMES[0]])
+        camera_h, camera_w = map(int, first.shape[:2])
+        canvas = Image.new("RGB", (camera_w * len(CAMERA_NAMES),
+                                   camera_h + header_height + footer_height),
                            "white")
         draw = ImageDraw.Draw(canvas)
         for i, (camera, label) in enumerate(zip(CAMERA_NAMES, labels, strict=True)):
-            x = i * 256
+            x = i * camera_w
             draw.text((x + 6, 5), label, fill="black")
             canvas.paste(Image.fromarray(self.initial_images[camera]),
                          (x, header_height))
-        y = header_height + 256 + 7
+        y = header_height + camera_h + 7
         for line in goal_lines:
             draw.text((7, y), line, fill="black")
             y += 14
@@ -523,7 +528,7 @@ def _procedural_config(args) -> dict:
         "style_id": args.style_id,
         "randomize_cameras": bool(args.randomize_cameras),
         "camera_names": list(CAMERA_NAMES),
-        "camera_size": [256, 256],
+        "camera_size": [CE._capture_size(args), CE._capture_size(args)],
         "save_reset_bundle": bool(args.save_reset_bundle),
         "load_reset_root": (str(args.load_reset_root.resolve())
                             if args.load_reset_root is not None else None),
