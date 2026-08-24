@@ -460,7 +460,10 @@ def _target_split_map() -> dict[str, str]:
 # DURABLE per-checkpoint episode results (compact summaries extracted by
 # scripts/extract_episode_results.py). These SURVIVE deleting the big per-episode video dirs under
 # episode/<m>/, and are the PREFERRED source for /stats #2. Falls back to episode/<m>/index.json.
-EPISODE_RESULTS_DIR = Path("eval_results/episode_results")
+# Keep the durable summaries under the same configurable results root as every other
+# System1 artifact.  A cwd-relative path pointed at /shared/openpi/eval_results when
+# the GUI was launched from the repository, while the real data lives under _RESULTS.
+EPISODE_RESULTS_DIR = _RESULTS / "episode_results"
 
 
 def _episode_index_docs() -> dict:
@@ -644,18 +647,15 @@ def _stats_fingerprint() -> tuple:
 
 def _compute_stats() -> dict:
     val = []
-    if VAL_MSE_DIR.is_dir():
-        for f in sorted(VAL_MSE_DIR.glob("*.json")):
-            try:
-                d = json.loads(f.read_text())
-                steps = [s for s in d.get("steps", []) if s.get("action_mse") is not None]
-                last = max(steps, key=lambda s: s.get("step") or 0) if steps else None
-                val.append(dict(exp_name=d.get("exp_name", f.stem),
-                                final_step=(last.get("step") if last else None),
-                                action_mse=(last.get("action_mse") if last else None),
-                                flow_loss=(last.get("flow_loss") if last else None)))
-            except Exception:
-                continue
+    # One summary row per experiment.  Previously this loop emitted one row per JSON file,
+    # which repeated an experiment for every checkpoint and was not rendered by /stats anyway.
+    for exp, steps in _load_mse_split(VAL_MSE_DIR).items():
+        measured = [s for s in steps if s.get("action_mse") is not None]
+        last = max(measured, key=lambda s: s.get("step") or 0) if measured else None
+        val.append(dict(exp_name=exp,
+                        final_step=(last.get("step") if last else None),
+                        action_mse=(last.get("action_mse") if last else None),
+                        flow_loss=(last.get("flow_loss") if last else None)))
     return dict(val_mse=val,
                 episode=_episode_stats(_root("episode")),
                 subtask=_subtask_stats(_root("finestep")),
@@ -860,6 +860,8 @@ STATS_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
   <h2>#0b Per-task COMBINED success <span style="font-size:11px;color:#888;font-weight:400">— task × method · #successful / #episodes (hover for % and s/ep) · OVERALL row = the three splits combined, then per-split totals and their tasks</span></h2>
   <div id="cmbcmp" style="font-size:11px;margin:0 0 5px"></div>
   <div id="cmbtask" style="overflow-x:auto"></div>
+  <h2>#1 Validation action MSE <span style="font-size:11px;color:#888;font-weight:400">— latest checkpoint per experiment · lower is better · <a href="/val_mse">open train/val curves</a></span></h2>
+  <div id="msetab" style="overflow-x:auto"></div>
   <h2>#2 Episode success rate <span style="font-size:11px;color:#888;font-weight:400">— % (n episodes)</span></h2>
   <div id="epfilter" style="margin:2px 0 8px;font-size:12px;display:flex;gap:6px;align-items:center;flex-wrap:wrap"></div>
   <div id="eptab"></div>
@@ -1094,6 +1096,15 @@ async function load(){
   if(_ld)_ld.remove();   // data in hand -> drop the loading banner
   renderTagDoc();
   let h;
+  // #1 validation MSE: compact latest-checkpoint summary. The dedicated /val_mse page retains
+  // the full train/validation curves; this table makes the API's existing result visible here.
+  const mse=(d.val_mse||[]).filter(v=>v.action_mse!=null)
+    .sort((a,b)=>a.action_mse-b.action_mse);
+  h="<table><tr><th class='exp'>experiment</th><th>step</th><th>action MSE</th><th>flow loss</th></tr>";
+  mse.forEach(v=>{h+=`<tr><td class='exp'>${v.exp_name||'–'}</td><td>${v.final_step??'–'}</td>`+
+    `<td>${f4(v.action_mse)}</td><td>${f4(v.flow_loss)}</td></tr>`;});
+  document.getElementById('msetab').innerHTML=mse.length?h+"</table>":
+    '<span style="color:#888;font-size:12px">No validation MSE results found.</span>';
   // #2 episode table: overall + category (atomic/composite) + split (seen/unseen) + 2x2 cross,
   // each cell "% (n)"; last column = avg wall-time per episode. Sortable: click a header.
   const cell=(v,c,cnt)=>{const n=cnt&&cnt[c]!=null?cnt[c]:null; return `<td title="${n!=null?n+' episodes':''}">${pct(v[c])}${n!=null?` <span style="color:#aaa">(${n})</span>`:''}</td>`;};
@@ -1757,7 +1768,7 @@ async function load(){
     {label:'episode success (all)',data:methods.map(m=>d.episode[m]?100*(d.episode[m].all||0):null),backgroundColor:COLORS[0]},
     {label:'subtask gemini (decided success rate)',data:methods.map(m=>d.subtask[m]&&d.subtask[m].overall!=null?100*d.subtask[m].overall:null),backgroundColor:COLORS[1]},
   ];
-  new Chart(document.getElementById('chart'),{type:'bar',data:{labels:methods,datasets:ds},
+  if(window.Chart)new Chart(document.getElementById('chart'),{type:'bar',data:{labels:methods,datasets:ds},
     options:{responsive:true,scales:{y:{min:0,max:100,title:{display:true,text:'%'}}}}});
 }
 // A failed /api/stats (tunnel hiccup, or this server restarting mid-sweep) must not surface as an
