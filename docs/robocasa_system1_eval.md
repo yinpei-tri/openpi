@@ -7,8 +7,10 @@ decided at each level, the GUI, and the known limitations.
 
 All evals run in the **robocasa micromamba env** (`/home/yinpei.dai/micromamba/envs/robocasa/bin/python`)
 and talk to a policy served from the **openpi `.venv`** via `scripts/serve_policy.py` (websocket).
-Ground-truth episodes + dense subgoal annotations come from
-`/home/yinpei.dai/RoboAnnotator/data_annotation/` (subgoal method `g_subgoal_gemini3_final_batch`).
+Ground-truth episodes + dense subgoal annotations come from the RoboAnnotator interface
+(shared at `/home/<user>/data/data_annotation`, mirrored to
+`s3://tri-ml-datasets-uw2/yinpeidai/robocasa_dataset_preprocessed/data_annotation`; subgoal
+method `g_subgoal_gemini3_final_batch`).
 
 Results for the current target-split run live under **`eval_results/`**:
 - `eval_results/episode/<method>/`    — episode-level open-loop
@@ -16,6 +18,16 @@ Results for the current target-split run live under **`eval_results/`**:
 - `eval_results/milestone/<method>/`  — milestone-level (oracle-referenced sim-check)
 - `eval_results/valmse_results/`, `.../trainmse_results/` — offline MSE curves
 - each also has an `oracle` method = the ground-truth reference rollout.
+
+The `eval_results/` tree is mirrored to
+**`s3://tri-ml-datasets-uw2/yinpeidai/system1_eval_results`** (and browsed via the
+RoboAnnotator portal's `/system1_eval` proxy). Checkpoints live under
+`s3://tri-ml-datasets-uw2/yinpeidai/openpi/checkpoints`.
+
+```sh
+# pull / push the System1 eval results
+aws s3 sync s3://tri-ml-datasets-uw2/yinpeidai/system1_eval_results eval_results
+```
 
 ---
 

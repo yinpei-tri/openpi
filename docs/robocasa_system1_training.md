@@ -19,7 +19,7 @@ cd <openpi-repo>
 eval "$(aws --profile sagemaker configure export-credentials --format env)"
 export AWS_DEFAULT_REGION=us-west-2
 # 2. point the config at the S3 shards
-export ROBOCASA_SHARDS_DIR=s3://tri-ml-datasets-uw2/yinpeidai/data/robocasa_system1/shards
+export ROBOCASA_SHARDS_DIR=s3://tri-ml-datasets-uw2/yinpeidai/robocasa_final_training_shard/system1_midset_0717/shards
 # 3. norm stats must exist locally for this config (see "Norm stats" below):
 #    assets/pi05_robocasa_system1_noanchor/robocasa_system1/norm_stats.json
 # 4. train — 8 GPUs, FSDP across all 8, batch divisible by 8
@@ -38,9 +38,9 @@ A100 80GB has far more memory than the dev A6000s, so you have headroom: larger
 - **Format**: per-frame, globally-shuffled WebDataset tar shards + a deduped anchor
   store. Built by RoboAnnotator `producers/preprocess_robocasa_to_tar.py`. Full field
   schema is in the dataset's `SCHEMA.md`.
-- **Local**: `/home/yinpeidai/RoboAnnotator/data/robocasa_system1/` (16GB, 594 shards,
-  303,755 frames, 350 episodes).
-- **S3**: `s3://tri-ml-datasets-uw2/yinpeidai/data/robocasa_system1/`
+- **Local**: `/home/<user>/data/train_shard/system1_midset_0717` (the current System1 set;
+  earlier builds used `RoboAnnotator/data/robocasa_system1/`).
+- **S3**: `s3://tri-ml-datasets-uw2/yinpeidai/robocasa_final_training_shard/system1_midset_0717/`
   (`shards/`, `anchors/`, `meta.json`, `SCHEMA.md`).
 - The loader (`openpi/training/robocasa_webdataset.py`) reads `ROBOCASA_SHARDS_DIR`
   (local dir OR `s3://`); it derives the `anchors/` sibling automatically. For S3 it
@@ -199,7 +199,7 @@ CUDA_VISIBLE_DEVICES=0 .venv/bin/python scripts/compute_norm_stats.py \
 eval "$(aws --profile sagemaker configure export-credentials --format env)"
 HOST_UID=$(id -u) HOST_GID=$(id -g) \
 NVIDIA_VISIBLE_DEVICES=0,1 \
-ROBOCASA_SHARDS_DIR=s3://tri-ml-datasets-uw2/yinpeidai/data/robocasa_system1/shards \
+ROBOCASA_SHARDS_DIR=s3://tri-ml-datasets-uw2/yinpeidai/robocasa_final_training_shard/system1_midset_0717/shards \
 AWS_DEFAULT_REGION=us-west-2 \
 TRAIN_CONFIG=pi05_robocasa_system1_noanchor EXP_NAME=docker_run \
 TRAIN_ARGS="--batch-size=2 --fsdp-devices=2 --ema-decay=None --num-train-steps=200 --overwrite" \
